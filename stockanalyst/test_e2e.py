@@ -148,17 +148,17 @@ def main() -> None:
     print(f"  ✓ fund_tx    {buy.fund_tx}")
     print(f"  ✓ budget     {buy.budget_u} U")
 
-    # ── 3. notify_funded ─────────────────────────────────────────────────────
-    step(3, f"notify_funded — tell agent to start work on job {buy.job_id}")
+    # ── 3. notify_funded sweep ───────────────────────────────────────────────
+    step(3, "notify_funded — request a funded-job sweep")
     payload = {
         "jsonrpc": "2.0", "id": 2, "method": "message/send",
         "params": {
             "message": {
                 "role": "user",
-                "messageId": f"notify-{buy.job_id}",
+                "messageId": "notify-sweep",
                 "parts": [{
                     "kind": "data",
-                    "data": {"skill": "notify_funded", "job_id": buy.job_id},
+                    "data": {"skill": "notify_funded"},
                 }],
             }
         },

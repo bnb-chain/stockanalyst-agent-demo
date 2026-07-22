@@ -47,6 +47,7 @@ The free tier proves wallet identity via a 0-U EIP-712 signature and is rate-lim
 
 ---
 
+<<<<<<< HEAD
 ## Prerequisites
 
 - **Node.js 18+** (for native `fetch` + `ReadableStream`)
@@ -56,6 +57,44 @@ The free tier proves wallet identity via a 0-U EIP-712 signature and is rate-lim
 - **Agent** running locally on port 9000 (for x402) or deployed on platform (for ERC-8183)
 
 ---
+=======
+| Step | What happens |
+|---|---|
+| 1 | Load UOMP user context — portfolio (AAPL, NVDA) + risk profile from Guard |
+| 2 | A2A negotiate — fetch OAuth2 token, send signed quote request to cloud seller |
+| 3 | On-chain — `createJob → registerJob → setBudget → approve → fund` (5 txs) |
+| 4 | `notify_funded` — EIP-712-authorize the exact delivery context with the job-client wallet |
+| 5 | Poll on-chain until job status reaches `SUBMITTED` |
+| 6 | Fetch deliverable via tunnel URL → display report |
+| 7 | Settle — release escrow to seller (available after 24h dispute window) |
+>>>>>>> 7ba1935 (docs: describe authenticated delivery protocol)
+
+## Authenticated `notify_funded`
+
+For a named job, do not construct a raw notification payload. Use the signing
+helper with the same wallet that created the on-chain job:
+
+```ts
+const status = await notifyFunded(AGENT_ENDPOINT, wallet, jobId, {
+  gatewayUrl: relay.publicUrl,
+  gatewayToken: relay.token,
+  portfolio,
+  riskProfile,
+});
+```
+
+The helper serializes the complete context exactly once and creates an EIP-712
+authorization for the decimal job ID. The seller uses its configured chain and
+Commerce contract as the domain, recovers the signer, and accepts the context
+only when that signer is the on-chain job client. Gateway, token, portfolio,
+and risk-profile fields therefore must not be sent outside the signed context.
+
+Production accepts public HTTPS `*.trycloudflare.com` relay origins by default.
+For a local HTTP loopback relay only, set
+`ALLOW_PRIVATE_DELIVERY_GATEWAY=true` on the seller. To use an alternative
+approved public origin, set the seller's `DELIVERY_GATEWAY_ALLOWED_HOSTS` to a
+comma-separated exact hostname or `.suffix` allowlist. Keep this allowlist as
+narrow as possible.
 
 ## Setup
 

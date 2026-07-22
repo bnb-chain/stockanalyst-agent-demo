@@ -157,9 +157,9 @@ Buyer                        Chain (BSC Testnet)              Seller Agent
 
 UOMP solves two problems ERC-8183 alone cannot:
 
-**User context**: The buyer's portfolio (symbols, shares, avg cost) and risk profile (tolerance, horizon, preferred indicators) are stored in their own Memory Guard on localhost. Before negotiating, the buyer client reads this data, builds a personalized task description, and passes the raw holdings to `notify_funded`. The agent receives structured portfolio objects — not raw personal data transmitted over the public A2A wire.
+**User context**: The buyer's portfolio (symbols, shares, avg cost) and risk profile (tolerance, horizon, preferred indicators) are stored in their own Memory Guard on localhost. Before negotiating, the buyer client reads this data and builds a personalized task description. For a named `notify_funded` call, it serializes the delivery and portfolio context once and signs that exact string; the seller receives only the validated structured context from the EIP-712 authorization envelope.
 
-**Reverse delivery**: The seller runs in the cloud with no inbound URL the buyer can poll. The buyer starts a local relay on `:9444`, exposes it via Cloudflare Tunnel (`https://xxx.trycloudflare.com`), and passes the tunnel URL in `notify_funded`. The seller uploads the report there; the buyer fetches it from its own relay.
+**Reverse delivery**: The seller runs in the cloud with no inbound URL the buyer can poll. The buyer starts a local relay on `:9444`, exposes it via Cloudflare Tunnel (`https://xxx.trycloudflare.com`), and includes the tunnel URL and token in the signed `notify_funded` context. The seller uploads the report there; the buyer fetches it from its own relay.
 
 ---
 
@@ -182,7 +182,7 @@ UOMP solves two problems ERC-8183 alone cannot:
 │                                                                           │  │
 └───────────────────────────────────────────────────────────────────────────┘  │
                          │ [4. notify_funded]                                   │
-                         │   + tunnel URL + token + portfolio + risk_profile    │
+                         │   EIP-712 signed gateway + portfolio context         │
                          ▼                                                       │
 ┌──────────────────────────────────────────────────────────────────────────┐   │
 │              BNB Chain Platform (cloud seller)                            │   │
@@ -292,10 +292,27 @@ npm run dev
 | 1 | Load UOMP context | Guard → AAPL ×50 @ $185, NVDA ×20 @ $420, risk=moderate |
 | 2 | `negotiate` | OAuth2 token → A2A → signed quote 1.0 U |
 | 3 | On-chain buy | createJob → registerJob → setBudget → approve → fund |
-| 4 | `notify_funded` | Tunnel URL + token + portfolio holdings + risk profile → seller ACK |
+| 4 | `notify_funded` | Job-client EIP-712 authorization over exact gateway + portfolio context → seller ACK |
 | 5 | Seller works | Stage 1: data collection → Stage 2: kimi-k2.6 extended thinking + report (~5–15 min) |
 | 6 | Fetch report | Tunnel URL → local relay → report displayed inline |
 | 7 | Settle | After 24h dispute window: `bag erc8183 settle <job_id>` |
+
+### Authenticated `notify_funded` protocol
+
+The TypeScript buyer client uses `notifyFunded(AGENT_ENDPOINT, wallet, jobId,
+options)` rather than a raw named-job payload. It serializes the complete
+context (delivery gateway URL/token, portfolio, and risk profile) once and
+signs that exact string as EIP-712 typed data. The seller supplies the chain
+and Commerce contract domain values, recovers the signature, and requires the
+signer to be the on-chain job client. The authorization envelope is the only
+source of named-job delivery and personalization fields.
+
+Production gateways must be public HTTPS `*.trycloudflare.com` origins by
+default. To test an HTTP loopback relay locally, explicitly set
+`ALLOW_PRIVATE_DELIVERY_GATEWAY=true` on the seller. For another approved
+public delivery origin, configure `DELIVERY_GATEWAY_ALLOWED_HOSTS` as a
+comma-separated exact hostname or `.suffix` allowlist; do not broaden it beyond
+the relay origins you operate.
 
 ---
 
@@ -477,9 +494,9 @@ Agent 使用 **Kimi K2.6**（`kimi-k2.6`，256k 上下文窗口）通过 `api.mo
 
 ### UOMP：个性化上下文 + 反向交付
 
-**用户上下文**：买家的持仓（代码、股数、平均成本）和风险偏好（容忍度、时间跨度、偏好指标）存放在本地控制的 Memory Guard 中。协商前，买家客户端读取这些数据，构建个性化任务描述，并在 `notify_funded` 时把结构化的持仓对象传给卖家。Agent 收到的是结构化数据，而不是通过公开 A2A 通道传输的原始个人数据。
+**用户上下文**：买家的持仓（代码、股数、平均成本）和风险偏好（容忍度、时间跨度、偏好指标）存放在本地控制的 Memory Guard 中。协商前，买家客户端读取这些数据并构建个性化任务描述。针对带 job ID 的 `notify_funded` 调用，客户端会将交付和持仓上下文序列化一次，并对完全相同的字符串签名；卖家只从 EIP-712 授权信封中接收并验证结构化上下文。
 
-**反向交付**：卖家在云端运行，没有买家可以主动拉取报告的入站 URL。买家在本地启动 `:9444` 中继，通过 Cloudflare Tunnel 暴露（`https://xxx.trycloudflare.com`），在 `notify_funded` 时把 Tunnel URL 传给卖家。卖家把报告 POST 到那里，买家从自己的本地中继读取。
+**反向交付**：卖家在云端运行，没有买家可以主动拉取报告的入站 URL。买家在本地启动 `:9444` 中继，通过 Cloudflare Tunnel 暴露（`https://xxx.trycloudflare.com`），并将 Tunnel URL 和 token 放入已签名的 `notify_funded` 上下文。卖家把报告 POST 到那里，买家从自己的本地中继读取。
 
 ---
 
@@ -502,7 +519,7 @@ Agent 使用 **Kimi K2.6**（`kimi-k2.6`，256k 上下文窗口）通过 `api.mo
 │                                                                           │  │
 └───────────────────────────────────────────────────────────────────────────┘  │
                          │ [4. notify_funded]                                   │
-                         │   + tunnel URL + token + 持仓数据 + 风险偏好         │
+                         │   EIP-712 签名的网关 + 持仓上下文                     │
                          ▼                                                       │
 ┌──────────────────────────────────────────────────────────────────────────┐   │
 │              BNB Chain 平台（云端卖家）                                    │   │
@@ -609,10 +626,24 @@ npm run dev
 | 1 | 加载 UOMP 上下文 | Guard → AAPL ×50 @ $185、NVDA ×20 @ $420，risk=moderate |
 | 2 | `negotiate`（A2A） | OAuth2 Token → A2A → 签名报价 1.0 U |
 | 3 | 链上买入 | createJob → registerJob → setBudget → approve → fund |
-| 4 | `notify_funded` | Tunnel URL + Token + 持仓数据 + 风险偏好 → 卖家 ACK |
+| 4 | `notify_funded` | job client 对精确网关 + 持仓上下文的 EIP-712 授权 → 卖家 ACK |
 | 5 | 卖家分析 | 第一阶段：5源数据采集 → 第二阶段：结构化报告撰写 |
 | 6 | 获取报告 | Tunnel URL → 本地中继 → 报告内联显示 |
 | 7 | 结算 | 24h 争议窗口后：`bag erc8183 settle <job_id>` |
+
+### 已认证的 `notify_funded` 协议
+
+TypeScript 买家客户端通过 `notifyFunded(AGENT_ENDPOINT, wallet, jobId,
+options)` 发起带 job ID 的通知，而不是手工构造原始请求。它会将完整上下文
+（交付网关 URL/token、持仓和风险偏好）序列化一次，并对完全相同的字符串进行
+EIP-712 签名。卖家使用自身配置的 chain 和 Commerce contract 域值恢复签名，且
+仅在签名者是链上 job client 时接受。授权信封是带 job ID 的交付和个性化字段的唯一来源。
+
+生产环境默认只接受公开 HTTPS `*.trycloudflare.com` 网关。若仅用于本地 HTTP
+loopback 中继测试，请在卖家端显式设置 `ALLOW_PRIVATE_DELIVERY_GATEWAY=true`。
+如果使用其他已批准的公开交付域名，请将
+`DELIVERY_GATEWAY_ALLOWED_HOSTS` 配置为逗号分隔的精确主机名或 `.suffix`
+允许列表，并保持范围尽可能窄。
 
 ---
 

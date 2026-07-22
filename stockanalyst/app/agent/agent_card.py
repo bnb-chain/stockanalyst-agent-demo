@@ -49,8 +49,13 @@ _NOTIFY_FUNDED = AgentSkill(
     id="notify_funded",
     name="Notify the seller a job is funded (request delivery)",
     description=(
-        "After you fund the job on-chain, send {\"skill\": \"notify_funded\", "
-        '"job_id": <int>} to tell the seller "I funded job X — please deliver". '
+        "After you fund a named job on-chain, use the buyer client's "
+        "notifyFunded helper to send its decimal job_id plus an authorization "
+        "envelope. The EIP-712 authorization signs the exact context string "
+        "(delivery gateway, token, portfolio, and risk profile) and must recover "
+        "to the on-chain job client; the seller-owned chain and contract domain "
+        "values are never supplied by the request. A bare {\"skill\": "
+        '"notify_funded"} call requests only a context-free funded-job sweep. '
         "The seller verifies the funded job carries its signed quote and replies "
         'AT ONCE with {"status": "accepted"|"rejected", "job_id"}; delivery then '
         "runs in the background (work takes time). Do NOT wait on this call for "

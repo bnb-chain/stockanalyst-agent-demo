@@ -60,7 +60,7 @@ Three ways to pay — pick the one that fits your use case:
         │  Cloudflare Tunnel ──────────────► https://xxx.trycloudflare.com
         │                                          │
         ├─[4]─ notify_funded ────────────► seller agent
-        │      + tunnel URL + token         ├─ kimi-k2.6 extended thinking (~5-15min)
+        │      EIP-712 signed context       ├─ kimi-k2.6 extended thinking (~5-15min)
         │                                   ├─[5]─ submit_result ─► BSC Testnet
         │                                   └─[6]─ POST report ───► Cloudflare Tunnel
         │                                                                 │
@@ -107,10 +107,28 @@ npm run dev                       # paid: 1 U, full analysis, ERC-8183 trustless
 | 1 | Buyer | Read UOMP Guard → AAPL/NVDA holdings + risk profile |
 | 2 | Buyer→Seller | A2A negotiate (OAuth2) → signed quote 1.0 U |
 | 3 | Buyer→Chain | createJob → registerJob → setBudget → approve → fund |
-| 4 | Buyer→Seller | notify_funded with Cloudflare Tunnel URL + token |
+| 4 | Buyer→Seller | `notify_funded` with EIP-712 authorization from the job-client wallet |
 | 5 | Seller | kimi-k2.6 extended thinking + report (~5–15 min) → submit_result → POST to tunnel |
 | 6 | Buyer | Poll chain → SUBMITTED → fetch report from local relay |
 | 7 | Buyer→Chain | settle (after 24h dispute window) |
+
+## Authenticated delivery notification
+
+Named `notify_funded` calls are authenticated separately from OAuth2. The buyer
+client serializes the complete delivery context once (gateway URL and token,
+portfolio, and risk profile), then its existing job-creation wallet signs that
+exact string as EIP-712 typed data. The request carries the decimal `job_id`
+and that authorization envelope; the seller recovers the signer against its own
+chain/Commerce domain and requires it to be the on-chain job client. The
+TypeScript [`notifyFunded`](buyer-client/src/negotiate.ts) helper is the supported
+way to make this request.
+
+For remote delivery, the production default accepts public HTTPS
+`*.trycloudflare.com` relay origins. Local loopback development is intentionally
+off by default: set `ALLOW_PRIVATE_DELIVERY_GATEWAY=true` only for an HTTP
+loopback relay. Deployments that use another approved public relay origin must
+configure `DELIVERY_GATEWAY_ALLOWED_HOSTS` (a comma-separated exact host or
+`.suffix` allowlist). These controls do not replace the buyer signature.
 
 ## Setup
 
