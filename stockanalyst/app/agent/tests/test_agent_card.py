@@ -54,6 +54,15 @@ def _load_agent_card():
 
 
 class NotifyFundedCardTests(unittest.TestCase):
+    def test_negotiate_handoff_requires_signed_notify_helper(self) -> None:
+        agent_card = _load_agent_card()
+        description = agent_card._NEGOTIATE.description
+
+        self.assertIn("notifyFunded", description)
+        self.assertIn("EIP-712", description)
+        self.assertIn("authorization", description.lower())
+        self.assertNotIn("`notify_funded` skill with the job_id", description)
+
     def test_card_requires_eip712_job_client_authorization(self) -> None:
         agent_card = _load_agent_card()
         description = agent_card._NOTIFY_FUNDED.description
@@ -63,4 +72,14 @@ class NotifyFundedCardTests(unittest.TestCase):
         self.assertIn("authorization", description.lower())
         self.assertNotIn(
             'send {"skill": "notify_funded", "job_id": <int>}', description
+        )
+
+    def test_card_distinguishes_bare_sweep_and_named_ack_shapes(self) -> None:
+        agent_card = _load_agent_card()
+        description = agent_card._NOTIFY_FUNDED.description
+
+        self.assertIn("returns status and note without job_id", description)
+        self.assertIn(
+            "signed named call returns status, reason, and job_id as applicable",
+            description,
         )

@@ -37,8 +37,9 @@ _NEGOTIATE = AgentSkill(
         '"terms": {"deliverables": "...", "quality_standards": "..."}} (both '
         "terms keys are REQUIRED) and receive a "
         "wallet-signed price quote (price, currency, negotiation_hash, provider_sig). "
-        "Anchor the returned envelope on-chain via createJob + fund, then send the "
-        "`notify_funded` skill with the job_id to request delivery."
+        "Anchor the returned envelope on-chain via createJob + fund, then use the "
+        "buyer client's notifyFunded helper with the job-creation wallet. It sends "
+        "the job_id with an EIP-712 authorization for the exact delivery context."
     ),
     tags=["erc8183", "negotiation", "bnb-chain"],
     input_modes=["application/json"],
@@ -55,9 +56,10 @@ _NOTIFY_FUNDED = AgentSkill(
         "(delivery gateway, token, portfolio, and risk profile) and must recover "
         "to the on-chain job client; the seller-owned chain and contract domain "
         "values are never supplied by the request. A bare {\"skill\": "
-        '"notify_funded"} call requests only a context-free funded-job sweep. '
-        "The seller verifies the funded job carries its signed quote and replies "
-        'AT ONCE with {"status": "accepted"|"rejected", "job_id"}; delivery then '
+        '"notify_funded"} call requests only a context-free funded-job sweep and '
+        "returns status and note without job_id. A signed named call returns status, "
+        "reason, and job_id as applicable after the seller verifies the funded job "
+        "carries its signed quote; delivery then "
         "runs in the background (work takes time). Do NOT wait on this call for "
         "the result — read the deliverable back from the CHAIN once the job "
         "reaches SUBMITTED (the `submit` tx carries the deliverable_url; "
