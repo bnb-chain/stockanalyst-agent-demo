@@ -141,7 +141,7 @@ async function main(): Promise<void> {
 
   // ── Step 4: notify_funded ────────────────────────────────────────────────
   hr(`Step 4: notify_funded — tell agent job #${buy.jobId} is funded`);
-  const notifyStatus = await notifyFunded(AGENT_ENDPOINT, buy.jobId, {
+  const notifyStatus = await notifyFunded(AGENT_ENDPOINT, wallet, buy.jobId, {
     gatewayUrl:   relay?.publicUrl,
     gatewayToken: relay?.token,
     portfolio,

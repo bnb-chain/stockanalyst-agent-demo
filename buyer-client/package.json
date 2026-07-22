@@ -6,6 +6,7 @@
   "main": "dist/index.js",
   "scripts": {
     "build": "tsc",
+    "test": "npm run build && node --test dist/*.test.js",
     "start": "node --env-file=.env dist/index.js",
     "dev": "npx tsx --env-file=.env src/index.ts",
     "x402": "npx tsx --env-file=.env src/x402.ts",
