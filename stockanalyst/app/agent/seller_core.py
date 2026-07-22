@@ -95,6 +95,11 @@ class SellerCore:
         #                 slower sweep never re-delivers a just-submitted job).
         self._tasks: set[asyncio.Task] = set()
         self._inflight: set[int] = set()
+        # Context-free sweep work records when it has irreversibly consumed the
+        # absence of notification context. Kept for terminal jobs alongside
+        # _inflight; cleared for transient outcomes so a named retry can win.
+        self._contextless_started: set[int] = set()
+        self._sweep_active = False
         # Immutable, authorization-bound off-chain context. This is installed
         # only after all on-chain and wallet checks succeed.
         self._job_contexts: dict[int, JobContext] = {}
@@ -143,7 +148,7 @@ class SellerCore:
         """
         raw = data.get("job_id")
         if raw is None or str(raw) == "":
-            self._spawn(self._sweep())  # bare notify → just scan stragglers
+            self._spawn_sweep()  # bare notify → just scan stragglers
             return {"status": "accepted", "note": "no job_id — scanning funded jobs in the background; poll the chain for results"}
         try:
             job_id = _parse_job_id(raw)
@@ -220,6 +225,15 @@ class SellerCore:
             logger.warning("job %s: notification rejected — %s", job_id, error.code)
             return {"status": "rejected", "job_id": job_id, "reason": error.code}
 
+        # Atomic with the worker's context lookup/marker update: neither path
+        # awaits between observing the marker/context and committing its state.
+        if job_id in self._contextless_started:
+            logger.warning("job %s: notification rejected — delivery_already_started", job_id)
+            return {
+                "status": "rejected",
+                "job_id": job_id,
+                "reason": "delivery_already_started",
+            }
         existing_context = self._job_contexts.get(job_id)
         if existing_context is None:
             self._job_contexts[job_id] = context
@@ -227,7 +241,7 @@ class SellerCore:
             logger.warning("job %s: notification rejected — context_conflict", job_id)
             return {"status": "rejected", "job_id": job_id, "reason": "context_conflict"}
         self._spawn_job(job_id, verified=True)
-        self._spawn(self._sweep())  # straggler fallback alongside the named job
+        self._spawn_sweep()  # straggler fallback alongside the named job
         return {
             "status": "accepted",
             "job_id": job_id,
@@ -240,6 +254,20 @@ class SellerCore:
         task = asyncio.create_task(coro)
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
+
+    def _spawn_sweep(self) -> None:
+        """Start at most one pending-job scan at a time."""
+        if self._sweep_active:
+            return
+        self._sweep_active = True
+
+        async def run_sweep() -> None:
+            try:
+                await self._sweep()
+            finally:
+                self._sweep_active = False
+
+        self._spawn(run_sweep())
 
     def _spawn_job(self, job_id: int, *, verified: bool) -> None:
         """Background-deliver ``job_id`` once, deduped against in-flight jobs.
@@ -291,6 +319,7 @@ class SellerCore:
                 self._job_contexts.pop(job_id, None)
             else:
                 self._inflight.discard(job_id)
+                self._contextless_started.discard(job_id)
 
     # -- internals -------------------------------------------------------------
     async def _fulfill_job(self, job_id: int) -> dict[str, Any]:
@@ -317,6 +346,8 @@ class SellerCore:
         # Read without consuming: a transient work/submit failure must retry with
         # the exact same authorization-bound values. Swept jobs have no context.
         context = self._job_contexts.get(job_id)
+        if context is None:
+            self._contextless_started.add(job_id)
         gateway_url = context.gateway_url if context is not None else None
         gateway_token = context.gateway_token if context is not None else None
         portfolio = context.portfolio_for_prompt() if context is not None else []

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import sys
+import threading
 import time
 from types import ModuleType, SimpleNamespace
 import unittest
@@ -78,10 +79,8 @@ class RecordingSellerCore(SellerCore):
         self._inflight.add(job_id)
         self.spawned_jobs.append((job_id, verified))
 
-    def _spawn(self, coro: object) -> None:
-        close = getattr(coro, "close", None)
-        if close is not None:
-            close()
+    def _spawn_sweep(self) -> None:
+        self._sweep().close()
 
 
 class NotifyFundedAuthorizationTests(unittest.IsolatedAsyncioTestCase):
@@ -156,6 +155,12 @@ class NotifyFundedAuthorizationTests(unittest.IsolatedAsyncioTestCase):
         context = authorization["context"]
         assert isinstance(context, str)
         return parse_signed_context(context)
+
+    @staticmethod
+    async def _drain_tasks(core: SellerCore) -> None:
+        while core._tasks:
+            await asyncio.gather(*tuple(core._tasks), return_exceptions=True)
+            await asyncio.sleep(0)
 
     async def test_unsigned_named_notification_is_rejected_without_state(self) -> None:
         result = await self.core.notify_funded({"job_id": JOB_ID})
@@ -310,6 +315,120 @@ class NotifyFundedAuthorizationTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertNotIn(JOB_ID, self.core._job_contexts)
         self.assertIn(JOB_ID, self.core._inflight)
+
+    async def test_named_context_installed_before_sweep_work_is_used(self) -> None:
+        run_work = AsyncMock(return_value="report")
+        core = SellerCore(run_work=run_work, generator="test")
+        core._sweep = AsyncMock(return_value=None)
+        request = self._signed_request()
+        expected_context = self._context_from_request(request)
+        sweep_verify_started = threading.Event()
+        allow_sweep_verify = threading.Event()
+        verify_call_count = 0
+        verify_lock = threading.Lock()
+
+        def ordered_verify(_job_id: int) -> tuple[bool, str, bool]:
+            nonlocal verify_call_count
+            with verify_lock:
+                verify_call_count += 1
+                call_number = verify_call_count
+            if call_number == 1:
+                sweep_verify_started.set()
+                allow_sweep_verify.wait(timeout=5)
+            return True, "", False
+
+        self.verify_signed_job.side_effect = ordered_verify
+        submitted = SimpleNamespace(submit_tx="0xtx", deliverable_url="https://result")
+        with (
+            patch.object(seller_core_module.signing, "job_spec", return_value=None),
+            patch.object(
+                seller_core_module.signing,
+                "submit_result",
+                return_value=submitted,
+            ) as submit,
+        ):
+            core._spawn_job(JOB_ID, verified=False)
+            started = await asyncio.to_thread(sweep_verify_started.wait, 2)
+            self.assertIs(started, True)
+            try:
+                result = await core.notify_funded(request)
+            finally:
+                allow_sweep_verify.set()
+            await self._drain_tasks(core)
+
+        self.assertEqual(result["status"], "accepted")
+        self.assertEqual(submit.call_args.kwargs["gateway_url"], expected_context.gateway_url)
+        self.assertEqual(submit.call_args.kwargs["gateway_token"], expected_context.gateway_token)
+        self.assertNotIn(JOB_ID, core._job_contexts)
+
+    async def test_named_context_is_rejected_after_context_free_work_starts(self) -> None:
+        run_work = AsyncMock(return_value="report")
+        core = SellerCore(run_work=run_work, generator="test")
+        core._sweep = AsyncMock(return_value=None)
+        job_spec_started = threading.Event()
+        allow_job_spec = threading.Event()
+
+        def blocking_job_spec(_job_id: int):
+            job_spec_started.set()
+            allow_job_spec.wait(timeout=5)
+            return None
+
+        submitted = SimpleNamespace(submit_tx="0xtx", deliverable_url="https://result")
+        with (
+            patch.object(seller_core_module.signing, "job_spec", side_effect=blocking_job_spec),
+            patch.object(
+                seller_core_module.signing,
+                "submit_result",
+                return_value=submitted,
+            ) as submit,
+        ):
+            core._spawn_job(JOB_ID, verified=False)
+            started = await asyncio.to_thread(job_spec_started.wait, 2)
+            self.assertIs(started, True)
+            try:
+                result = await core.notify_funded(self._signed_request())
+            finally:
+                allow_job_spec.set()
+            await self._drain_tasks(core)
+
+        self.assertEqual(result["status"], "rejected")
+        self.assertEqual(result["reason"], "delivery_already_started")
+        self.assertNotIn(JOB_ID, core._job_contexts)
+        self.assertIsNone(submit.call_args.kwargs["gateway_url"])
+        self.assertIsNone(submit.call_args.kwargs["gateway_token"])
+
+    async def test_identical_retries_share_one_active_sweep(self) -> None:
+        core = SellerCore(run_work=AsyncMock(return_value="report"), generator="test")
+        sweep_started = asyncio.Event()
+        release_sweep = asyncio.Event()
+        release_worker = asyncio.Event()
+
+        async def slow_sweep() -> None:
+            sweep_started.set()
+            await release_sweep.wait()
+
+        async def slow_worker(_job_id: int, *, verified: bool) -> None:
+            self.assertIs(verified, True)
+            await release_worker.wait()
+
+        core._sweep = AsyncMock(side_effect=slow_sweep)
+        core._run_job = AsyncMock(side_effect=slow_worker)
+        request = self._signed_request()
+
+        first = await core.notify_funded(request)
+        await asyncio.wait_for(sweep_started.wait(), timeout=2)
+        try:
+            second = await core.notify_funded(request)
+            await asyncio.sleep(0)
+            self.assertEqual(core._sweep.await_count, 1)
+        finally:
+            release_sweep.set()
+            release_worker.set()
+        await self._drain_tasks(core)
+
+        self.assertEqual(first["status"], "accepted")
+        self.assertEqual(second["status"], "accepted")
+        self.assertEqual(core._run_job.await_count, 1)
 
 
 if __name__ == "__main__":
