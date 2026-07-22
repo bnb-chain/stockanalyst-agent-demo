@@ -41,17 +41,17 @@ class _PinnedHTTPConnection(http.client.HTTPConnection):
         self,
         host: str,
         *,
-        pinned_address: str,
+        pinned_addresses: tuple[str, ...],
         pinned_port: int,
         **kwargs,
     ) -> None:
         super().__init__(host, **kwargs)
-        self._pinned_address = pinned_address
+        self._pinned_addresses = pinned_addresses
         self._pinned_port = pinned_port
 
     def connect(self) -> None:
         self.sock = _open_pinned_socket(
-            self._pinned_address,
+            self._pinned_addresses,
             self._pinned_port,
             self.timeout,
             self.source_address,
@@ -67,47 +67,54 @@ class _PinnedHTTPSConnection(http.client.HTTPSConnection):
         self,
         host: str,
         *,
-        pinned_address: str,
+        pinned_addresses: tuple[str, ...],
         pinned_port: int,
         **kwargs,
     ) -> None:
         super().__init__(host, **kwargs)
-        self._pinned_address = pinned_address
+        self._pinned_addresses = pinned_addresses
         self._pinned_port = pinned_port
 
     def connect(self) -> None:
         self.sock = _open_pinned_socket(
-            self._pinned_address,
+            self._pinned_addresses,
             self._pinned_port,
             self.timeout,
             self.source_address,
-        )
-        if self._tunnel_host:
-            self._tunnel()
-        self.sock = self._context.wrap_socket(
-            self.sock,
-            server_hostname=self.host,
+            wrap_socket=lambda connection: self._context.wrap_socket(
+                connection,
+                server_hostname=self.host,
+            ),
         )
 
 
 def _open_pinned_socket(
-    address: str,
+    addresses: tuple[str, ...],
     port: int,
     timeout: object,
     source_address: tuple[str, int] | None,
+    wrap_socket: Callable[[Any], Any] | None = None,
 ):
-    family = socket.AF_INET6 if ip_address(address).version == 6 else socket.AF_INET
-    connection = socket.socket(family, socket.SOCK_STREAM)
-    try:
-        if timeout is not socket._GLOBAL_DEFAULT_TIMEOUT:
-            connection.settimeout(timeout)
-        if source_address:
-            connection.bind(source_address)
-        connection.connect((address, port))
-        return connection
-    except Exception:
-        connection.close()
-        raise
+    first_error: Exception | None = None
+    for address in addresses:
+        connection = None
+        try:
+            family = socket.AF_INET6 if ip_address(address).version == 6 else socket.AF_INET
+            connection = socket.socket(family, socket.SOCK_STREAM)
+            if timeout is not socket._GLOBAL_DEFAULT_TIMEOUT:
+                connection.settimeout(timeout)
+            if source_address:
+                connection.bind(source_address)
+            connection.connect((address, port))
+            return wrap_socket(connection) if wrap_socket is not None else connection
+        except Exception as error:
+            if connection is not None:
+                connection.close()
+            if first_error is None:
+                first_error = error
+    if first_error is not None:
+        raise first_error
+    raise OSError("gateway resolved without an address")
 
 
 class _PinnedHTTPHandler(urllib.request.HTTPHandler):
@@ -126,13 +133,14 @@ class _PinnedHTTPHandler(urllib.request.HTTPHandler):
                 scheme="http",
                 host=host,
                 address=self._validated.addresses[0],
+                addresses=self._validated.addresses,
                 port=self._validated.port,
                 context=None,
                 timeout=timeout,
             )
         return _PinnedHTTPConnection(
             host,
-            pinned_address=self._validated.addresses[0],
+            pinned_addresses=self._validated.addresses,
             pinned_port=self._validated.port,
             timeout=timeout,
         )
@@ -159,13 +167,14 @@ class _PinnedHTTPSHandler(urllib.request.HTTPSHandler):
                 scheme="https",
                 host=host,
                 address=self._validated.addresses[0],
+                addresses=self._validated.addresses,
                 port=self._validated.port,
                 context=self._context,
                 timeout=timeout,
             )
         return _PinnedHTTPSConnection(
             host,
-            pinned_address=self._validated.addresses[0],
+            pinned_addresses=self._validated.addresses,
             pinned_port=self._validated.port,
             context=self._context,
             timeout=timeout,
@@ -273,10 +282,11 @@ class UOMPGatewayStorageProvider(StorageProvider):
             port = parsed.port
         except (TypeError, ValueError, UnicodeError):
             raise ValueError("invalid payload URL") from None
+        scheme = parsed.scheme.lower()
         expected_port = self._origin.port or (443 if self._origin.scheme == "https" else 80)
-        actual_port = port or (443 if parsed.scheme == "https" else 80)
+        actual_port = port or (443 if scheme == "https" else 80)
         if (
-            parsed.scheme.lower() != self._origin.scheme
+            scheme != self._origin.scheme
             or parsed.hostname is None
             or parsed.hostname.lower() != self._origin.hostname
             or actual_port != expected_port

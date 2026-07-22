@@ -222,7 +222,7 @@ class ProviderConstructionTests(unittest.TestCase):
                 context.wrap_socket.return_value = wrapped_socket
                 connection = storage_module._PinnedHTTPSConnection(
                     "buyer.trycloudflare.com",
-                    pinned_address=address,
+                    pinned_addresses=(address,),
                     pinned_port=443,
                     context=context,
                     timeout=30,
@@ -251,6 +251,132 @@ class ProviderConstructionTests(unittest.TestCase):
                     server_hostname="buyer.trycloudflare.com",
                 )
                 self.assertIs(connection.sock, wrapped_socket)
+
+    def test_pinned_connection_tries_all_validated_addresses_without_resolution(self) -> None:
+        resolver_calls = 0
+
+        def two_address_resolver(host: str, port: int, *args, **kwargs):
+            nonlocal resolver_calls
+            del host, args, kwargs
+            resolver_calls += 1
+            return [
+                (
+                    socket.AF_INET,
+                    socket.SOCK_STREAM,
+                    socket.IPPROTO_TCP,
+                    "",
+                    (address, port),
+                )
+                for address in ("104.16.132.229", "104.16.133.229")
+            ]
+
+        captured_handlers: list[object] = []
+
+        def capture_opener(*handlers):
+            captured_handlers.extend(handlers)
+            return FakeOpener()
+
+        with patch.object(urllib.request, "build_opener", side_effect=capture_opener):
+            UOMPGatewayStorageProvider(
+                "https://buyer.trycloudflare.com",
+                "token",
+                resolver=two_address_resolver,
+            )
+        handler = next(
+            item for item in captured_handlers if isinstance(item, urllib.request.HTTPSHandler)
+        )
+        connection = handler._connection("buyer.trycloudflare.com", timeout=30)
+        first_socket = Mock()
+        first_socket.connect.side_effect = OSError("first address unreachable")
+        second_socket = Mock()
+        wrapped_socket = object()
+        handler._context.wrap_socket = Mock(return_value=wrapped_socket)
+
+        with (
+            patch.object(
+                storage_module.socket,
+                "getaddrinfo",
+                side_effect=AssertionError("must not resolve while connecting"),
+            ) as resolve,
+            patch.object(
+                storage_module.socket,
+                "socket",
+                side_effect=[first_socket, second_socket],
+            ),
+        ):
+            connection.connect()
+
+        self.assertEqual(resolver_calls, 1)
+        resolve.assert_not_called()
+        first_socket.connect.assert_called_once_with(("104.16.132.229", 443))
+        first_socket.close.assert_called_once_with()
+        second_socket.connect.assert_called_once_with(("104.16.133.229", 443))
+        second_socket.close.assert_not_called()
+        handler._context.wrap_socket.assert_called_once_with(
+            second_socket,
+            server_hostname="buyer.trycloudflare.com",
+        )
+        self.assertIs(connection.sock, wrapped_socket)
+
+    def test_pinned_connection_preserves_first_error_when_all_addresses_fail(self) -> None:
+        first_error = OSError("first address unreachable")
+        second_error = OSError("second address unreachable")
+        first_socket = Mock()
+        first_socket.connect.side_effect = first_error
+        second_socket = Mock()
+        second_socket.connect.side_effect = second_error
+        connection = storage_module._PinnedHTTPConnection(
+            "buyer.trycloudflare.com",
+            pinned_addresses=("104.16.132.229", "104.16.133.229"),
+            pinned_port=80,
+            timeout=30,
+        )
+
+        with (
+            patch.object(
+                storage_module.socket,
+                "getaddrinfo",
+                side_effect=AssertionError("must not resolve while connecting"),
+            ) as resolve,
+            patch.object(
+                storage_module.socket,
+                "socket",
+                side_effect=[first_socket, second_socket],
+            ),
+            self.assertRaises(OSError) as raised,
+        ):
+            connection.connect()
+
+        self.assertIs(raised.exception, first_error)
+        resolve.assert_not_called()
+        first_socket.close.assert_called_once_with()
+        second_socket.close.assert_called_once_with()
+
+    def test_https_failover_closes_failed_tls_connection(self) -> None:
+        first_socket = Mock()
+        second_socket = Mock()
+        wrapped_socket = object()
+        context = Mock()
+        context.wrap_socket.side_effect = [ssl.SSLError("TLS failed"), wrapped_socket]
+        connection = storage_module._PinnedHTTPSConnection(
+            "buyer.trycloudflare.com",
+            pinned_addresses=("104.16.132.229", "104.16.133.229"),
+            pinned_port=443,
+            context=context,
+            timeout=30,
+        )
+
+        with patch.object(
+            storage_module.socket,
+            "socket",
+            side_effect=[first_socket, second_socket],
+        ):
+            connection.connect()
+
+        first_socket.close.assert_called_once_with()
+        second_socket.close.assert_not_called()
+        self.assertEqual(context.wrap_socket.call_count, 2)
+        self.assertIs(connection.sock, wrapped_socket)
 
 
 class UploadTests(unittest.IsolatedAsyncioTestCase):
@@ -339,6 +465,20 @@ class ResourceUrlTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(request.get_method(), "GET")
         self.assertEqual(timeout, 30)
         self.assertEqual(opener.response.read_sizes, [65_537])
+
+    async def test_download_normalizes_uppercase_https_with_implicit_default_port(self) -> None:
+        opener = FakeOpener(b'{"response":{"content":"report"}}')
+        instance = provider(opener)
+
+        await instance.download(
+            "HTTPS://BUYER.TRYCLOUDFLARE.COM/v1/payload/payload_123"
+        )
+
+        request, _ = opener.requests[0]
+        self.assertEqual(
+            request.full_url,
+            "https://buyer.trycloudflare.com/v1/payload/payload_123",
+        )
 
     async def test_download_rejects_cross_origin_and_path_smuggling(self) -> None:
         urls = [
