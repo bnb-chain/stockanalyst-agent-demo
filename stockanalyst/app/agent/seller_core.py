@@ -44,10 +44,14 @@ import os
 from typing import Any
 
 import signing
-from bnbagent_studio_core.erc8183.errors import SubmitPermanentlyUnsupportedError
+from bnbagent_studio_core.erc8183.errors import (
+    SdkCallFailedError,
+    SubmitPermanentlyUnsupportedError,
+)
 from notify_security import (
     JobContext,
     NotifySecurityError,
+    preflight_notify_authorization,
     validate_gateway_url,
     verify_notify_authorization,
 )
@@ -75,6 +79,7 @@ def _env_seconds(name: str, default: int) -> float:
 _JOB_DELIVERY_TIMEOUT_SECONDS = _env_seconds("NOTIFY_DELIVERY_TIMEOUT_SECONDS", 1800)
 _SWEEP_TIMEOUT_SECONDS = _env_seconds("NOTIFY_SWEEP_TIMEOUT_SECONDS", 60)
 _PREVERIFY_TIMEOUT_SECONDS = _env_seconds("NOTIFY_PREVERIFY_TIMEOUT_SECONDS", 30)
+_MAX_JOB_ID = 2**256 - 1
 
 
 class SellerCore:
@@ -96,14 +101,18 @@ class SellerCore:
         self._network = network or "bsc-testnet"
         # Background delivery bookkeeping (see notify_funded / is_busy):
         #  _tasks       — live background asyncio tasks (busy-status source).
-        #  _inflight    — job ids in flight OR already terminally handled this
-        #                 process (notify/sweep dedup; retained on success so a
-        #                 slower sweep never re-delivers a just-submitted job).
+        #  _inflight    — job ids with active background work.
+        #  _handled     — terminal jobs retained for process-lifetime dedup so a
+        #                 stale notify/sweep cannot reinstall context or redeliver.
         self._tasks: set[asyncio.Task] = set()
         self._inflight: set[int] = set()
+        # Terminal jobs are distinct from live work. This marker is checked in
+        # the same no-await section as context compare-and-set, so a stale
+        # verification can never reinstall context after terminal cleanup.
+        self._handled: set[int] = set()
         # Context-free sweep work records when it has irreversibly consumed the
         # absence of notification context. Kept for terminal jobs alongside
-        # _inflight; cleared for transient outcomes so a named retry can win.
+        # _handled; cleared for transient outcomes so a named retry can win.
         self._contextless_started: set[int] = set()
         self._sweep_active = False
         # Immutable, authorization-bound off-chain context. This is installed
@@ -179,6 +188,11 @@ class SellerCore:
                 "job_id": job_id,
                 "reason": "authorization_required",
             }
+        try:
+            preflight_notify_authorization(authorization)
+        except NotifySecurityError as error:
+            logger.warning("job %s: notification rejected — %s", job_id, error.code)
+            return {"status": "rejected", "job_id": job_id, "reason": error.code}
 
         try:
             ok, reason, permanent = await asyncio.wait_for(
@@ -233,12 +247,13 @@ class SellerCore:
                     gateway_url=validate_gateway_url(context.gateway_url),
                 )
         except NotifySecurityError as error:
-            logger.warning("job %s: notification rejected — %s", job_id, error.code)
-            return {"status": "rejected", "job_id": job_id, "reason": error.code}
+            reason = "unsafe_gateway" if error.code == "invalid_gateway_url" else error.code
+            logger.warning("job %s: notification rejected — %s", job_id, reason)
+            return {"status": "rejected", "job_id": job_id, "reason": reason}
 
         # Atomic with the worker's context lookup/marker update: neither path
         # awaits between observing the marker/context and committing its state.
-        if job_id in self._contextless_started:
+        if job_id in self._handled or job_id in self._contextless_started:
             logger.warning("job %s: notification rejected — delivery_already_started", job_id)
             return {
                 "status": "rejected",
@@ -286,7 +301,7 @@ class SellerCore:
         ``_inflight`` is updated SYNCHRONOUSLY here (before scheduling) so a
         concurrent notify + sweep can never double-deliver the same job.
         """
-        if job_id in self._inflight:
+        if job_id in self._inflight or job_id in self._handled:
             return
         self._inflight.add(job_id)
         self._spawn(self._run_job(job_id, verified=verified))
@@ -307,14 +322,17 @@ class SellerCore:
                 self._do_work_and_submit(job_id) if verified else self._fulfill_job(job_id),
                 timeout=_JOB_DELIVERY_TIMEOUT_SECONDS,
             )
-            logger.info("notify_funded job %s → %s", job_id, result)
-            # A terminal outcome (delivered, or a permanent skip) must STAY in
-            # _inflight: keeping it lets the dedup gate in _spawn_job reject a
-            # slower concurrent sweep that still sees this job as FUNDED, so the
-            # just-submitted job is never re-delivered. Clearing on success
-            # reopened that race — the sweep re-ran the work and then failed the
-            # on-chain FUNDED gate (Job status is SUBMITTED). Only transient
-            # failures fall through to discard so a later sweep can retry them.
+            logger.info(
+                "notify_funded job %s completed (ok=%s, skip=%s)",
+                job_id,
+                bool(result.get("ok")),
+                bool(result.get("skip")),
+            )
+            # A terminal outcome (delivered, or a permanent skip) moves to the
+            # distinct handled marker. The _spawn_job gate then rejects a slower
+            # concurrent sweep that still sees this job as FUNDED, while the
+            # notify CAS gate rejects stale verified requests after context cleanup.
+            # Only transient failures clear all markers for a later retry.
             terminal = bool(result.get("ok") or result.get("skip"))
         except (asyncio.TimeoutError, TimeoutError):
             # Transient by design — leave terminal False so a later sweep retries.
@@ -327,7 +345,9 @@ class SellerCore:
             logger.exception("background delivery of job %s failed", job_id)
         finally:
             if terminal:
+                self._handled.add(job_id)
                 self._job_contexts.pop(job_id, None)
+                self._inflight.discard(job_id)
             else:
                 self._inflight.discard(job_id)
                 self._contextless_started.discard(job_id)
@@ -393,6 +413,22 @@ class SellerCore:
             # Deterministic for this wallet kind: submit can NEVER succeed →
             # permanent skip (a transient error would burn one LLM call / retry).
             return {"ok": False, "job_id": job_id, "skip": True, "reason": str(e)}
+        except SdkCallFailedError as error:
+            # bnbagent's structured contract marks only genuine transient
+            # chain/internal failures with ``retryable=True``. Missing/false
+            # retryability is terminal; retrying an unclassified SDK failure
+            # would repeat costly LLM work forever.
+            if error.retryable is True:
+                raise
+            result = {
+                "ok": False,
+                "job_id": job_id,
+                "skip": True,
+                "reason": error.code or "submission_failed",
+            }
+            if error.tx_hash is not None:
+                result["tx_hash"] = error.tx_hash
+            return result
         return {
             "ok": True,
             "job_id": job_id,
@@ -651,7 +687,15 @@ FIELD RULES:
 
 def _parse_job_id(raw: Any) -> int:
     """Normalise an envelope ``job_id`` (``0x..`` / decimal string / int) to int."""
+    if isinstance(raw, bool):
+        raise TypeError("job_id must be an unsigned integer")
     if isinstance(raw, int):
-        return raw
-    s = str(raw).strip()
-    return int(s, 16) if s.lower().startswith("0x") else int(s)
+        job_id = raw
+    elif isinstance(raw, str):
+        s = raw.strip()
+        job_id = int(s, 16) if s.lower().startswith("0x") else int(s)
+    else:
+        raise TypeError("job_id must be an integer or string")
+    if not 0 <= job_id <= _MAX_JOB_ID:
+        raise ValueError("job_id is outside uint256")
+    return job_id

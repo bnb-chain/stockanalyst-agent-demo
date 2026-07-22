@@ -6,6 +6,7 @@ import {
   buildNotifyContext,
   createNotifyAuthorization,
   recoverNotifySigner,
+  type NotifyOptions,
 } from "./notify-auth.js";
 import { notifyFunded } from "./negotiate.js";
 
@@ -25,6 +26,28 @@ const vector = JSON.parse(
     "utf8",
   ),
 ) as NotifyAuthVector;
+
+const missingRiskHorizon: NotifyOptions = {
+  // @ts-expect-error risk profiles require horizonMonths.
+  riskProfile: { tolerance: "moderate", preferredIndicators: [] },
+};
+void missingRiskHorizon;
+
+const missingRiskIndicators: NotifyOptions = {
+  // @ts-expect-error risk profiles require preferredIndicators.
+  riskProfile: { tolerance: "moderate", horizonMonths: 12 },
+};
+void missingRiskIndicators;
+
+const invalidRiskTolerance: NotifyOptions = {
+  riskProfile: {
+    // @ts-expect-error tolerance is a closed conservative/moderate/aggressive union.
+    tolerance: "reckless",
+    horizonMonths: 12,
+    preferredIndicators: [],
+  },
+};
+void invalidRiskTolerance;
 
 test("signs exact context for a large job id", async () => {
   const wallet = new Wallet(vector.test_key);
@@ -53,7 +76,7 @@ test("signs exact context for a large job id", async () => {
 test("sends a signed notification envelope without duplicate context fields", async () => {
   const wallet = new Wallet(vector.test_key);
   const jobId = 2n ** 60n + 7n;
-  const options = {
+  const options: NotifyOptions = {
     gatewayUrl: "https://buyer.trycloudflare.com",
     gatewayToken: "relay-token",
     portfolio: [{ symbol: "AAPL", shares: 10, avgCost: 190.25, currency: "USD" }],
@@ -93,4 +116,20 @@ test("sends a signed notification envelope without duplicate context fields", as
   assert.equal(authorization["context"], expectedContext);
   assert.equal("portfolio" in data, false);
   assert.equal("delivery_gateway_token" in data, false);
+});
+
+test("serializes every required risk-profile field into the signed context", () => {
+  const context = JSON.parse(buildNotifyContext({
+    riskProfile: {
+      tolerance: "aggressive",
+      horizonMonths: 24,
+      preferredIndicators: ["MACD", "ATR"],
+    },
+  })) as { risk_profile: Record<string, unknown> };
+
+  assert.deepEqual(context.risk_profile, {
+    tolerance: "aggressive",
+    horizonMonths: 24,
+    preferredIndicators: ["MACD", "ATR"],
+  });
 });

@@ -215,11 +215,18 @@ def submit_result(
     Without gateway params the function falls back to the default storage backend
     configured in studio.toml (typically LocalStorageProvider for local dev).
     """
-    if gateway_url and gateway_token:
-        import bnbagent_studio_core.storage as _storage_mod
-        from uomp_storage import UOMPGatewayStorageProvider, submit_lock
+    # The gateway path temporarily replaces a process-global SDK factory. Every
+    # submission, including default-storage sweeps, must share this lock or a
+    # concurrent default call can capture another buyer's gateway provider.
+    # The current SDK has no explicit provider-injection seam, so the lock
+    # cannot safely be shortened to provider construction alone.
+    from uomp_storage import submit_lock
 
-        with submit_lock:
+    with submit_lock:
+        if gateway_url and gateway_token:
+            import bnbagent_studio_core.storage as _storage_mod
+            from uomp_storage import UOMPGatewayStorageProvider
+
             _orig = _storage_mod.storage_provider_from_config
             _storage_mod.storage_provider_from_config = (
                 lambda **_kw: UOMPGatewayStorageProvider(gateway_url, gateway_token)
@@ -229,7 +236,7 @@ def submit_result(
             finally:
                 _storage_mod.storage_provider_from_config = _orig
 
-    return submit_workflow(job_id, response_content, metadata=metadata)
+        return submit_workflow(job_id, response_content, metadata=metadata)
 
 
 def settle(job_id: int) -> str:

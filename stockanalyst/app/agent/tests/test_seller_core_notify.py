@@ -44,7 +44,23 @@ class SubmitPermanentlyUnsupportedError(Exception):
     pass
 
 
+class SdkCallFailedError(Exception):
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: str | None = None,
+        tx_hash: str | None = None,
+        retryable: bool | None = None,
+    ) -> None:
+        self.code = code
+        self.tx_hash = tx_hash
+        self.retryable = retryable
+        super().__init__(message)
+
+
 errors_stub.SubmitPermanentlyUnsupportedError = SubmitPermanentlyUnsupportedError
+errors_stub.SdkCallFailedError = SdkCallFailedError
 studio_core_stub.erc8183 = erc8183_stub
 erc8183_stub.errors = errors_stub
 sys.modules.setdefault("bnbagent_studio_core", studio_core_stub)
@@ -91,7 +107,7 @@ class RecordingSellerCore(SellerCore):
         self.spawned_jobs: list[tuple[int, bool]] = []
 
     def _spawn_job(self, job_id: int, *, verified: bool) -> None:
-        if job_id in self._inflight:
+        if job_id in self._inflight or job_id in self._handled:
             return
         self._inflight.add(job_id)
         self.spawned_jobs.append((job_id, verified))
@@ -244,6 +260,51 @@ class NotifyFundedAuthorizationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.core._job_contexts, {})
         self.assertEqual(self.core.spawned_jobs, [])
 
+    async def test_invalid_job_ids_are_rejected_before_chain_rpc(self) -> None:
+        for raw_job_id in (True, -1, 2**256):
+            with self.subTest(job_id=raw_job_id):
+                request = self._signed_request()
+                request["job_id"] = raw_job_id
+                self.verify_signed_job.reset_mock()
+                self.job_authorization_target.reset_mock()
+
+                result = await self.core.notify_funded(request)
+
+                self.assertEqual(result["status"], "rejected")
+                self.verify_signed_job.assert_not_called()
+                self.job_authorization_target.assert_not_called()
+
+    async def test_malformed_authorization_is_rejected_before_chain_rpc(self) -> None:
+        request = self._signed_request()
+        authorization = request["authorization"]
+        assert isinstance(authorization, dict)
+        malformed_authorizations = [
+            {key: value for key, value in authorization.items() if key != "context"},
+            {**authorization, "unexpected": "value"},
+            {**authorization, "context": 42},
+            {**authorization, "context": "x" * 65_537},
+            {**authorization, "expires_at": True},
+            {**authorization, "expires_at": int(time.time()) - 31},
+            {**authorization, "expires_at": int(time.time()) + 601},
+            {**authorization, "nonce": "0x01"},
+            {**authorization, "signature": "0x01"},
+        ]
+
+        for malformed in malformed_authorizations:
+            with self.subTest(keys=tuple(malformed), expires_at=malformed.get("expires_at")):
+                self.verify_signed_job.reset_mock()
+                self.job_authorization_target.reset_mock()
+                self.validate_gateway_url.reset_mock()
+
+                result = await self.core.notify_funded(
+                    {"job_id": JOB_ID, "authorization": malformed}
+                )
+
+                self.assertEqual(result["status"], "rejected")
+                self.verify_signed_job.assert_not_called()
+                self.job_authorization_target.assert_not_called()
+                self.validate_gateway_url.assert_not_called()
+
     async def test_unsafe_signed_gateway_is_rejected_before_state_or_spawn(self) -> None:
         self.validate_gateway_url.side_effect = lambda url: self.real_validate_gateway_url(
             url,
@@ -253,10 +314,41 @@ class NotifyFundedAuthorizationTests(unittest.IsolatedAsyncioTestCase):
         result = await self.core.notify_funded(self._signed_request())
 
         self.assertEqual(result["status"], "rejected")
-        self.assertEqual(result["reason"], "invalid_gateway_url")
+        self.assertEqual(result["reason"], "unsafe_gateway")
         self.assertEqual(self.core._job_contexts, {})
         self.assertEqual(self.core._inflight, set())
         self.assertEqual(self.core.spawned_jobs, [])
+
+    async def test_signer_verification_precedes_gateway_dns(self) -> None:
+        request = self._signed_request()
+        context = self._context_from_request(request)
+        order: list[str] = []
+
+        def verify_signer(*args, **kwargs):
+            del args, kwargs
+            order.append("signer")
+            return context
+
+        def validate_dns(url: str) -> str:
+            order.append("dns")
+            return url
+
+        with (
+            patch.object(
+                seller_core_module,
+                "verify_notify_authorization",
+                side_effect=verify_signer,
+            ),
+            patch.object(
+                seller_core_module,
+                "validate_gateway_url",
+                side_effect=validate_dns,
+            ),
+        ):
+            result = await self.core.notify_funded(request)
+
+        self.assertEqual(result["status"], "accepted")
+        self.assertEqual(order, ["signer", "dns"])
 
     async def test_identical_signed_context_is_idempotent(self) -> None:
         request = self._signed_request()
@@ -356,7 +448,138 @@ class NotifyFundedAuthorizationTests(unittest.IsolatedAsyncioTestCase):
         await self.core._run_job(JOB_ID, verified=True)
 
         self.assertNotIn(JOB_ID, self.core._job_contexts)
-        self.assertIn(JOB_ID, self.core._inflight)
+        self.assertNotIn(JOB_ID, self.core._inflight)
+        self.assertIn(JOB_ID, self.core._handled)
+
+    async def test_terminal_delivery_log_does_not_include_gateway_result_url(self) -> None:
+        self.core._inflight.add(JOB_ID)
+        self.core._do_work_and_submit = AsyncMock(
+            return_value={
+                "ok": True,
+                "job_id": JOB_ID,
+                "tx_hash": "0xtx",
+                "deliverable_url": "https://buyer.trycloudflare.com/v1/payload/private",
+            }
+        )
+
+        with patch.object(seller_core_module.logger, "info") as log_info:
+            await self.core._run_job(JOB_ID, verified=True)
+
+        rendered = log_info.call_args.args[0] % log_info.call_args.args[1:]
+        self.assertIn(str(JOB_ID), rendered)
+        self.assertNotIn("trycloudflare.com", rendered)
+        self.assertNotIn("private", rendered)
+
+    async def test_terminal_sdk_submission_failures_do_not_retry(self) -> None:
+        failures = [
+            SdkCallFailedError("expired", code="job_expired"),
+            SdkCallFailedError("wrong status", code="wrong_status"),
+            SdkCallFailedError(
+                "deadline passed",
+                code="submit_deadline_passed",
+            ),
+            SdkCallFailedError(
+                "network timeout text must not override the verdict",
+                code="future_terminal_code",
+                retryable=False,
+            ),
+            SdkCallFailedError(
+                "unclassified SDK failure is not an authorized retry verdict",
+                code=None,
+                retryable=None,
+            ),
+        ]
+        for failure in failures:
+            with self.subTest(code=failure.code, retryable=failure.retryable):
+                core = RecordingSellerCore()
+                context = self._context_from_request(self._signed_request())
+                core._job_contexts[JOB_ID] = context
+                core._inflight.add(JOB_ID)
+                core._run_work = AsyncMock(return_value="report")
+                with (
+                    patch.object(seller_core_module.signing, "job_spec", return_value=None),
+                    patch.object(
+                        seller_core_module.signing,
+                        "submit_result",
+                        side_effect=failure,
+                    ),
+                ):
+                    await core._run_job(JOB_ID, verified=True)
+
+                self.assertNotIn(JOB_ID, core._job_contexts)
+                self.assertNotIn(JOB_ID, core._inflight)
+                self.assertIn(JOB_ID, core._handled)
+
+    async def test_retryable_sdk_submission_failure_keeps_context(self) -> None:
+        core = RecordingSellerCore()
+        context = self._context_from_request(self._signed_request())
+        core._job_contexts[JOB_ID] = context
+        core._inflight.add(JOB_ID)
+        core._run_work = AsyncMock(return_value="report")
+        failure = SdkCallFailedError(
+            "job_expired appears only in arbitrary message text",
+            code="chain_unavailable",
+            retryable=True,
+        )
+        with (
+            patch.object(seller_core_module.signing, "job_spec", return_value=None),
+            patch.object(
+                seller_core_module.signing,
+                "submit_result",
+                side_effect=failure,
+            ),
+        ):
+            await core._run_job(JOB_ID, verified=True)
+
+        self.assertIs(core._job_contexts[JOB_ID], context)
+        self.assertNotIn(JOB_ID, core._inflight)
+        self.assertNotIn(JOB_ID, core._handled)
+
+    async def test_stale_verified_notification_cannot_install_after_terminal(self) -> None:
+        core = RecordingSellerCore()
+        first_request = self._signed_request()
+        conflicting_request = self._signed_request(
+            context={
+                "delivery_gateway_url": "https://second.trycloudflare.com",
+                "delivery_gateway_token": "second-token",
+                "portfolio": [],
+            }
+        )
+        target_lookup_started = threading.Event()
+        release_target_lookup = threading.Event()
+        target_calls = 0
+        target_calls_lock = threading.Lock()
+
+        def ordered_target(_job_id: int):
+            nonlocal target_calls
+            with target_calls_lock:
+                target_calls += 1
+                call_number = target_calls
+            if call_number == 2:
+                target_lookup_started.set()
+                release_target_lookup.wait(timeout=5)
+            return self.target
+
+        self.job_authorization_target.side_effect = ordered_target
+        first = await core.notify_funded(first_request)
+        core._do_work_and_submit = AsyncMock(
+            return_value={"ok": True, "job_id": JOB_ID, "tx_hash": "0xtx"}
+        )
+        stale = asyncio.create_task(core.notify_funded(conflicting_request))
+        started = await asyncio.to_thread(target_lookup_started.wait, 2)
+        self.assertIs(started, True)
+        try:
+            await core._run_job(JOB_ID, verified=True)
+        finally:
+            release_target_lookup.set()
+        second = await stale
+
+        self.assertEqual(first["status"], "accepted")
+        self.assertEqual(second["status"], "rejected")
+        self.assertEqual(second["reason"], "delivery_already_started")
+        self.assertNotIn(JOB_ID, core._job_contexts)
+        self.assertIn(JOB_ID, core._handled)
+        self.assertEqual(core.spawned_jobs, [(JOB_ID, True)])
 
     async def test_named_context_installed_before_sweep_work_is_used(self) -> None:
         run_work = AsyncMock(return_value="report")

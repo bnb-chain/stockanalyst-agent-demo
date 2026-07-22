@@ -63,16 +63,50 @@ class FakeResponse:
     def __init__(self, body: bytes) -> None:
         self.body = body
         self.read_sizes: list[int] = []
+        self.closed = False
 
     def __enter__(self):
         return self
 
     def __exit__(self, *args) -> None:
         del args
+        self.close()
 
     def read(self, size: int = -1) -> bytes:
         self.read_sizes.append(size)
         return self.body if size < 0 else self.body[:size]
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class FakeClock:
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def __call__(self) -> float:
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
+
+
+class SlowDripResponse(FakeResponse):
+    def __init__(self, chunks: list[bytes], clock: FakeClock) -> None:
+        super().__init__(b"".join(chunks))
+        self._chunks = list(chunks)
+        self._clock = clock
+
+    def read(self, size: int = -1) -> bytes:
+        self._clock.advance(0.4)
+        return super().read(size)
+
+    def read1(self, size: int = -1) -> bytes:
+        self.read_sizes.append(size)
+        self._clock.advance(0.4)
+        if not self._chunks:
+            return b""
+        return self._chunks.pop(0)
 
 
 class FakeOpener:
@@ -86,6 +120,16 @@ class FakeOpener:
         if self.error is not None:
             raise self.error
         return self.response
+
+
+class DelayedOpener(FakeOpener):
+    def __init__(self, clock: FakeClock) -> None:
+        super().__init__(b"")
+        self._clock = clock
+
+    def open(self, request: urllib.request.Request, *, timeout: int):
+        self._clock.advance(1.1)
+        return super().open(request, timeout=timeout)
 
 
 class FakeTransportResponse(FakeResponse):
@@ -164,6 +208,52 @@ def provider(opener: FakeOpener | None = None) -> UOMPGatewayStorageProvider:
 
 
 class ProviderConstructionTests(unittest.TestCase):
+    def test_deadline_socket_recomputes_remaining_timeout_and_closes_on_expiry(self) -> None:
+        clock = FakeClock()
+        raw_socket = Mock()
+        raw_socket.recv_into.return_value = 1
+        deadline_socket = getattr(storage_module, "_DeadlineSocket", None)
+        self.assertIsNotNone(deadline_socket)
+        wrapped = deadline_socket(
+            raw_socket,
+            deadline=1.0,
+            monotonic=clock,
+        )
+        clock.advance(0.75)
+
+        self.assertEqual(wrapped.recv_into(bytearray(1)), 1)
+        raw_socket.settimeout.assert_called_once_with(0.25)
+
+        clock.advance(0.30)
+        with self.assertRaises(TimeoutError):
+            wrapped.recv_into(bytearray(1))
+        raw_socket.close.assert_called_once_with()
+
+    def test_deadline_socket_defers_raw_close_while_makefile_is_readable(self) -> None:
+        client, server = socket.socketpair()
+        reader = None
+        try:
+            wrapped = storage_module._DeadlineSocket(
+                client,
+                deadline=storage_module._monotonic() + 1,
+            )
+            reader = wrapped.makefile("rb")
+            server.sendall(b"body")
+
+            # urllib closes HTTPConnection.sock after parsing headers while the
+            # HTTPResponse makefile must remain able to consume the body.
+            wrapped.close()
+
+            self.assertEqual(reader.read(4), b"body")
+            self.assertNotEqual(client.fileno(), -1)
+            reader.close()
+            self.assertEqual(client.fileno(), -1)
+        finally:
+            if reader is not None:
+                reader.close()
+            client.close()
+            server.close()
+
     def test_constructor_rechecks_and_normalizes_gateway_origin(self) -> None:
         instance = UOMPGatewayStorageProvider(
             "https://Buyer.TryCloudflare.com/",
@@ -244,7 +334,13 @@ class ProviderConstructionTests(unittest.TestCase):
 
                 resolve.assert_not_called()
                 make_socket.assert_called_once_with(family, socket.SOCK_STREAM)
-                raw_socket.settimeout.assert_called_once_with(connection.timeout)
+                connect_timeout, tls_timeout = [
+                    call.args[0] for call in raw_socket.settimeout.call_args_list
+                ]
+                self.assertGreater(connect_timeout, 0)
+                self.assertLessEqual(connect_timeout, connection.timeout)
+                self.assertGreater(tls_timeout, 0)
+                self.assertLessEqual(tls_timeout, connect_timeout)
                 raw_socket.connect.assert_called_once_with((address, 443))
                 context.wrap_socket.assert_called_once_with(
                     raw_socket,
@@ -378,6 +474,55 @@ class ProviderConstructionTests(unittest.TestCase):
         self.assertEqual(context.wrap_socket.call_count, 2)
         self.assertIs(connection.sock, wrapped_socket)
 
+    def test_connect_attempts_and_tls_handshake_share_one_deadline(self) -> None:
+        clock = FakeClock()
+        first_socket = Mock()
+        second_socket = Mock()
+        context = Mock()
+
+        def fail_first(*args) -> None:
+            del args
+            clock.advance(0.6)
+            raise OSError("first address unreachable")
+
+        def connect_second(*args) -> None:
+            del args
+            clock.advance(0.25)
+
+        def slow_tls(*args, **kwargs):
+            del args, kwargs
+            clock.advance(0.2)
+            return object()
+
+        first_socket.connect.side_effect = fail_first
+        second_socket.connect.side_effect = connect_second
+        context.wrap_socket.side_effect = slow_tls
+        connection = storage_module._PinnedHTTPSConnection(
+            "buyer.trycloudflare.com",
+            pinned_addresses=("104.16.132.229", "104.16.133.229"),
+            pinned_port=443,
+            context=context,
+            timeout=1,
+            response_deadline=1,
+        )
+
+        with (
+            patch.object(storage_module, "_monotonic", clock),
+            patch.object(
+                storage_module.socket,
+                "socket",
+                side_effect=[first_socket, second_socket],
+            ),
+            self.assertRaises(TimeoutError),
+        ):
+            connection.connect()
+
+        self.assertAlmostEqual(first_socket.settimeout.call_args_list[0].args[0], 1)
+        self.assertAlmostEqual(second_socket.settimeout.call_args_list[0].args[0], 0.4)
+        self.assertAlmostEqual(second_socket.settimeout.call_args_list[1].args[0], 0.15)
+        first_socket.close.assert_called_once_with()
+        second_socket.close.assert_called_once_with()
+
 
 class UploadTests(unittest.IsolatedAsyncioTestCase):
     async def test_upload_uses_validated_origin_and_bounded_json_response(self) -> None:
@@ -446,6 +591,24 @@ class UploadTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(factory.calls), 1)
         self.assertEqual(factory.calls[0]["host"], "buyer.trycloudflare.com")
 
+    async def test_upload_enforces_one_total_slow_drip_deadline(self) -> None:
+        clock = FakeClock()
+        opener = FakeOpener()
+        opener.response = SlowDripResponse(
+            [b'{"payload_id":', b'"payload_123"', b"}"],
+            clock,
+        )
+        instance = provider(opener)
+
+        with (
+            patch.object(storage_module, "_monotonic", clock, create=True),
+            patch.object(storage_module, "_TIMEOUT_UPLOAD", 1),
+            self.assertRaises(TimeoutError),
+        ):
+            await instance.upload({"response": {"content": "report"}})
+
+        self.assertTrue(opener.response.closed)
+
 
 class ResourceUrlTests(unittest.IsolatedAsyncioTestCase):
     async def test_download_accepts_only_single_payload_on_same_origin(self) -> None:
@@ -479,6 +642,37 @@ class ResourceUrlTests(unittest.IsolatedAsyncioTestCase):
             request.full_url,
             "https://buyer.trycloudflare.com/v1/payload/payload_123",
         )
+
+    async def test_download_rejects_non_ascii_host_before_normalization(self) -> None:
+        instance = UOMPGatewayStorageProvider(
+            "https://k.trycloudflare.com",
+            "token",
+            resolver=public_resolver,
+            opener=FakeOpener(b'{}'),
+        )
+
+        with self.assertRaises(ValueError):
+            await instance.download("https://K.trycloudflare.com/v1/payload/payload_123")
+
+    async def test_download_enforces_one_total_slow_drip_deadline(self) -> None:
+        clock = FakeClock()
+        opener = FakeOpener()
+        opener.response = SlowDripResponse(
+            [b'{"response":', b'{"content":"report"}', b"}"],
+            clock,
+        )
+        instance = provider(opener)
+
+        with (
+            patch.object(storage_module, "_monotonic", clock, create=True),
+            patch.object(storage_module, "_TIMEOUT_DOWNLOAD", 1),
+            self.assertRaises(TimeoutError),
+        ):
+            await instance.download(
+                "https://buyer.trycloudflare.com/v1/payload/payload_123"
+            )
+
+        self.assertTrue(opener.response.closed)
 
     async def test_download_rejects_cross_origin_and_path_smuggling(self) -> None:
         urls = [
@@ -516,6 +710,22 @@ class ResourceUrlTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(
             await instance.exists("https://buyer.trycloudflare.com/v1/payload/payload_123")
         )
+
+    async def test_exists_rejects_a_response_opened_after_total_deadline(self) -> None:
+        clock = FakeClock()
+        opener = DelayedOpener(clock)
+        instance = provider(opener)
+
+        with (
+            patch.object(storage_module, "_monotonic", clock, create=True),
+            patch.object(storage_module, "_TIMEOUT_EXISTS", 1, create=True),
+        ):
+            exists = await instance.exists(
+                "https://buyer.trycloudflare.com/v1/payload/payload_123"
+            )
+
+        self.assertFalse(exists)
+        self.assertTrue(opener.response.closed)
 
     async def test_all_requests_use_validated_address_without_dns_rebinding(self) -> None:
         resolver_calls = 0

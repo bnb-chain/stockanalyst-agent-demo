@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import hashlib
-from ipaddress import ip_address
+from ipaddress import ip_address, ip_network
 import json
 import math
 import os
@@ -43,6 +43,17 @@ _MAX_UINT256 = 2**256 - 1
 _DEFAULT_GATEWAY_HOST_RULES = (".trycloudflare.com",)
 _TRUE_ENV_VALUES = frozenset({"1", "true", "yes", "on"})
 _HOST_LABEL_PATTERN = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\Z")
+_EXPLICITLY_DENIED_GATEWAY_NETWORKS = tuple(
+    ip_network(network)
+    for network in (
+        "192.0.0.0/24",
+        "64:ff9b:1::/48",
+        "2002::/16",
+    )
+)
+_NAT64_WELL_KNOWN_PREFIX = ip_network("64:ff9b::/96")
+_IPV4_COMPATIBLE_PREFIX = ip_network("::/96")
+_IPV4_TRANSLATABLE_PREFIX = ip_network("::ffff:0:0:0/96")
 
 
 class NotifySecurityError(ValueError):
@@ -90,6 +101,7 @@ def _validate_gateway_origin(
     if (
         not isinstance(url, str)
         or not url
+        or not url.isascii()
         or any(ord(char) <= 32 or ord(char) == 127 for char in url)
     ):
         raise NotifySecurityError("invalid_gateway_url")
@@ -162,6 +174,33 @@ def _validate_gateway_origin(
 
 
 def _is_public_gateway_address(address: Any) -> bool:
+    try:
+        normalized = ip_address(str(address))
+    except ValueError:
+        return False
+    if any(normalized in network for network in _EXPLICITLY_DENIED_GATEWAY_NETWORKS):
+        return False
+
+    embedded_ipv4 = []
+    if normalized.version == 6:
+        mapped = normalized.ipv4_mapped
+        if mapped is not None:
+            embedded_ipv4.append(mapped)
+        if normalized in _NAT64_WELL_KNOWN_PREFIX:
+            embedded_ipv4.append(ip_address(int(normalized) & 0xFFFFFFFF))
+        if normalized in _IPV4_COMPATIBLE_PREFIX and normalized not in {
+            ip_address("::"),
+            ip_address("::1"),
+        }:
+            embedded_ipv4.append(ip_address(int(normalized) & 0xFFFFFFFF))
+        if normalized in _IPV4_TRANSLATABLE_PREFIX:
+            embedded_ipv4.append(ip_address(int(normalized) & 0xFFFFFFFF))
+        teredo = normalized.teredo
+        if teredo is not None:
+            embedded_ipv4.extend(teredo)
+    if any(not _is_public_gateway_address(value) for value in embedded_ipv4):
+        return False
+
     return bool(
         address.is_global
         and not address.is_loopback
@@ -193,6 +232,8 @@ def _parse_gateway_host_rules(configured: str) -> tuple[str, ...]:
 
     rules: list[str] = []
     for raw_rule in raw_rules:
+        if not raw_rule.isascii():
+            raise NotifySecurityError("invalid_gateway_url")
         rule = raw_rule.strip().lower()
         suffix = rule.startswith(".")
         value = rule[1:] if suffix else rule
@@ -377,6 +418,39 @@ def verify_notify_authorization(
     now: int | None = None,
 ) -> JobContext:
     """Recover and verify the job client's EIP-712 authorization envelope."""
+    preflight_notify_authorization(authorization, now=now)
+    assert isinstance(authorization, dict)
+
+    context = authorization["context"]
+    expires_at = authorization["expires_at"]
+    nonce = authorization["nonce"]
+    signature = authorization["signature"]
+
+    try:
+        expected = to_checksum_address(expected_client)
+        typed_data = build_notify_typed_data(
+            job_id=job_id,
+            context=context,
+            expires_at=expires_at,
+            nonce=nonce,
+            chain_id=chain_id,
+            verifying_contract=verifying_contract,
+        )
+        recovered = Account.recover_message(encode_typed_data(full_message=typed_data), signature=signature)
+    except (TypeError, ValueError):
+        raise NotifySecurityError("invalid_authorization") from None
+
+    if to_checksum_address(recovered) != expected:
+        raise NotifySecurityError("caller_not_job_client")
+    return parse_signed_context(context)
+
+
+def preflight_notify_authorization(
+    authorization: object,
+    *,
+    now: int | None = None,
+) -> None:
+    """Reject malformed/expired envelopes without chain access or signer recovery."""
     if not isinstance(authorization, dict):
         raise NotifySecurityError("authorization_required")
     if not _AUTHORIZATION_KEYS <= set(authorization):
@@ -399,6 +473,11 @@ def verify_notify_authorization(
         or _SIGNATURE_PATTERN.fullmatch(signature) is None
     ):
         raise NotifySecurityError("invalid_authorization")
+    try:
+        if len(context.encode("utf-8")) > _MAX_CONTEXT_BYTES:
+            raise NotifySecurityError("invalid_context")
+    except UnicodeError:
+        raise NotifySecurityError("invalid_authorization") from None
 
     current_time = int(time.time()) if now is None else now
     if isinstance(current_time, bool) or not isinstance(current_time, int):
@@ -407,24 +486,6 @@ def verify_notify_authorization(
         raise NotifySecurityError("authorization_expired")
     if expires_at > current_time + 600:
         raise NotifySecurityError("invalid_authorization")
-
-    try:
-        expected = to_checksum_address(expected_client)
-        typed_data = build_notify_typed_data(
-            job_id=job_id,
-            context=context,
-            expires_at=expires_at,
-            nonce=nonce,
-            chain_id=chain_id,
-            verifying_contract=verifying_contract,
-        )
-        recovered = Account.recover_message(encode_typed_data(full_message=typed_data), signature=signature)
-    except (TypeError, ValueError):
-        raise NotifySecurityError("invalid_authorization") from None
-
-    if to_checksum_address(recovered) != expected:
-        raise NotifySecurityError("caller_not_job_client")
-    return parse_signed_context(context)
 
 
 def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:

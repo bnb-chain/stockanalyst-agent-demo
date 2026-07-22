@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import dataclasses
 import hashlib
+from ipaddress import ip_address
 import json
 import os
 from pathlib import Path
@@ -16,6 +17,7 @@ from eth_account.messages import encode_typed_data
 
 from stockanalyst.app.agent.notify_security import (
     NotifySecurityError,
+    _is_public_gateway_address,
     build_notify_typed_data,
     parse_signed_context,
     validate_gateway_url,
@@ -149,6 +151,49 @@ class GatewayPolicyTests(unittest.TestCase):
                 resolver=_resolver("104.16.132.229", "127.0.0.1"),
             )
 
+    def test_rejects_version_independent_special_and_embedded_addresses(self) -> None:
+        class LegacyGlobalAddress:
+            """Simulate older Python tables that marked the outer IPv6 global."""
+
+            is_global = True
+            is_loopback = False
+            is_private = False
+            is_link_local = False
+            is_multicast = False
+            is_unspecified = False
+            is_reserved = False
+            is_site_local = False
+
+            def __init__(self, value: str) -> None:
+                self._address = ip_address(value)
+
+            def __str__(self) -> str:
+                return str(self._address)
+
+        explicitly_denied = [
+            "192.0.0.9",
+            "64:ff9b:1::808:808",
+            "2002:0808:0808::1",
+        ]
+        for address in explicitly_denied:
+            with self.subTest(address=address):
+                self.assertFalse(
+                    _is_public_gateway_address(LegacyGlobalAddress(address))
+                )
+
+        embedded_non_global = [
+            "::ffff:10.0.0.1",
+            "::ffff:0:10.0.0.1",
+            "::ffff:0:169.254.169.254",
+            "64:ff9b::a00:1",
+            "2001:0000:4136:e378:8000:63bf:3fff:fdd2",
+        ]
+        for address in embedded_non_global:
+            with self.subTest(address=address):
+                self.assertFalse(
+                    _is_public_gateway_address(LegacyGlobalAddress(address))
+                )
+
     def test_rejects_localhost_ip_literals_and_failed_resolution(self) -> None:
         cases = [
             ("https://localhost", _resolver("127.0.0.1")),
@@ -196,11 +241,12 @@ class GatewayPolicyTests(unittest.TestCase):
                 validate_gateway_url("https://gateway.example", resolver=PUBLIC_RESOLVER)
 
     def test_rejects_non_ascii_hosts_and_allowlist_rules(self) -> None:
-        with self.assertRaises(NotifySecurityError):
-            validate_gateway_url(
-                "https://bücher.trycloudflare.com",
-                resolver=PUBLIC_RESOLVER,
-            )
+        for url in (
+            "https://bücher.trycloudflare.com",
+            "https://K.trycloudflare.com",
+        ):
+            with self.subTest(url=url), self.assertRaises(NotifySecurityError):
+                validate_gateway_url(url, resolver=PUBLIC_RESOLVER)
         with (
             patch.dict(
                 os.environ,
@@ -210,6 +256,15 @@ class GatewayPolicyTests(unittest.TestCase):
             self.assertRaises(NotifySecurityError),
         ):
             validate_gateway_url("https://gateway.example", resolver=PUBLIC_RESOLVER)
+        with (
+            patch.dict(
+                os.environ,
+                {"DELIVERY_GATEWAY_ALLOWED_HOSTS": "Kateway.example"},
+                clear=False,
+            ),
+            self.assertRaises(NotifySecurityError),
+        ):
+            validate_gateway_url("https://kateway.example", resolver=PUBLIC_RESOLVER)
 
     def test_rejects_trailing_dot_host_and_wildcard_rule_bypasses(self) -> None:
         with self.assertRaises(NotifySecurityError):

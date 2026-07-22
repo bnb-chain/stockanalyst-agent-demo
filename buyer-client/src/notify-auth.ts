@@ -11,7 +11,11 @@ export interface NotifyOptions {
   gatewayUrl?: string;
   gatewayToken?: string;
   portfolio?: Array<{ symbol: string; shares: number; avgCost: number; currency: string }>;
-  riskProfile?: { tolerance: string; horizonMonths?: number; preferredIndicators?: string[] };
+  riskProfile?: {
+    tolerance: "conservative" | "moderate" | "aggressive";
+    horizonMonths: number;
+    preferredIndicators: string[];
+  };
 }
 
 export interface NotifyAuthorization {
