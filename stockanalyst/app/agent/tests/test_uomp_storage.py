@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from email.message import Message
 import socket
 import ssl
 import sys
@@ -9,7 +10,7 @@ from types import ModuleType
 import unittest
 import urllib.error
 import urllib.request
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 
 # Exercise the real provider while stubbing only its optional SDK base class.
@@ -26,6 +27,7 @@ bnbagent_stub.storage = storage_stub
 sys.modules.setdefault("bnbagent", bnbagent_stub)
 sys.modules.setdefault("bnbagent.storage", storage_stub)
 
+from stockanalyst.app.agent import uomp_storage as storage_module  # noqa: E402
 from stockanalyst.app.agent.uomp_storage import (  # noqa: E402
     UOMPGatewayStorageProvider,
 )
@@ -86,6 +88,72 @@ class FakeOpener:
         return self.response
 
 
+class FakeTransportResponse(FakeResponse):
+    def __init__(
+        self,
+        body: bytes,
+        *,
+        code: int = 200,
+        headers: dict[str, str] | None = None,
+    ) -> None:
+        super().__init__(body)
+        self.code = code
+        self.status = code
+        self.reason = "Found" if 300 <= code < 400 else "OK"
+        self.headers = Message()
+        for key, value in (headers or {}).items():
+            self.headers[key] = value
+        self.msg = self.reason
+        self.url = ""
+
+    def info(self):
+        return self.headers
+
+    def close(self) -> None:
+        pass
+
+
+class FakeConnection:
+    def __init__(self, response: FakeTransportResponse, requests: list[dict]) -> None:
+        self.response = response
+        self.requests = requests
+        self.sock = None
+
+    def set_debuglevel(self, level: int) -> None:
+        del level
+
+    def set_tunnel(self, *args, **kwargs) -> None:
+        del args, kwargs
+
+    def request(self, method, path, body, headers, *, encode_chunked) -> None:
+        self.requests.append(
+            {
+                "method": method,
+                "path": path,
+                "body": body,
+                "headers": headers,
+                "encode_chunked": encode_chunked,
+            }
+        )
+
+    def getresponse(self) -> FakeTransportResponse:
+        return self.response
+
+    def close(self) -> None:
+        pass
+
+
+class FakeConnectionFactory:
+    def __init__(self, *responses: FakeTransportResponse) -> None:
+        self.responses = list(responses)
+        self.calls: list[dict] = []
+        self.requests: list[dict] = []
+
+    def __call__(self, **kwargs):
+        self.calls.append(kwargs)
+        return FakeConnection(self.responses.pop(0), self.requests)
+
+
 def provider(opener: FakeOpener | None = None) -> UOMPGatewayStorageProvider:
     return UOMPGatewayStorageProvider(
         "https://buyer.trycloudflare.com",
@@ -141,6 +209,49 @@ class ProviderConstructionTests(unittest.TestCase):
             redirect_handler.redirect_request(None, None, 302, "Found", {}, "https://evil.example")
         )
 
+    def test_pinned_https_connection_uses_ip_but_hostname_for_sni(self) -> None:
+        cases = [
+            ("104.16.132.229", socket.AF_INET),
+            ("2606:4700::6810:84e5", socket.AF_INET6),
+        ]
+        for address, family in cases:
+            with self.subTest(address=address):
+                raw_socket = Mock()
+                wrapped_socket = object()
+                context = Mock()
+                context.wrap_socket.return_value = wrapped_socket
+                connection = storage_module._PinnedHTTPSConnection(
+                    "buyer.trycloudflare.com",
+                    pinned_address=address,
+                    pinned_port=443,
+                    context=context,
+                    timeout=30,
+                )
+
+                with (
+                    patch.object(
+                        storage_module.socket,
+                        "getaddrinfo",
+                        side_effect=AssertionError("must not resolve while connecting"),
+                    ) as resolve,
+                    patch.object(
+                        storage_module.socket,
+                        "socket",
+                        return_value=raw_socket,
+                    ) as make_socket,
+                ):
+                    connection.connect()
+
+                resolve.assert_not_called()
+                make_socket.assert_called_once_with(family, socket.SOCK_STREAM)
+                raw_socket.settimeout.assert_called_once_with(connection.timeout)
+                raw_socket.connect.assert_called_once_with((address, 443))
+                context.wrap_socket.assert_called_once_with(
+                    raw_socket,
+                    server_hostname="buyer.trycloudflare.com",
+                )
+                self.assertIs(connection.sock, wrapped_socket)
+
 
 class UploadTests(unittest.IsolatedAsyncioTestCase):
     async def test_upload_uses_validated_origin_and_bounded_json_response(self) -> None:
@@ -186,6 +297,29 @@ class UploadTests(unittest.IsolatedAsyncioTestCase):
         finally:
             redirect.close()
 
+    async def test_constructed_transport_rejects_redirect_without_second_connection(self) -> None:
+        factory = FakeConnectionFactory(
+            FakeTransportResponse(
+                b"redirect",
+                code=302,
+                headers={"Location": "https://evil.example/v1/payload/upload"},
+            )
+        )
+        instance = UOMPGatewayStorageProvider(
+            "https://buyer.trycloudflare.com",
+            "token",
+            resolver=public_resolver,
+            connection_factory=factory,
+        )
+
+        with self.assertRaises(urllib.error.HTTPError) as raised:
+            await instance.upload({"response": {"content": "report"}})
+
+        self.assertEqual(raised.exception.code, 302)
+        raised.exception.close()
+        self.assertEqual(len(factory.calls), 1)
+        self.assertEqual(factory.calls[0]["host"], "buyer.trycloudflare.com")
+
 
 class ResourceUrlTests(unittest.IsolatedAsyncioTestCase):
     async def test_download_accepts_only_single_payload_on_same_origin(self) -> None:
@@ -193,11 +327,15 @@ class ResourceUrlTests(unittest.IsolatedAsyncioTestCase):
         instance = provider(opener)
 
         result = await instance.download(
-            "https://buyer.trycloudflare.com:443/v1/payload/payload_123"
+            "HTTPS://BUYER.TRYCLOUDFLARE.COM:443/v1/payload/payload_123"
         )
 
         self.assertEqual(result, {"response": {"content": "report"}})
         request, timeout = opener.requests[0]
+        self.assertEqual(
+            request.full_url,
+            "https://buyer.trycloudflare.com/v1/payload/payload_123",
+        )
         self.assertEqual(request.get_method(), "GET")
         self.assertEqual(timeout, 30)
         self.assertEqual(opener.response.read_sizes, [65_537])
@@ -238,3 +376,50 @@ class ResourceUrlTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(
             await instance.exists("https://buyer.trycloudflare.com/v1/payload/payload_123")
         )
+
+    async def test_all_requests_use_validated_address_without_dns_rebinding(self) -> None:
+        resolver_calls = 0
+
+        def rebinding_resolver(host: str, port: int, *args, **kwargs):
+            nonlocal resolver_calls
+            del host, args, kwargs
+            resolver_calls += 1
+            address = "104.16.132.229" if resolver_calls == 1 else "127.0.0.1"
+            return [
+                (
+                    socket.AF_INET,
+                    socket.SOCK_STREAM,
+                    socket.IPPROTO_TCP,
+                    "",
+                    (address, port),
+                )
+            ]
+
+        factory = FakeConnectionFactory(
+            FakeTransportResponse(b'{"payload_id":"payload_123"}'),
+            FakeTransportResponse(b'{"response":{"content":"report"}}'),
+            FakeTransportResponse(b""),
+        )
+        instance = UOMPGatewayStorageProvider(
+            "HTTPS://BUYER.TRYCLOUDFLARE.COM:443/",
+            "token",
+            resolver=rebinding_resolver,
+            connection_factory=factory,
+        )
+
+        await instance.upload({"response": {"content": "report"}})
+        await instance.download(
+            "HTTPS://BUYER.TRYCLOUDFLARE.COM:443/v1/payload/payload_123"
+        )
+        self.assertTrue(
+            await instance.exists(
+                "HTTPS://BUYER.TRYCLOUDFLARE.COM:443/v1/payload/payload_123"
+            )
+        )
+
+        self.assertEqual(resolver_calls, 1)
+        self.assertEqual(len(factory.calls), 3)
+        for call in factory.calls:
+            self.assertEqual(call["host"], "buyer.trycloudflare.com")
+            self.assertEqual(call["address"], "104.16.132.229")
+            self.assertEqual(call["port"], 443)

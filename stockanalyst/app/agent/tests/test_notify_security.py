@@ -133,6 +133,7 @@ class GatewayPolicyTests(unittest.TestCase):
             "::",
             "224.0.0.1",
             "ff02::1",
+            "fec0::1",
             "240.0.0.1",
         ]
         for address in non_global:
@@ -168,6 +169,65 @@ class GatewayPolicyTests(unittest.TestCase):
             validate_gateway_url(
                 "https://buyer.trycloudflare.com",
                 resolver=failing_resolver,
+            )
+
+    def test_rejects_malformed_allowlist_rules_as_a_whole(self) -> None:
+        malformed = [
+            "",
+            ".",
+            "gateway.example,",
+            "gateway.example,,other.example",
+            "gateway.example,.",
+            "gateway.example,..example",
+            "gateway.example,example.",
+            "gateway.example,*.example",
+            "gateway.example,https://other.example",
+        ]
+        for configured in malformed:
+            with (
+                self.subTest(configured=configured),
+                patch.dict(
+                    os.environ,
+                    {"DELIVERY_GATEWAY_ALLOWED_HOSTS": configured},
+                    clear=False,
+                ),
+                self.assertRaises(NotifySecurityError),
+            ):
+                validate_gateway_url("https://gateway.example", resolver=PUBLIC_RESOLVER)
+
+    def test_rejects_non_ascii_hosts_and_allowlist_rules(self) -> None:
+        with self.assertRaises(NotifySecurityError):
+            validate_gateway_url(
+                "https://bücher.trycloudflare.com",
+                resolver=PUBLIC_RESOLVER,
+            )
+        with (
+            patch.dict(
+                os.environ,
+                {"DELIVERY_GATEWAY_ALLOWED_HOSTS": "gateway.example,bücher.example"},
+                clear=False,
+            ),
+            self.assertRaises(NotifySecurityError),
+        ):
+            validate_gateway_url("https://gateway.example", resolver=PUBLIC_RESOLVER)
+
+    def test_rejects_trailing_dot_host_and_wildcard_rule_bypasses(self) -> None:
+        with self.assertRaises(NotifySecurityError):
+            validate_gateway_url(
+                "https://buyer.trycloudflare.com.",
+                resolver=PUBLIC_RESOLVER,
+            )
+        with (
+            patch.dict(
+                os.environ,
+                {"DELIVERY_GATEWAY_ALLOWED_HOSTS": "*.trycloudflare.com"},
+                clear=False,
+            ),
+            self.assertRaises(NotifySecurityError),
+        ):
+            validate_gateway_url(
+                "https://buyer.trycloudflare.com",
+                resolver=PUBLIC_RESOLVER,
             )
 
     def test_development_flag_allows_only_http_loopback_origin(self) -> None:

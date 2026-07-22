@@ -42,6 +42,7 @@ _MAX_UINT64 = 2**64 - 1
 _MAX_UINT256 = 2**256 - 1
 _DEFAULT_GATEWAY_HOST_RULES = (".trycloudflare.com",)
 _TRUE_ENV_VALUES = frozenset({"1", "true", "yes", "on"})
+_HOST_LABEL_PATTERN = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\Z")
 
 
 class NotifySecurityError(ValueError):
@@ -50,6 +51,15 @@ class NotifySecurityError(ValueError):
     def __init__(self, code: str) -> None:
         self.code = code
         super().__init__(code)
+
+
+@dataclass(frozen=True)
+class _ValidatedGatewayOrigin:
+    origin: str
+    scheme: str
+    hostname: str
+    port: int
+    addresses: tuple[str, ...]
 
 
 def validate_gateway_url(
@@ -64,7 +74,24 @@ def validate_gateway_url(
     answer set is globally routable.  Development mode adds one narrow
     exception: HTTP is permitted when every answer is loopback.
     """
-    if not isinstance(url, str) or not url or any(ord(char) <= 32 or ord(char) == 127 for char in url):
+    return _validate_gateway_origin(
+        url,
+        allow_private=allow_private,
+        resolver=resolver,
+    ).origin
+
+
+def _validate_gateway_origin(
+    url: str,
+    *,
+    allow_private: bool | None = None,
+    resolver: Callable[..., object] | None = None,
+) -> _ValidatedGatewayOrigin:
+    if (
+        not isinstance(url, str)
+        or not url
+        or any(ord(char) <= 32 or ord(char) == 127 for char in url)
+    ):
         raise NotifySecurityError("invalid_gateway_url")
     # ``urlsplit`` discards empty query/fragment delimiters, so reject the
     # delimiters themselves rather than silently normalizing them away.
@@ -91,7 +118,7 @@ def validate_gateway_url(
     ):
         raise NotifySecurityError("invalid_gateway_url")
 
-    hostname = hostname.lower()
+    hostname = _canonical_ascii_hostname(hostname)
     if hostname == "localhost" or hostname.endswith(".localhost"):
         raise NotifySecurityError("invalid_gateway_url")
 
@@ -105,11 +132,13 @@ def validate_gateway_url(
         raise NotifySecurityError("invalid_gateway_url")
     if scheme == "http" and not allow_private:
         raise NotifySecurityError("invalid_gateway_url")
+    if scheme == "https" and not _gateway_host_allowed(hostname):
+        raise NotifySecurityError("invalid_gateway_url")
 
     lookup = socket.getaddrinfo if resolver is None else resolver
     try:
         answers = lookup(hostname, port or expected_port, type=socket.SOCK_STREAM)
-        addresses = [ip_address(answer[4][0]) for answer in answers]  # type: ignore[index]
+        addresses = tuple(ip_address(answer[4][0]) for answer in answers)  # type: ignore[index]
     except (OSError, TypeError, ValueError, IndexError):
         raise NotifySecurityError("invalid_gateway_url") from None
     if not addresses:
@@ -120,12 +149,16 @@ def validate_gateway_url(
         raise NotifySecurityError("invalid_gateway_url")
     if scheme == "https" and not all(_is_public_gateway_address(address) for address in addresses):
         raise NotifySecurityError("invalid_gateway_url")
-    if not loopback_http and not _gateway_host_allowed(hostname):
-        raise NotifySecurityError("invalid_gateway_url")
-
     rendered_host = f"[{hostname}]" if ":" in hostname else hostname
     rendered_port = "" if port in (None, expected_port) else f":{port}"
-    return f"{scheme}://{rendered_host}{rendered_port}"
+    origin = f"{scheme}://{rendered_host}{rendered_port}"
+    return _ValidatedGatewayOrigin(
+        origin=origin,
+        scheme=scheme,
+        hostname=hostname,
+        port=port or expected_port,
+        addresses=tuple(dict.fromkeys(str(address) for address in addresses)),
+    )
 
 
 def _is_public_gateway_address(address: Any) -> bool:
@@ -137,14 +170,13 @@ def _is_public_gateway_address(address: Any) -> bool:
         and not address.is_multicast
         and not address.is_unspecified
         and not address.is_reserved
+        and not getattr(address, "is_site_local", False)
     )
 
 
 def _gateway_host_allowed(hostname: str) -> bool:
     configured = os.environ.get("DELIVERY_GATEWAY_ALLOWED_HOSTS")
-    rules = _DEFAULT_GATEWAY_HOST_RULES if configured is None else tuple(
-        item.strip().lower() for item in configured.split(",") if item.strip()
-    )
+    rules = _DEFAULT_GATEWAY_HOST_RULES if configured is None else _parse_gateway_host_rules(configured)
     for rule in rules:
         if rule.startswith("."):
             if hostname.endswith(rule) and hostname != rule[1:]:
@@ -152,6 +184,44 @@ def _gateway_host_allowed(hostname: str) -> bool:
         elif hostname == rule:
             return True
     return False
+
+
+def _parse_gateway_host_rules(configured: str) -> tuple[str, ...]:
+    raw_rules = configured.split(",")
+    if not raw_rules or any(not item.strip() for item in raw_rules):
+        raise NotifySecurityError("invalid_gateway_url")
+
+    rules: list[str] = []
+    for raw_rule in raw_rules:
+        rule = raw_rule.strip().lower()
+        suffix = rule.startswith(".")
+        value = rule[1:] if suffix else rule
+        canonical = _canonical_ascii_hostname(value)
+        if suffix:
+            try:
+                ip_address(canonical)
+            except ValueError:
+                pass
+            else:
+                raise NotifySecurityError("invalid_gateway_url")
+            canonical = f".{canonical}"
+        rules.append(canonical)
+    return tuple(rules)
+
+
+def _canonical_ascii_hostname(hostname: str) -> str:
+    if not hostname or not hostname.isascii() or hostname.endswith("."):
+        raise NotifySecurityError("invalid_gateway_url")
+    lowered = hostname.lower()
+    try:
+        return str(ip_address(lowered))
+    except ValueError:
+        pass
+    if len(lowered) > 253 or any(
+        _HOST_LABEL_PATTERN.fullmatch(label) is None for label in lowered.split(".")
+    ):
+        raise NotifySecurityError("invalid_gateway_url")
+    return lowered
 
 
 @dataclass(frozen=True)

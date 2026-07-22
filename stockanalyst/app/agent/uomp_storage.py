@@ -5,16 +5,19 @@ authenticated endpoint, and only reads payload URLs on that same origin.
 """
 from __future__ import annotations
 
+import http.client
+from ipaddress import ip_address
 import json
 import re
 import ssl
+import socket
 import threading
 from typing import Any, Callable
 import urllib.request
 from urllib.parse import urlsplit
 
 from bnbagent.storage import StorageProvider
-from notify_security import validate_gateway_url
+from notify_security import _ValidatedGatewayOrigin, _validate_gateway_origin
 
 _TIMEOUT_UPLOAD = 30
 _TIMEOUT_DOWNLOAD = 30
@@ -31,10 +34,160 @@ class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
         return None
 
 
-def _verified_no_redirect_opener():
-    context = ssl.create_default_context()
+class _PinnedHTTPConnection(http.client.HTTPConnection):
+    """Connect to a prevalidated address while retaining the HTTP hostname."""
+
+    def __init__(
+        self,
+        host: str,
+        *,
+        pinned_address: str,
+        pinned_port: int,
+        **kwargs,
+    ) -> None:
+        super().__init__(host, **kwargs)
+        self._pinned_address = pinned_address
+        self._pinned_port = pinned_port
+
+    def connect(self) -> None:
+        self.sock = _open_pinned_socket(
+            self._pinned_address,
+            self._pinned_port,
+            self.timeout,
+            self.source_address,
+        )
+        if self._tunnel_host:
+            self._tunnel()
+
+
+class _PinnedHTTPSConnection(http.client.HTTPSConnection):
+    """Pin the TCP peer while preserving the hostname for certificate SNI."""
+
+    def __init__(
+        self,
+        host: str,
+        *,
+        pinned_address: str,
+        pinned_port: int,
+        **kwargs,
+    ) -> None:
+        super().__init__(host, **kwargs)
+        self._pinned_address = pinned_address
+        self._pinned_port = pinned_port
+
+    def connect(self) -> None:
+        self.sock = _open_pinned_socket(
+            self._pinned_address,
+            self._pinned_port,
+            self.timeout,
+            self.source_address,
+        )
+        if self._tunnel_host:
+            self._tunnel()
+        self.sock = self._context.wrap_socket(
+            self.sock,
+            server_hostname=self.host,
+        )
+
+
+def _open_pinned_socket(
+    address: str,
+    port: int,
+    timeout: object,
+    source_address: tuple[str, int] | None,
+):
+    family = socket.AF_INET6 if ip_address(address).version == 6 else socket.AF_INET
+    connection = socket.socket(family, socket.SOCK_STREAM)
+    try:
+        if timeout is not socket._GLOBAL_DEFAULT_TIMEOUT:
+            connection.settimeout(timeout)
+        if source_address:
+            connection.bind(source_address)
+        connection.connect((address, port))
+        return connection
+    except Exception:
+        connection.close()
+        raise
+
+
+class _PinnedHTTPHandler(urllib.request.HTTPHandler):
+    def __init__(self, validated: _ValidatedGatewayOrigin, connection_factory=None) -> None:
+        super().__init__()
+        self._validated = validated
+        self._connection_factory = connection_factory
+
+    def http_open(self, request):
+        return self.do_open(self._connection, request)
+
+    def _connection(self, host: str, *, timeout: float, **kwargs):
+        del kwargs
+        if self._connection_factory is not None:
+            return self._connection_factory(
+                scheme="http",
+                host=host,
+                address=self._validated.addresses[0],
+                port=self._validated.port,
+                context=None,
+                timeout=timeout,
+            )
+        return _PinnedHTTPConnection(
+            host,
+            pinned_address=self._validated.addresses[0],
+            pinned_port=self._validated.port,
+            timeout=timeout,
+        )
+
+
+class _PinnedHTTPSHandler(urllib.request.HTTPSHandler):
+    def __init__(
+        self,
+        validated: _ValidatedGatewayOrigin,
+        context: ssl.SSLContext,
+        connection_factory=None,
+    ) -> None:
+        super().__init__(context=context)
+        self._validated = validated
+        self._connection_factory = connection_factory
+
+    def https_open(self, request):
+        return self.do_open(self._connection, request)
+
+    def _connection(self, host: str, *, timeout: float, **kwargs):
+        del kwargs
+        if self._connection_factory is not None:
+            return self._connection_factory(
+                scheme="https",
+                host=host,
+                address=self._validated.addresses[0],
+                port=self._validated.port,
+                context=self._context,
+                timeout=timeout,
+            )
+        return _PinnedHTTPSConnection(
+            host,
+            pinned_address=self._validated.addresses[0],
+            pinned_port=self._validated.port,
+            context=self._context,
+            timeout=timeout,
+        )
+
+
+def _verified_no_redirect_opener(
+    validated: _ValidatedGatewayOrigin,
+    *,
+    connection_factory=None,
+):
+    if validated.scheme == "https":
+        transport_handler = _PinnedHTTPSHandler(
+            validated,
+            ssl.create_default_context(),
+            connection_factory,
+        )
+    else:
+        transport_handler = _PinnedHTTPHandler(validated, connection_factory)
     return urllib.request.build_opener(
-        urllib.request.HTTPSHandler(context=context),
+        urllib.request.ProxyHandler({}),
+        transport_handler,
         _NoRedirectHandler(),
     )
 
@@ -51,11 +204,20 @@ class UOMPGatewayStorageProvider(StorageProvider):
         *,
         resolver: Callable[..., object] | None = None,
         opener: Any | None = None,
+        connection_factory: Any | None = None,
     ) -> None:
-        self._base = validate_gateway_url(gateway_url, resolver=resolver)
+        validated = _validate_gateway_origin(gateway_url, resolver=resolver)
+        self._base = validated.origin
         self._origin = urlsplit(self._base)
         self._token = token
-        self._opener = opener if opener is not None else _verified_no_redirect_opener()
+        self._opener = (
+            opener
+            if opener is not None
+            else _verified_no_redirect_opener(
+                validated,
+                connection_factory=connection_factory,
+            )
+        )
 
     async def upload(self, data: dict, filename: str | None = None) -> str:
         del filename
@@ -125,7 +287,7 @@ class UOMPGatewayStorageProvider(StorageProvider):
             or _PAYLOAD_PATH_PATTERN.fullmatch(parsed.path) is None
         ):
             raise ValueError("invalid payload URL")
-        return url
+        return f"{self._base}{parsed.path}"
 
 
 def _read_bounded_json(response: Any) -> object:
