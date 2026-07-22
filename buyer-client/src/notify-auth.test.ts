@@ -72,13 +72,7 @@ test("sends a signed notification envelope without duplicate context fields", as
   };
 
   try {
-    type SignedNotifyFunded = (
-      endpoint: string,
-      signer: Wallet,
-      fundedJobId: bigint,
-      notifyOptions: typeof options,
-    ) => Promise<string>;
-    const status = await (notifyFunded as unknown as SignedNotifyFunded)(
+    const status = await notifyFunded(
       "https://seller.example/a2a",
       wallet,
       jobId,
