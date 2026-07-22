@@ -24,6 +24,7 @@ dependencies = [
     "requests>=2.28",
     "fredapi>=0.3.12",
     "newsapi-python>=0.2.7",
+    "eth-account>=0.13,<1",
 ]
 
 [build-system]

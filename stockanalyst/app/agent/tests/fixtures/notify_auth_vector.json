@@ -1,0 +1,15 @@
+{
+  "test_key": "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+  "expected_address": "0xFCAd0B19bB29D4674531d6f115237E16AfCE377c",
+  "domain": {
+    "name": "stockanalyst-notify-funded",
+    "version": "1",
+    "chainId": 97,
+    "verifyingContract": "0xa206c0517B6371C6638CD9e4a42Cc9f02A33B0DE"
+  },
+  "job_id": "1152921504606846983",
+  "context": "{\"delivery_gateway_url\":\"https://buyer.trycloudflare.com\",\"delivery_gateway_token\":\"relay-token\",\"portfolio\":[{\"symbol\":\"AAPL\",\"shares\":10,\"avgCost\":190.25,\"currency\":\"USD\"}],\"risk_profile\":{\"tolerance\":\"moderate\",\"horizonMonths\":12,\"preferredIndicators\":[\"RSI-14\",\"MACD\"]}}",
+  "expires_at": 1800000300,
+  "nonce": "0x1111111111111111111111111111111111111111111111111111111111111111",
+  "signature": "d1a2acb265316e1699d53309bbc1665ab50b3923f7ce5406aa28666e234a0f60239e8cb08cbcdaae7d565a5546bd9959479fd60922056b2ac8f466a169d4dbe21b"
+}
