@@ -19,7 +19,7 @@ _MAX_CONTEXT_BYTES = 65_536
 _MAX_GATEWAY_URL_LENGTH = 2_048
 _MAX_GATEWAY_TOKEN_LENGTH = 2_048
 _MAX_HOLDINGS = 50
-_MAX_VALUE = 1e12
+_MAX_VALUE = 10**12
 _SYMBOL_PATTERN = re.compile(r"[A-Z][A-Z0-9.-]{0,9}\Z")
 _CURRENCY_PATTERN = re.compile(r"[A-Z]{3,8}\Z")
 _RISK_TOLERANCES = frozenset({"conservative", "moderate", "aggressive"})
@@ -147,7 +147,11 @@ def build_notify_typed_data(
     _require_uint(job_id, maximum=_MAX_UINT256)
     _require_uint(expires_at, maximum=_MAX_UINT64)
     _require_uint(chain_id, maximum=_MAX_UINT256)
-    if not isinstance(context, str) or not _NONCE_PATTERN.fullmatch(nonce):
+    if (
+        not isinstance(context, str)
+        or not isinstance(nonce, str)
+        or _NONCE_PATTERN.fullmatch(nonce) is None
+    ):
         raise NotifySecurityError("invalid_authorization")
     try:
         contract = to_checksum_address(verifying_contract)
@@ -295,9 +299,13 @@ def _parse_portfolio(value: Any) -> tuple[Holding, ...]:
 
 
 def _finite_number(value: Any) -> float | int:
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+    if isinstance(value, bool):
         raise ValueError
-    return value
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float) and math.isfinite(value):
+        return value
+    raise ValueError
 
 
 def _parse_risk_profile(value: Any) -> RiskProfile | None:

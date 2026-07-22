@@ -169,6 +169,85 @@ class ContextTests(unittest.TestCase):
                 parse_signed_context(_raw(value))
             self.assertEqual(raised.exception.code, "invalid_context")
 
+    def test_accepts_documented_schema_boundaries(self) -> None:
+        valid = _valid_context()
+        valid["delivery_gateway_url"] = "u" * 2_048
+        valid["delivery_gateway_token"] = "t" * 2_048
+        valid["portfolio"] = [
+            {
+                "symbol": "A123456789",
+                "shares": 1_000_000_000_000,
+                "avgCost": 1_000_000_000_000,
+                "currency": "ABCDEFGH",
+            }
+            for _ in range(50)
+        ]
+        valid["risk_profile"] = {
+            "tolerance": "moderate",
+            "horizonMonths": 1,
+            "preferredIndicators": ["RSI-14"],
+        }
+
+        context = parse_signed_context(_raw(valid))
+
+        self.assertEqual(len(context.gateway_url), 2_048)
+        self.assertEqual(len(context.gateway_token), 2_048)
+        self.assertEqual(len(context.portfolio), 50)
+        self.assertEqual(context.portfolio[0].symbol, "A123456789")
+        self.assertEqual(context.portfolio[0].shares, 1_000_000_000_000)
+        self.assertEqual(context.portfolio[0].avg_cost, 1_000_000_000_000)
+        self.assertEqual(context.portfolio[0].currency, "ABCDEFGH")
+        self.assertEqual(context.risk_profile.horizon_months, 1)
+
+        valid["portfolio"] = [
+            {
+                "symbol": "A",
+                "shares": 1,
+                "avgCost": 0,
+                "currency": "USD",
+            }
+        ]
+        self.assertEqual(parse_signed_context(_raw(valid)).portfolio[0].symbol, "A")
+
+        valid["risk_profile"] = {
+            "tolerance": "moderate",
+            "horizonMonths": 600,
+            "preferredIndicators": ["RSI-14"],
+        }
+        self.assertEqual(parse_signed_context(_raw(valid)).risk_profile.horizon_months, 600)
+
+    def test_enforces_exact_signed_context_byte_limit(self) -> None:
+        raw = _raw(_valid_context())
+        at_limit = raw + " " * (65_536 - len(raw.encode("utf-8")))
+        over_limit = at_limit + " "
+
+        self.assertEqual(len(at_limit.encode("utf-8")), 65_536)
+        self.assertEqual(parse_signed_context(at_limit).digest, hashlib.sha256(at_limit.encode()).hexdigest())
+        with self.assertRaises(NotifySecurityError) as raised:
+            parse_signed_context(over_limit)
+        self.assertEqual(raised.exception.code, "invalid_context")
+
+    def test_rejects_huge_json_integer_without_leaking_an_overflow_error(self) -> None:
+        raw = _raw(_valid_context()).replace('"shares":10', '"shares":1' + '0' * 4_000)
+
+        with self.assertRaises(NotifySecurityError) as raised:
+            parse_signed_context(raw)
+
+        self.assertEqual(raised.exception.code, "invalid_context")
+
+    def test_rejects_remaining_schema_boundaries_outside_the_allowlist(self) -> None:
+        valid = _valid_context()
+        cases = [
+            ("symbol is too long", {**valid, "portfolio": [{**valid["portfolio"][0], "symbol": "A1234567890"}]}),  # type: ignore[index]
+            ("currency is too long", {**valid, "portfolio": [{**valid["portfolio"][0], "currency": "ABCDEFGHI"}]}),  # type: ignore[index]
+            ("boolean horizon", {**valid, "risk_profile": {**valid["risk_profile"], "horizonMonths": True}}),  # type: ignore[arg-type]
+        ]
+
+        for name, value in cases:
+            with self.subTest(name=name), self.assertRaises(NotifySecurityError) as raised:
+                parse_signed_context(_raw(value))
+            self.assertEqual(raised.exception.code, "invalid_context")
+
 
 TEST_NOW = 1_800_000_000
 
@@ -296,6 +375,19 @@ class AuthorizationTests(unittest.TestCase):
             self._verify(None)
 
         self.assertEqual(raised.exception.code, "authorization_required")
+
+    def test_build_rejects_a_non_string_nonce_without_leaking_type_error(self) -> None:
+        with self.assertRaises(NotifySecurityError) as raised:
+            build_notify_typed_data(
+                job_id=self.job_id,
+                context=self.raw,
+                expires_at=TEST_NOW + 300,
+                nonce=object(),  # type: ignore[arg-type]
+                chain_id=self.chain_id,
+                verifying_contract=self.contract,
+            )
+
+        self.assertEqual(raised.exception.code, "invalid_authorization")
 
 if __name__ == "__main__":
     unittest.main()
