@@ -37,6 +37,7 @@ the LLM tool list.
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 import json
 import logging
 import os
@@ -44,7 +45,12 @@ from typing import Any
 
 import signing
 from bnbagent_studio_core.erc8183.errors import SubmitPermanentlyUnsupportedError
-from notify_security import JobContext, NotifySecurityError, verify_notify_authorization
+from notify_security import (
+    JobContext,
+    NotifySecurityError,
+    validate_gateway_url,
+    verify_notify_authorization,
+)
 
 logger = logging.getLogger("seller-agent.core")
 
@@ -221,6 +227,11 @@ class SellerCore:
                 chain_id=target.chain_id,
                 verifying_contract=target.verifying_contract,
             )
+            if context.gateway_url is not None:
+                context = replace(
+                    context,
+                    gateway_url=validate_gateway_url(context.gateway_url),
+                )
         except NotifySecurityError as error:
             logger.warning("job %s: notification rejected — %s", job_id, error.code)
             return {"status": "rejected", "job_id": job_id, "reason": error.code}

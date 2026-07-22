@@ -4,11 +4,15 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import hashlib
+from ipaddress import ip_address
 import json
 import math
+import os
 import re
+import socket
 import time
-from typing import Any
+from typing import Any, Callable
+from urllib.parse import urlsplit
 
 from eth_account import Account
 from eth_account.messages import encode_typed_data
@@ -36,6 +40,8 @@ _NONCE_PATTERN = re.compile(r"0x[0-9a-fA-F]{64}\Z")
 _SIGNATURE_PATTERN = re.compile(r"(?:0x)?[0-9a-fA-F]{130}\Z")
 _MAX_UINT64 = 2**64 - 1
 _MAX_UINT256 = 2**256 - 1
+_DEFAULT_GATEWAY_HOST_RULES = (".trycloudflare.com",)
+_TRUE_ENV_VALUES = frozenset({"1", "true", "yes", "on"})
 
 
 class NotifySecurityError(ValueError):
@@ -44,6 +50,108 @@ class NotifySecurityError(ValueError):
     def __init__(self, code: str) -> None:
         self.code = code
         super().__init__(code)
+
+
+def validate_gateway_url(
+    url: str,
+    *,
+    allow_private: bool | None = None,
+    resolver: Callable[..., object] | None = None,
+) -> str:
+    """Validate a gateway origin and return its canonical origin string.
+
+    Production origins must be allowlisted HTTPS endpoints whose complete DNS
+    answer set is globally routable.  Development mode adds one narrow
+    exception: HTTP is permitted when every answer is loopback.
+    """
+    if not isinstance(url, str) or not url or any(ord(char) <= 32 or ord(char) == 127 for char in url):
+        raise NotifySecurityError("invalid_gateway_url")
+    # ``urlsplit`` discards empty query/fragment delimiters, so reject the
+    # delimiters themselves rather than silently normalizing them away.
+    if "?" in url or "#" in url or "\\" in url:
+        raise NotifySecurityError("invalid_gateway_url")
+
+    try:
+        parsed = urlsplit(url)
+        hostname = parsed.hostname
+        port = parsed.port
+    except (TypeError, ValueError, UnicodeError):
+        raise NotifySecurityError("invalid_gateway_url") from None
+
+    scheme = parsed.scheme.lower()
+    if (
+        hostname is None
+        or not parsed.netloc
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.path not in ("", "/")
+        or parsed.query
+        or parsed.fragment
+        or scheme not in {"http", "https"}
+    ):
+        raise NotifySecurityError("invalid_gateway_url")
+
+    hostname = hostname.lower()
+    if hostname == "localhost" or hostname.endswith(".localhost"):
+        raise NotifySecurityError("invalid_gateway_url")
+
+    if allow_private is None:
+        allow_private = os.environ.get("ALLOW_PRIVATE_DELIVERY_GATEWAY", "").strip().lower() in _TRUE_ENV_VALUES
+    elif not isinstance(allow_private, bool):
+        raise NotifySecurityError("invalid_gateway_url")
+
+    expected_port = 443 if scheme == "https" else 80
+    if scheme == "https" and port not in (None, 443):
+        raise NotifySecurityError("invalid_gateway_url")
+    if scheme == "http" and not allow_private:
+        raise NotifySecurityError("invalid_gateway_url")
+
+    lookup = socket.getaddrinfo if resolver is None else resolver
+    try:
+        answers = lookup(hostname, port or expected_port, type=socket.SOCK_STREAM)
+        addresses = [ip_address(answer[4][0]) for answer in answers]  # type: ignore[index]
+    except (OSError, TypeError, ValueError, IndexError):
+        raise NotifySecurityError("invalid_gateway_url") from None
+    if not addresses:
+        raise NotifySecurityError("invalid_gateway_url")
+
+    loopback_http = scheme == "http" and allow_private and all(address.is_loopback for address in addresses)
+    if scheme == "http" and not loopback_http:
+        raise NotifySecurityError("invalid_gateway_url")
+    if scheme == "https" and not all(_is_public_gateway_address(address) for address in addresses):
+        raise NotifySecurityError("invalid_gateway_url")
+    if not loopback_http and not _gateway_host_allowed(hostname):
+        raise NotifySecurityError("invalid_gateway_url")
+
+    rendered_host = f"[{hostname}]" if ":" in hostname else hostname
+    rendered_port = "" if port in (None, expected_port) else f":{port}"
+    return f"{scheme}://{rendered_host}{rendered_port}"
+
+
+def _is_public_gateway_address(address: Any) -> bool:
+    return bool(
+        address.is_global
+        and not address.is_loopback
+        and not address.is_private
+        and not address.is_link_local
+        and not address.is_multicast
+        and not address.is_unspecified
+        and not address.is_reserved
+    )
+
+
+def _gateway_host_allowed(hostname: str) -> bool:
+    configured = os.environ.get("DELIVERY_GATEWAY_ALLOWED_HOSTS")
+    rules = _DEFAULT_GATEWAY_HOST_RULES if configured is None else tuple(
+        item.strip().lower() for item in configured.split(",") if item.strip()
+    )
+    for rule in rules:
+        if rule.startswith("."):
+            if hostname.endswith(rule) and hostname != rule[1:]:
+                return True
+        elif hostname == rule:
+            return True
+    return False
 
 
 @dataclass(frozen=True)

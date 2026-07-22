@@ -5,8 +5,11 @@ from __future__ import annotations
 import dataclasses
 import hashlib
 import json
+import os
 from pathlib import Path
+import socket
 import unittest
+from unittest.mock import patch
 
 from eth_account import Account
 from eth_account.messages import encode_typed_data
@@ -15,6 +18,7 @@ from stockanalyst.app.agent.notify_security import (
     NotifySecurityError,
     build_notify_typed_data,
     parse_signed_context,
+    validate_gateway_url,
     verify_notify_authorization,
 )
 
@@ -41,6 +45,171 @@ def _valid_context() -> dict[str, object]:
 
 def _raw(context: dict[str, object]) -> str:
     return json.dumps(context, separators=(",", ":"), allow_nan=True)
+
+
+def _resolver(*addresses: str):
+    def resolve(host: str, port: int, *args, **kwargs):
+        del host, args, kwargs
+        return [
+            (
+                socket.AF_INET6 if ":" in address else socket.AF_INET,
+                socket.SOCK_STREAM,
+                socket.IPPROTO_TCP,
+                "",
+                (address, port, 0, 0) if ":" in address else (address, port),
+            )
+            for address in addresses
+        ]
+
+    return resolve
+
+
+PUBLIC_RESOLVER = _resolver("104.16.132.229")
+
+
+class GatewayPolicyTests(unittest.TestCase):
+    def test_accepts_public_https_origin_on_default_suffix(self) -> None:
+        self.assertEqual(
+            validate_gateway_url(
+                "https://Buyer.TryCloudflare.com/",
+                resolver=PUBLIC_RESOLVER,
+            ),
+            "https://buyer.trycloudflare.com",
+        )
+
+    def test_rejects_non_origin_and_ambiguous_url_components(self) -> None:
+        urls = [
+            "http://buyer.trycloudflare.com",
+            "https://user@buyer.trycloudflare.com",
+            "https://user:pass@buyer.trycloudflare.com",
+            "https://buyer.trycloudflare.com/path",
+            "https://buyer.trycloudflare.com/%2fadmin",
+            "https://buyer.trycloudflare.com?next=http://127.0.0.1",
+            "https://buyer.trycloudflare.com?",
+            "https://buyer.trycloudflare.com#fragment",
+            "https://buyer.trycloudflare.com#",
+            "https://buyer.trycloudflare.com:8443",
+            "https://buyer.trycloudflare.com\\@evil.example",
+        ]
+
+        for url in urls:
+            with self.subTest(url=url), self.assertRaises(NotifySecurityError):
+                validate_gateway_url(url, resolver=PUBLIC_RESOLVER)
+
+    def test_rejects_hosts_outside_exact_and_dot_boundary_allowlist(self) -> None:
+        with patch.dict(
+            os.environ,
+            {"DELIVERY_GATEWAY_ALLOWED_HOSTS": "gateway.example,.approved.example"},
+            clear=False,
+        ):
+            self.assertEqual(
+                validate_gateway_url("https://gateway.example", resolver=PUBLIC_RESOLVER),
+                "https://gateway.example",
+            )
+            self.assertEqual(
+                validate_gateway_url("https://a.approved.example", resolver=PUBLIC_RESOLVER),
+                "https://a.approved.example",
+            )
+            rejected = [
+                "https://sub.gateway.example",
+                "https://approved.example",
+                "https://evilapproved.example",
+                "https://buyer.trycloudflare.com",
+            ]
+            for url in rejected:
+                with self.subTest(url=url), self.assertRaises(NotifySecurityError):
+                    validate_gateway_url(url, resolver=PUBLIC_RESOLVER)
+
+    def test_rejects_non_global_and_mixed_dns_answers_in_production(self) -> None:
+        non_global = [
+            "127.0.0.1",
+            "::1",
+            "10.0.0.1",
+            "172.16.0.1",
+            "192.168.0.1",
+            "169.254.169.254",
+            "fe80::1",
+            "0.0.0.0",
+            "::",
+            "224.0.0.1",
+            "ff02::1",
+            "240.0.0.1",
+        ]
+        for address in non_global:
+            with self.subTest(address=address), self.assertRaises(NotifySecurityError):
+                validate_gateway_url(
+                    "https://buyer.trycloudflare.com",
+                    resolver=_resolver(address),
+                )
+
+        with self.assertRaises(NotifySecurityError):
+            validate_gateway_url(
+                "https://buyer.trycloudflare.com",
+                resolver=_resolver("104.16.132.229", "127.0.0.1"),
+            )
+
+    def test_rejects_localhost_ip_literals_and_failed_resolution(self) -> None:
+        cases = [
+            ("https://localhost", _resolver("127.0.0.1")),
+            ("https://127.0.0.1", _resolver("127.0.0.1")),
+            ("https://[::1]", _resolver("::1")),
+            ("https://buyer.trycloudflare.com", _resolver()),
+        ]
+        for url, resolver in cases:
+            with self.subTest(url=url), self.assertRaises(NotifySecurityError):
+                validate_gateway_url(url, resolver=resolver)
+
+    def test_rejects_resolution_errors(self) -> None:
+        def failing_resolver(*args, **kwargs):
+            del args, kwargs
+            raise socket.gaierror("not found")
+
+        with self.assertRaises(NotifySecurityError):
+            validate_gateway_url(
+                "https://buyer.trycloudflare.com",
+                resolver=failing_resolver,
+            )
+
+    def test_development_flag_allows_only_http_loopback_origin(self) -> None:
+        self.assertEqual(
+            validate_gateway_url(
+                "http://127.0.0.1:9444",
+                allow_private=True,
+                resolver=_resolver("127.0.0.1"),
+            ),
+            "http://127.0.0.1:9444",
+        )
+        self.assertEqual(
+            validate_gateway_url(
+                "http://[::1]:9444",
+                allow_private=True,
+                resolver=_resolver("::1"),
+            ),
+            "http://[::1]:9444",
+        )
+        for address in ("169.254.169.254", "10.0.0.1", "104.16.132.229"):
+            with self.subTest(address=address), self.assertRaises(NotifySecurityError):
+                validate_gateway_url(
+                    "http://gateway.example:9444",
+                    allow_private=True,
+                    resolver=_resolver(address),
+                )
+
+    def test_explicit_private_setting_overrides_environment(self) -> None:
+        with patch.dict(os.environ, {"ALLOW_PRIVATE_DELIVERY_GATEWAY": "true"}):
+            self.assertEqual(
+                validate_gateway_url(
+                    "http://127.0.0.1:9444",
+                    resolver=_resolver("127.0.0.1"),
+                ),
+                "http://127.0.0.1:9444",
+            )
+            with self.assertRaises(NotifySecurityError):
+                validate_gateway_url(
+                    "http://127.0.0.1:9444",
+                    allow_private=False,
+                    resolver=_resolver("127.0.0.1"),
+                )
 
 
 class ContextTests(unittest.TestCase):

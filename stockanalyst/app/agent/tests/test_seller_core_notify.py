@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import socket
 import sys
 import threading
 import time
@@ -63,6 +64,22 @@ EXPIRES_AT = int(time.time()) + 300
 NONCE = "0x" + "33" * 32
 
 
+def _gateway_resolver(address: str):
+    def resolve(host: str, port: int, *args, **kwargs):
+        del host, args, kwargs
+        return [
+            (
+                socket.AF_INET,
+                socket.SOCK_STREAM,
+                socket.IPPROTO_TCP,
+                "",
+                (address, port),
+            )
+        ]
+
+    return resolve
+
+
 class RecordingSellerCore(SellerCore):
     """Seller core whose background scheduling is observable and inert."""
 
@@ -109,8 +126,19 @@ class NotifyFundedAuthorizationTests(unittest.IsolatedAsyncioTestCase):
         )
         self.verify_signed_job = self.verify_patcher.start()
         self.job_authorization_target = self.target_patcher.start()
+        self.real_validate_gateway_url = seller_core_module.validate_gateway_url
+        self.gateway_patcher = patch.object(
+            seller_core_module,
+            "validate_gateway_url",
+            side_effect=lambda url: self.real_validate_gateway_url(
+                url,
+                resolver=_gateway_resolver("104.16.132.229"),
+            ),
+        )
+        self.validate_gateway_url = self.gateway_patcher.start()
         self.addCleanup(self.verify_patcher.stop)
         self.addCleanup(self.target_patcher.stop)
+        self.addCleanup(self.gateway_patcher.stop)
 
     def _signed_request(
         self,
@@ -214,6 +242,20 @@ class NotifyFundedAuthorizationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["reason"], "verification_unavailable")
         self.assertIs(result["retryable"], True)
         self.assertEqual(self.core._job_contexts, {})
+        self.assertEqual(self.core.spawned_jobs, [])
+
+    async def test_unsafe_signed_gateway_is_rejected_before_state_or_spawn(self) -> None:
+        self.validate_gateway_url.side_effect = lambda url: self.real_validate_gateway_url(
+            url,
+            resolver=_gateway_resolver("127.0.0.1"),
+        )
+
+        result = await self.core.notify_funded(self._signed_request())
+
+        self.assertEqual(result["status"], "rejected")
+        self.assertEqual(result["reason"], "invalid_gateway_url")
+        self.assertEqual(self.core._job_contexts, {})
+        self.assertEqual(self.core._inflight, set())
         self.assertEqual(self.core.spawned_jobs, [])
 
     async def test_identical_signed_context_is_idempotent(self) -> None:
