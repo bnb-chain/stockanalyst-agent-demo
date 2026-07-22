@@ -44,6 +44,7 @@ from typing import Any
 
 import signing
 from bnbagent_studio_core.erc8183.errors import SubmitPermanentlyUnsupportedError
+from notify_security import JobContext, NotifySecurityError, verify_notify_authorization
 
 logger = logging.getLogger("seller-agent.core")
 
@@ -94,11 +95,9 @@ class SellerCore:
         #                 slower sweep never re-delivers a just-submitted job).
         self._tasks: set[asyncio.Task] = set()
         self._inflight: set[int] = set()
-        # Per-job UOMP gateway params extracted from the buyer's notify_funded data.
-        # Keyed by job_id; consumed (popped) in _do_work_and_submit.
-        self._job_gateways: dict[int, tuple[str, str]] = {}
-        # Per-job UOMP portfolio context (holdings + risk profile) from the buyer.
-        self._job_portfolios: dict[int, dict] = {}
+        # Immutable, authorization-bound off-chain context. This is installed
+        # only after all on-chain and wallet checks succeed.
+        self._job_contexts: dict[int, JobContext] = {}
 
     def is_busy(self) -> bool:
         """True while any background delivery is in flight.
@@ -151,39 +150,83 @@ class SellerCore:
         except (TypeError, ValueError):
             return {"status": "rejected", "error": f"invalid job_id: {raw!r}"}
 
-        # UOMP delivery: buyer passes its relay URL + token so the seller can
-        # upload the report directly to the buyer's local gateway.
-        gw_url = data.get("delivery_gateway_url")
-        gw_tok = data.get("delivery_gateway_token")
-        if gw_url and gw_tok:
-            self._job_gateways[job_id] = (str(gw_url), str(gw_tok))
-            logger.info("job %s: UOMP gateway delivery → %s", job_id, gw_url)
-
-        # UOMP portfolio context: buyer passes holdings + risk profile for personalised analysis.
-        portfolio = data.get("portfolio")
-        risk_profile = data.get("risk_profile")
-        if portfolio or risk_profile:
-            self._job_portfolios[job_id] = {
-                "portfolio": portfolio or [],
-                "risk_profile": risk_profile or {},
+        legacy_context_keys = {
+            "delivery_gateway_url",
+            "delivery_gateway_token",
+            "portfolio",
+            "risk_profile",
+        }
+        if legacy_context_keys.intersection(data):
+            reason = (
+                "invalid_authorization" if "authorization" in data else "authorization_required"
+            )
+            return {"status": "rejected", "job_id": job_id, "reason": reason}
+        authorization = data.get("authorization")
+        if not isinstance(authorization, dict):
+            return {
+                "status": "rejected",
+                "job_id": job_id,
+                "reason": "authorization_required",
             }
-            logger.info("job %s: portfolio context received (%d holdings)", job_id, len(portfolio or []))
 
-        verified = False
         try:
-            # Off the event loop + time-bounded: a blocking RPC must not stall the
-            # ack path. On timeout we fall through to accept-and-re-verify below.
             ok, reason, permanent = await asyncio.wait_for(
                 asyncio.to_thread(signing.verify_signed_job, job_id),
                 timeout=_PREVERIFY_TIMEOUT_SECONDS,
             )
-            if not ok and permanent:
+        except Exception:  # noqa: BLE001 — includes RPC and timeout failures
+            logger.warning("job %s: verification unavailable", job_id)
+            return {
+                "status": "rejected",
+                "job_id": job_id,
+                "reason": "verification_unavailable",
+                "retryable": True,
+            }
+        if not ok:
+            if permanent:
                 logger.warning("job %s: verify rejected permanently — %s", job_id, reason)
                 return {"status": "rejected", "job_id": job_id, "reason": reason}
-            verified = ok
-        except Exception as e:  # noqa: BLE001 — pre-verify is best-effort; bg re-verifies (incl. TimeoutError)
-            logger.warning("pre-verify of job %s failed (%s); accepting, will re-verify in background", job_id, e)
-        self._spawn_job(job_id, verified=verified)
+            logger.warning("job %s: verification unavailable", job_id)
+            return {
+                "status": "rejected",
+                "job_id": job_id,
+                "reason": "verification_unavailable",
+                "retryable": True,
+            }
+
+        try:
+            target = await asyncio.wait_for(
+                asyncio.to_thread(signing.job_authorization_target, job_id),
+                timeout=_PREVERIFY_TIMEOUT_SECONDS,
+            )
+        except Exception:  # noqa: BLE001 — includes RPC and timeout failures
+            logger.warning("job %s: authorization target unavailable", job_id)
+            return {
+                "status": "rejected",
+                "job_id": job_id,
+                "reason": "verification_unavailable",
+                "retryable": True,
+            }
+
+        try:
+            context = verify_notify_authorization(
+                authorization,
+                job_id=job_id,
+                expected_client=target.client,
+                chain_id=target.chain_id,
+                verifying_contract=target.verifying_contract,
+            )
+        except NotifySecurityError as error:
+            logger.warning("job %s: notification rejected — %s", job_id, error.code)
+            return {"status": "rejected", "job_id": job_id, "reason": error.code}
+
+        existing_context = self._job_contexts.get(job_id)
+        if existing_context is None:
+            self._job_contexts[job_id] = context
+        elif existing_context.digest != context.digest:
+            logger.warning("job %s: notification rejected — context_conflict", job_id)
+            return {"status": "rejected", "job_id": job_id, "reason": "context_conflict"}
+        self._spawn_job(job_id, verified=True)
         self._spawn(self._sweep())  # straggler fallback alongside the named job
         return {
             "status": "accepted",
@@ -244,7 +287,9 @@ class SellerCore:
         except Exception:  # noqa: BLE001 — a background job must never crash the loop
             logger.exception("background delivery of job %s failed", job_id)
         finally:
-            if not terminal:
+            if terminal:
+                self._job_contexts.pop(job_id, None)
+            else:
                 self._inflight.discard(job_id)
 
     # -- internals -------------------------------------------------------------
@@ -269,13 +314,13 @@ class SellerCore:
         (defense in depth) and RAISES on a failed submit, so an ``ok: True`` result
         always carries a landed tx hash.
         """
-        # Pop gateway params (if the buyer sent them in notify_funded). These are
-        # consumed once here and not retained — each notify_funded is independent.
-        gateway = self._job_gateways.pop(job_id, None)
-        gateway_url, gateway_token = gateway if gateway else (None, None)
-
-        # Pop UOMP portfolio context (if the buyer sent it in notify_funded).
-        portfolio_data = self._job_portfolios.pop(job_id, {})
+        # Read without consuming: a transient work/submit failure must retry with
+        # the exact same authorization-bound values. Swept jobs have no context.
+        context = self._job_contexts.get(job_id)
+        gateway_url = context.gateway_url if context is not None else None
+        gateway_token = context.gateway_token if context is not None else None
+        portfolio = context.portfolio_for_prompt() if context is not None else []
+        risk_profile = context.risk_profile_for_prompt() if context is not None else None
 
         spec = await asyncio.to_thread(signing.job_spec, job_id)
         if spec is not None:
@@ -284,8 +329,8 @@ class SellerCore:
             task = f"job {job_id}"
         prompt, symbols = _build_stock_analysis_prompt(
             task,
-            portfolio=portfolio_data.get("portfolio", []),
-            risk_profile=portfolio_data.get("risk_profile", {}),
+            portfolio=portfolio,
+            risk_profile=risk_profile,
         )
         work = await self._run_work(prompt, session_id=str(job_id), symbols=symbols)
 

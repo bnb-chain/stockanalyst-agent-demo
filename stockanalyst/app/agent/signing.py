@@ -20,6 +20,8 @@ domain needs it, but keep these ops OUT of the LLM tool list.
 """
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 from bnbagent.erc8183 import NegotiationHandler
 
 from bnbagent_studio_core import config
@@ -157,6 +159,26 @@ def verify_signed_job(job_id: int) -> tuple[bool, str, bool]:
 
     v = _verify(job_id, expected_signer=get_wallet().address)
     return v.ok, v.reason, v.permanent
+
+
+@dataclass(frozen=True)
+class JobAuthorizationTarget:
+    """On-chain identity and EIP-712 domain for a funded job's client."""
+
+    client: str
+    chain_id: int
+    verifying_contract: str
+
+
+def job_authorization_target(job_id: int) -> JobAuthorizationTarget:
+    """Return the chain-owned client and EIP-712 domain for ``job_id``."""
+    client = get_8183_client()
+    job = client.get_job(job_id)
+    return JobAuthorizationTarget(
+        client=str(job.client),
+        chain_id=int(client.network.chain_id),
+        verifying_contract=str(client.commerce.address),
+    )
 
 
 def job_spec(job_id: int):
