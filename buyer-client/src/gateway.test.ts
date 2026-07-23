@@ -14,6 +14,7 @@ import test from "node:test";
 import {
   createGatewayHandler,
   fetchDeliverable,
+  findCloudflared,
   type GatewayHandlerOptions,
   type GatewayRelay,
 } from "./gateway.js";
@@ -761,4 +762,35 @@ test("fetches without credentials when no relay is available", async () => {
   await fetchDeliverable(url, undefined, fakeFetch);
 
   assert.deepEqual(calls, [{ url, init: undefined }]);
+});
+
+test("findCloudflared prefers an executable found through PATH", () => {
+  const executable = new Set(["/custom/bin/cloudflared", "/home/me/.local/bin/cloudflared"]);
+  assert.equal(findCloudflared({
+    env: { PATH: "/missing:/custom/bin", HOME: "/home/me" },
+    isExecutable: (path) => executable.has(path),
+  }), "/custom/bin/cloudflared");
+});
+
+test("findCloudflared falls back through every documented absolute location", () => {
+  for (const expected of [
+    "/home/me/.local/bin/cloudflared",
+    "/usr/local/bin/cloudflared",
+    "/opt/homebrew/bin/cloudflared",
+  ]) {
+    assert.equal(findCloudflared({
+      env: { PATH: "/missing", HOME: "/home/me" },
+      isExecutable: (path) => path === expected,
+    }), expected);
+  }
+});
+
+test("findCloudflared rejects non-executable candidates with a clear error", () => {
+  assert.throws(
+    () => findCloudflared({
+      env: { PATH: "/bin", HOME: "/home/me" },
+      isExecutable: () => false,
+    }),
+    /cloudflared executable not found/i,
+  );
 });

@@ -24,6 +24,8 @@ import {
 } from "http";
 import { spawn, type ChildProcess } from "child_process";
 import { randomBytes, timingSafeEqual } from "crypto";
+import { accessSync, constants, statSync } from "fs";
+import { delimiter, join } from "path";
 
 export const MAX_PAYLOAD_BYTES = 2 * 1024 * 1024;
 export const MAX_RELAY_BYTES = 16 * 1024 * 1024;
@@ -55,6 +57,11 @@ export interface GatewayRelay {
   publicUrl: string;   // https://xxx.trycloudflare.com  (for seller to upload)
   token: string;       // Bearer token required for payload uploads and reads
   close(): void;
+}
+
+export interface CloudflaredDiscoveryOptions {
+  env?: NodeJS.ProcessEnv;
+  isExecutable?: (path: string) => boolean;
 }
 
 export async function fetchDeliverable(
@@ -418,16 +425,38 @@ function createRelayServer(port: number, token: string): Promise<() => void> {
   });
 }
 
-function findCloudflared(): string {
+function defaultIsExecutable(path: string): boolean {
+  try {
+    if (!statSync(path).isFile()) return false;
+    accessSync(path, constants.X_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export function findCloudflared(
+  options: CloudflaredDiscoveryOptions = {},
+): string {
+  const env = options.env ?? process.env;
+  const isExecutable = options.isExecutable ?? defaultIsExecutable;
+  const pathCandidates = (env.PATH ?? "")
+    .split(delimiter)
+    .filter(Boolean)
+    .map((directory) => join(directory, "cloudflared"));
   const candidates = [
-    "cloudflared",
-    `${process.env["HOME"]}/.local/bin/cloudflared`,
+    ...pathCandidates,
+    ...(env.HOME ? [join(env.HOME, ".local", "bin", "cloudflared")] : []),
     "/usr/local/bin/cloudflared",
     "/opt/homebrew/bin/cloudflared",
   ];
-  // Return first match — on PATH we can't stat, so just return the first name
-  // and let spawn fail if not found.
-  return candidates[0] ?? "cloudflared";
+  const match = candidates.find(isExecutable);
+  if (!match) {
+    throw new Error(
+      "cloudflared executable not found in PATH, ~/.local/bin, /usr/local/bin, or /opt/homebrew/bin",
+    );
+  }
+  return match;
 }
 
 function startCloudflaredTunnel(localPort: number): Promise<{ url: string; proc: ChildProcess }> {
