@@ -339,8 +339,12 @@ def parse_signed_context(raw: str) -> JobContext:
         if gateway_token is not None and ("\r" in gateway_token or "\n" in gateway_token):
             raise ValueError
 
-        portfolio = _parse_portfolio(parsed.get("portfolio", []))
-        risk_profile = _parse_risk_profile(parsed["risk_profile"]) if "risk_profile" in parsed else None
+        portfolio = parse_portfolio(parsed.get("portfolio", []))
+        risk_profile = (
+            parse_risk_profile(parsed["risk_profile"])
+            if "risk_profile" in parsed
+            else None
+        )
     except (TypeError, ValueError, UnicodeError, json.JSONDecodeError):
         raise NotifySecurityError("invalid_context") from None
 
@@ -512,7 +516,7 @@ def _optional_string(
     return value
 
 
-def _parse_portfolio(value: Any) -> tuple[Holding, ...]:
+def parse_portfolio(value: Any) -> tuple[Holding, ...]:
     if not isinstance(value, list) or len(value) > _MAX_HOLDINGS:
         raise ValueError
 
@@ -547,7 +551,7 @@ def _finite_number(value: Any) -> float | int:
     raise ValueError
 
 
-def _parse_risk_profile(value: Any) -> RiskProfile | None:
+def parse_risk_profile(value: Any) -> RiskProfile | None:
     if not isinstance(value, dict) or set(value) != _RISK_PROFILE_KEYS:
         raise ValueError
 
