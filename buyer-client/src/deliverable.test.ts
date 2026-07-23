@@ -49,6 +49,14 @@ test("canonicalizes key order and whitespace before comparing the commitment", (
   );
 });
 
+test("matches SDK key ordering for BMP and astral metadata keys", () => {
+  const sdkCanonical = `{"chain_id":97,"contracts":{"commerce":"${CONTRACTS.commerce}","policy":"${CONTRACTS.policy}","router":"${CONTRACTS.router}"},"job_id":${JOB_ID},"metadata":{"\\ue000":"bmp","\\ud800\\udc00":"astral"},"response":{"content":"# verified","content_type":"text/plain"},"version":1}`;
+  assert.equal(
+    verifyDeliverableManifest(sdkCanonical, expectation(sdkCanonical)),
+    "# verified",
+  );
+});
+
 test("rejects a changed response even when the manifest context is valid", () => {
   const canonical = canonicalManifest();
   const changed = canonical.replace("# verified", "# replaced");

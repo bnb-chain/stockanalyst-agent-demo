@@ -68,7 +68,12 @@ export async function completeSubmittedJob(
   params: CompletionParams,
   dependencies: CompletionDependencies,
 ): Promise<CompletionResult> {
-  const url = await dependencies.getDeliverableUrl(params.jobId, params.fundTxBlock);
+  let url: string | null;
+  try {
+    url = await dependencies.getDeliverableUrl(params.jobId, params.fundTxBlock);
+  } catch {
+    throw blocked("deliverable URL could not be read");
+  }
   if (!url) throw blocked("deliverable URL is missing");
 
   let parsedUrl: URL;

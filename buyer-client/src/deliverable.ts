@@ -37,13 +37,23 @@ function jsonString(value: string): string {
   );
 }
 
+function compareUnicodeCodePoints(left: string, right: string): number {
+  const leftPoints = [...left];
+  const rightPoints = [...right];
+  for (let index = 0; index < Math.min(leftPoints.length, rightPoints.length); index += 1) {
+    const difference = leftPoints[index]!.codePointAt(0)! - rightPoints[index]!.codePointAt(0)!;
+    if (difference !== 0) return difference;
+  }
+  return leftPoints.length - rightPoints.length;
+}
+
 function canonicalJson(value: JsonValue): string {
   if (value === null || typeof value === "boolean") return String(value);
   if (typeof value === "string") return jsonString(value);
   if (isLosslessNumber(value)) return value.value;
   if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
   const objectValue = value as { [key: string]: JsonValue };
-  return `{${Object.keys(objectValue).sort().map(
+  return `{${Object.keys(objectValue).sort(compareUnicodeCodePoints).map(
     (key) => `${jsonString(key)}:${canonicalJson(objectValue[key]!)}`,
   ).join(",")}}`;
 }

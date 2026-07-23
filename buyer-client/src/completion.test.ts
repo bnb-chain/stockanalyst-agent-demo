@@ -44,6 +44,28 @@ test("settles once after fetch and manifest verification succeed", async () => {
   assert.equal(fixture.settleCalls(), 1);
 });
 
+test("URL lookup failure blocks settlement without leaking dependency errors", async () => {
+  const secret = "rpc-token-must-not-leak";
+  const fixture = dependencies({
+    getDeliverableUrl: async () => {
+      throw new Error(`RPC request failed at https://gateway.example/${secret}`);
+    },
+  });
+  await assert.rejects(
+    completeSubmittedJob(
+      { jobId, fundTxBlock: 1, chainId: 97n, contracts },
+      fixture.deps,
+    ),
+    (error: unknown) => {
+      if (!(error instanceof Error)) return false;
+      assert.match(error.message, /settlement blocked/i);
+      assert.doesNotMatch(error.message, new RegExp(secret));
+      return true;
+    },
+  );
+  assert.equal(fixture.settleCalls(), 0);
+});
+
 for (const [name, overrides] of [
   ["missing URL", { getDeliverableUrl: async () => null }],
   ["unsupported URL", { getDeliverableUrl: async () => "ipfs://payload" }],
@@ -51,6 +73,9 @@ for (const [name, overrides] of [
   ["HTTP failure", { fetchDeliverable: async () => new Response("", { status: 503 }) }],
   ["oversized response", {
     fetchDeliverable: async () => new Response("x".repeat(MAX_PAYLOAD_BYTES + 1), { status: 200 }),
+  }],
+  ["plain-text response", {
+    fetchDeliverable: async () => new Response("legacy raw report", { status: 200 }),
   }],
   ["invalid manifest", { fetchDeliverable: async () => new Response("{}", { status: 200 }) }],
   ["hash mismatch", { getDeliverableCommitment: async () => `0x${"00".repeat(32)}` }],
