@@ -24,7 +24,8 @@ from notify_security import _ValidatedGatewayOrigin, _validate_gateway_origin
 _TIMEOUT_UPLOAD = 30
 _TIMEOUT_DOWNLOAD = 30
 _TIMEOUT_EXISTS = 10
-_MAX_RESPONSE_BYTES = 65_536
+_MAX_UPLOAD_RESPONSE_BYTES = 65_536
+_MAX_DOWNLOAD_RESPONSE_BYTES = 2 * 1024 * 1024
 _READ_CHUNK_BYTES = 8_192
 _PAYLOAD_ID_PATTERN = re.compile(r"pay_[0-9a-f]{32}\Z")
 _PAYLOAD_PATH_PATTERN = re.compile(r"/v1/payload/(pay_[0-9a-f]{32})\Z")
@@ -430,7 +431,11 @@ class UOMPGatewayStorageProvider(StorageProvider):
         )
         response, deadline = self._open_response(request, timeout=_TIMEOUT_UPLOAD)
         with response:
-            result = _read_bounded_json(response, deadline=deadline)
+            result = _read_bounded_json(
+                response,
+                deadline=deadline,
+                max_bytes=_MAX_UPLOAD_RESPONSE_BYTES,
+            )
         if not isinstance(result, dict):
             raise ValueError("invalid gateway response")
         payload_id = result.get("payload_id")
@@ -447,7 +452,11 @@ class UOMPGatewayStorageProvider(StorageProvider):
         )
         response, deadline = self._open_response(request, timeout=_TIMEOUT_DOWNLOAD)
         with response:
-            result = _read_bounded_json(response, deadline=deadline)
+            result = _read_bounded_json(
+                response,
+                deadline=deadline,
+                max_bytes=_MAX_DOWNLOAD_RESPONSE_BYTES,
+            )
         if not isinstance(result, dict):
             raise ValueError("invalid gateway response")
         return result
@@ -501,8 +510,12 @@ class UOMPGatewayStorageProvider(StorageProvider):
         except (TypeError, ValueError, UnicodeError):
             raise ValueError("invalid payload URL") from None
         scheme = parsed.scheme.lower()
-        expected_port = self._origin.port or (443 if self._origin.scheme == "https" else 80)
-        actual_port = port or (443 if scheme == "https" else 80)
+        expected_port = (
+            self._origin.port
+            if self._origin.port is not None
+            else (443 if self._origin.scheme == "https" else 80)
+        )
+        actual_port = port if port is not None else (443 if scheme == "https" else 80)
         if (
             scheme != self._origin.scheme
             or parsed.hostname is None
@@ -518,14 +531,19 @@ class UOMPGatewayStorageProvider(StorageProvider):
         return f"{self._base}{parsed.path}"
 
 
-def _read_bounded_json(response: Any, *, deadline: float) -> object:
+def _read_bounded_json(
+    response: Any,
+    *,
+    deadline: float,
+    max_bytes: int,
+) -> object:
     read1 = getattr(response, "read1", None)
     if callable(read1):
         chunks: list[bytes] = []
         size = 0
         while True:
             _ensure_before_deadline(response, deadline)
-            chunk = read1(min(_READ_CHUNK_BYTES, _MAX_RESPONSE_BYTES + 1 - size))
+            chunk = read1(min(_READ_CHUNK_BYTES, max_bytes + 1 - size))
             _ensure_before_deadline(response, deadline)
             if not chunk:
                 break
@@ -534,14 +552,14 @@ def _read_bounded_json(response: Any, *, deadline: float) -> object:
                 raise ValueError("invalid gateway response")
             chunks.append(chunk)
             size += len(chunk)
-            if size > _MAX_RESPONSE_BYTES:
+            if size > max_bytes:
                 break
         body = b"".join(chunks)
     else:
         _ensure_before_deadline(response, deadline)
-        body = response.read(_MAX_RESPONSE_BYTES + 1)
+        body = response.read(max_bytes + 1)
         _ensure_before_deadline(response, deadline)
-    if len(body) > _MAX_RESPONSE_BYTES:
+    if len(body) > max_bytes:
         raise ValueError("gateway response too large")
     try:
         return json.loads(body)

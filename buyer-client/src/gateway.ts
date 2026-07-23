@@ -28,6 +28,7 @@ import { randomBytes, timingSafeEqual } from "crypto";
 export const MAX_PAYLOAD_BYTES = 2 * 1024 * 1024;
 export const MAX_RELAY_BYTES = 16 * 1024 * 1024;
 export const MAX_RELAY_PAYLOADS = 32;
+const MAX_PAYLOAD_SEGMENTS = 32;
 
 export interface RelayLimits {
   maxPayloadBytes: number;
@@ -38,6 +39,15 @@ export interface RelayLimits {
 export interface GatewayHandlerOptions {
   idFactory?: () => string;
   limits?: Partial<RelayLimits>;
+  /** Optional storage telemetry used by focused relay tests. */
+  onPayloadStored?: (observation: PayloadStorageObservation) => void;
+}
+
+export interface PayloadStorageObservation {
+  allocatedBytes: number;
+  byteLength: number;
+  dataEvents: number;
+  segmentCount: number;
 }
 
 export interface GatewayRelay {
@@ -95,12 +105,22 @@ function sendNotFound(res: ServerResponse): void {
 }
 
 function sendUploadError(
+  req: IncomingMessage,
   res: ServerResponse,
   status: number,
   code: string,
   message: string,
 ): void {
-  if (res.headersSent || res.writableEnded || res.destroyed) return;
+  if (
+    req.aborted
+    || req.destroyed
+    || req.socket.destroyed
+    || res.headersSent
+    || res.writableEnded
+    || res.destroyed
+  ) {
+    return;
+  }
   res.writeHead(status, {
     "Content-Type": "application/json",
     "Connection": "close",
@@ -121,15 +141,27 @@ export function createGatewayHandler(
   token: string,
   options: GatewayHandlerOptions = {},
 ): RequestListener {
-  const payloads = new Map<string, Buffer>();
+  interface StoredPayload {
+    allocatedBytes: number;
+    byteLength: number;
+    segments: Buffer[];
+  }
+
+  const payloads = new Map<string, StoredPayload>();
   const idFactory = options.idFactory ?? (() => `pay_${randomBytes(16).toString("hex")}`);
   const limits: RelayLimits = {
     maxPayloadBytes: options.limits?.maxPayloadBytes ?? MAX_PAYLOAD_BYTES,
     maxRelayBytes: options.limits?.maxRelayBytes ?? MAX_RELAY_BYTES,
     maxPayloads: options.limits?.maxPayloads ?? MAX_RELAY_PAYLOADS,
   };
-  let storedBytes = 0;
-  let inFlightBytes = 0;
+  // The production 2 MiB limit yields 64 KiB pages. Smaller injected limits
+  // scale the page size down while preserving the same 32-segment ceiling.
+  const segmentBytes = Math.max(
+    1,
+    Math.ceil(limits.maxPayloadBytes / MAX_PAYLOAD_SEGMENTS),
+  );
+  let storedAllocatedBytes = 0;
+  let inFlightAllocatedBytes = 0;
   let activeUploads = 0;
 
   return (
@@ -160,13 +192,13 @@ export function createGatewayHandler(
           typeof contentLengthHeader !== "string"
           || !/^[0-9]+$/.test(contentLengthHeader)
         ) {
-          sendUploadError(res, 400, "BAD_REQUEST", "Invalid Content-Length");
+          sendUploadError(req, res, 400, "BAD_REQUEST", "Invalid Content-Length");
           drainRequest(req);
           return;
         }
         const declaredBigInt = BigInt(contentLengthHeader);
         if (declaredBigInt > BigInt(limits.maxPayloadBytes)) {
-          sendUploadError(res, 413, "PAYLOAD_TOO_LARGE", "Payload exceeds byte limit");
+          sendUploadError(req, res, 413, "PAYLOAD_TOO_LARGE", "Payload exceeds byte limit");
           drainRequest(req);
           return;
         }
@@ -174,33 +206,31 @@ export function createGatewayHandler(
       }
 
       if (payloads.size + activeUploads >= limits.maxPayloads) {
-        sendUploadError(res, 507, "INSUFFICIENT_STORAGE", "Payload slot limit reached");
-        drainRequest(req);
-        return;
-      }
-      if (declaredBytes > limits.maxRelayBytes - storedBytes - inFlightBytes) {
-        sendUploadError(res, 507, "INSUFFICIENT_STORAGE", "Relay byte limit reached");
+        sendUploadError(req, res, 507, "INSUFFICIENT_STORAGE", "Payload slot limit reached");
         drainRequest(req);
         return;
       }
 
-      const chunks: Buffer[] = [];
+      const segments: Buffer[] = [];
       let receivedBytes = 0;
-      let reservedBytes = declaredBytes;
+      let reservedAllocatedBytes = 0;
+      let dataEvents = 0;
+      let writeSegment = 0;
+      let writeOffset = 0;
       let terminal = false;
       let released = false;
       activeUploads += 1;
-      inFlightBytes += declaredBytes;
 
-      const release = (committedBytes?: number): void => {
+      const release = (committed = false): void => {
         if (released) return;
         released = true;
-        inFlightBytes -= reservedBytes;
+        inFlightAllocatedBytes -= reservedAllocatedBytes;
         activeUploads -= 1;
-        if (committedBytes !== undefined) {
-          storedBytes += committedBytes;
+        if (committed) {
+          storedAllocatedBytes += reservedAllocatedBytes;
+        } else {
+          segments.length = 0;
         }
-        chunks.length = 0;
       };
 
       const rejectUpload = (
@@ -211,29 +241,89 @@ export function createGatewayHandler(
         if (terminal) return;
         terminal = true;
         release();
-        sendUploadError(res, status, code, message);
+        sendUploadError(req, res, status, code, message);
         req.resume();
       };
 
+      const ensureRetainedCapacity = (targetBytes: number): boolean => {
+        const targetAllocatedBytes = targetBytes === 0
+          ? 0
+          : Math.min(
+            limits.maxPayloadBytes,
+            Math.ceil(targetBytes / segmentBytes) * segmentBytes,
+          );
+        const additionalAllocatedBytes =
+          targetAllocatedBytes - reservedAllocatedBytes;
+        if (
+          additionalAllocatedBytes
+            > limits.maxRelayBytes
+              - storedAllocatedBytes
+              - inFlightAllocatedBytes
+        ) {
+          return false;
+        }
+
+        while (reservedAllocatedBytes < targetAllocatedBytes) {
+          const nextSegmentBytes = Math.min(
+            segmentBytes,
+            limits.maxPayloadBytes - reservedAllocatedBytes,
+          );
+          if (nextSegmentBytes <= 0) return false;
+          reservedAllocatedBytes += nextSegmentBytes;
+          inFlightAllocatedBytes += nextSegmentBytes;
+          try {
+            segments.push(Buffer.allocUnsafeSlow(nextSegmentBytes));
+          } catch {
+            return false;
+          }
+        }
+        return true;
+      };
+
+      if (!ensureRetainedCapacity(declaredBytes)) {
+        rejectUpload(507, "INSUFFICIENT_STORAGE", "Relay byte limit reached");
+        return;
+      }
+
       req.on("data", (chunk: Buffer) => {
         if (terminal) return;
+        dataEvents += 1;
         const nextReceivedBytes = receivedBytes + chunk.byteLength;
         if (nextReceivedBytes > limits.maxPayloadBytes) {
           rejectUpload(413, "PAYLOAD_TOO_LARGE", "Payload exceeds byte limit");
           return;
         }
 
-        const additionalBytes = Math.max(0, nextReceivedBytes - reservedBytes);
-        if (additionalBytes > limits.maxRelayBytes - storedBytes - inFlightBytes) {
+        if (!ensureRetainedCapacity(nextReceivedBytes)) {
           rejectUpload(507, "INSUFFICIENT_STORAGE", "Relay byte limit reached");
           return;
         }
-        if (additionalBytes > 0) {
-          reservedBytes += additionalBytes;
-          inFlightBytes += additionalBytes;
+
+        let sourceOffset = 0;
+        while (sourceOffset < chunk.byteLength) {
+          const segment = segments[writeSegment];
+          if (!segment) {
+            rejectUpload(507, "INSUFFICIENT_STORAGE", "Relay byte limit reached");
+            return;
+          }
+          const copiedBytes = Math.min(
+            chunk.byteLength - sourceOffset,
+            segment.byteLength - writeOffset,
+          );
+          chunk.copy(
+            segment,
+            writeOffset,
+            sourceOffset,
+            sourceOffset + copiedBytes,
+          );
+          sourceOffset += copiedBytes;
+          writeOffset += copiedBytes;
+          if (writeOffset === segment.byteLength) {
+            writeSegment += 1;
+            writeOffset = 0;
+          }
         }
         receivedBytes = nextReceivedBytes;
-        chunks.push(chunk);
       });
       req.on("end", () => {
         if (terminal) return;
@@ -241,12 +331,22 @@ export function createGatewayHandler(
         while (payloads.has(id)) {
           id = idFactory();
         }
-        const data = Buffer.concat(chunks, receivedBytes);
-        payloads.set(id, data);
+        const payload: StoredPayload = {
+          allocatedBytes: reservedAllocatedBytes,
+          byteLength: receivedBytes,
+          segments,
+        };
+        payloads.set(id, payload);
         terminal = true;
-        release(data.byteLength);
+        release(true);
+        options.onPayloadStored?.({
+          allocatedBytes: payload.allocatedBytes,
+          byteLength: payload.byteLength,
+          dataEvents,
+          segmentCount: payload.segments.length,
+        });
         res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ payload_id: id, size: data.byteLength }));
+        res.end(JSON.stringify({ payload_id: id, size: payload.byteLength }));
       });
       req.on("aborted", () => {
         rejectUpload(400, "BAD_REQUEST", "Upload aborted");
@@ -275,16 +375,33 @@ export function createGatewayHandler(
         return;
       }
 
-      const data = payloads.get(match[1]);
-      if (!data) {
+      const payload = payloads.get(match[1]);
+      if (!payload) {
         sendNotFound(res);
         return;
       }
       res.writeHead(200, {
         "Content-Type": "application/octet-stream",
-        "Content-Length": String(data.byteLength),
+        "Content-Length": String(payload.byteLength),
       });
-      res.end(method === "HEAD" ? undefined : data);
+      if (method === "HEAD" || payload.byteLength === 0) {
+        res.end();
+        return;
+      }
+      let remainingBytes = payload.byteLength;
+      for (const segment of payload.segments) {
+        const bodyBytes = Math.min(remainingBytes, segment.byteLength);
+        remainingBytes -= bodyBytes;
+        const body = bodyBytes === segment.byteLength
+          ? segment
+          : segment.subarray(0, bodyBytes);
+        if (remainingBytes === 0) {
+          res.end(body);
+          return;
+        }
+        res.write(body);
+      }
+      res.end();
       return;
     }
 

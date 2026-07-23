@@ -211,6 +211,12 @@ def provider(opener: FakeOpener | None = None) -> UOMPGatewayStorageProvider:
     )
 
 
+def valid_manifest(total_bytes: int) -> bytes:
+    prefix = b'{"response":{"content":"'
+    suffix = b'"}}'
+    return prefix + b"x" * (total_bytes - len(prefix) - len(suffix)) + suffix
+
+
 class ProviderConstructionTests(unittest.TestCase):
     def test_deadline_socket_recomputes_remaining_timeout_and_closes_on_expiry(self) -> None:
         clock = FakeClock()
@@ -657,7 +663,28 @@ class ResourceUrlTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(request.get_method(), "GET")
         self.assertEqual(request.get_header("Authorization"), "Bearer token")
         self.assertEqual(timeout, 30)
-        self.assertEqual(opener.response.read_sizes, [65_537])
+        self.assertEqual(opener.response.read_sizes, [2_097_153])
+
+    async def test_download_accepts_exactly_two_mib_and_rejects_above(self) -> None:
+        limit = 2 * 1024 * 1024
+        url = (
+            "https://buyer.trycloudflare.com/v1/payload/"
+            "pay_0123456789abcdef0123456789abcdef"
+        )
+        exact_opener = FakeOpener(valid_manifest(limit))
+
+        result = await provider(exact_opener).download(url)
+
+        self.assertEqual(
+            len(result["response"]["content"]),
+            limit - len(b'{"response":{"content":"') - len(b'"}}'),
+        )
+        self.assertEqual(exact_opener.response.read_sizes, [limit + 1])
+
+        oversized_opener = FakeOpener(valid_manifest(limit + 1))
+        with self.assertRaisesRegex(ValueError, "gateway response too large"):
+            await provider(oversized_opener).download(url)
+        self.assertEqual(oversized_opener.response.read_sizes, [limit + 1])
 
     async def test_download_normalizes_uppercase_https_with_implicit_default_port(self) -> None:
         opener = FakeOpener(b'{"response":{"content":"report"}}')
@@ -688,6 +715,21 @@ class ResourceUrlTests(unittest.IsolatedAsyncioTestCase):
                 "https://K.trycloudflare.com/v1/payload/"
                 "pay_0123456789abcdef0123456789abcdef"
             )
+
+    async def test_rejects_explicit_zero_port_before_authenticated_request(self) -> None:
+        opener = FakeOpener(b"{}")
+        instance = provider(opener)
+        url = (
+            "https://buyer.trycloudflare.com:0/v1/payload/"
+            "pay_0123456789abcdef0123456789abcdef"
+        )
+
+        with self.assertRaises(ValueError):
+            await instance.download(url)
+        with self.assertRaises(ValueError):
+            await instance.exists(url)
+
+        self.assertEqual(opener.requests, [])
 
     async def test_download_enforces_one_total_slow_drip_deadline(self) -> None:
         clock = FakeClock()

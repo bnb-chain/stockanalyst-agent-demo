@@ -1,10 +1,15 @@
 import assert from "node:assert/strict";
+import { EventEmitter } from "node:events";
 import {
   createServer,
   request as httpRequest,
   type ClientRequest,
+  type IncomingMessage,
+  type RequestListener,
   type Server,
+  type ServerResponse,
 } from "node:http";
+import { connect as netConnect } from "node:net";
 import test from "node:test";
 import {
   createGatewayHandler,
@@ -15,12 +20,11 @@ import {
 
 const TEST_TIMEOUT_MS = 1_000;
 
-async function withRelay(
-  token: string,
+async function withHandler(
+  handler: RequestListener,
   run: (baseUrl: string, server: Server) => Promise<void>,
-  options?: GatewayHandlerOptions,
 ): Promise<void> {
-  const server = createServer(createGatewayHandler(token, options));
+  const server = createServer(handler);
   await new Promise<void>((resolve, reject) => {
     server.once("error", reject);
     server.listen(0, "127.0.0.1", resolve);
@@ -35,6 +39,14 @@ async function withRelay(
       server.closeAllConnections();
     });
   }
+}
+
+async function withRelay(
+  token: string,
+  run: (baseUrl: string, server: Server) => Promise<void>,
+  options?: GatewayHandlerOptions,
+): Promise<void> {
+  await withHandler(createGatewayHandler(token, options), run);
 }
 
 function bounded<T>(promise: Promise<T>, label: string): Promise<T> {
@@ -97,6 +109,74 @@ async function postChunks(
   });
 }
 
+async function postRawOneByteChunks(
+  baseUrl: string,
+  token: string,
+  byteCount: number,
+): Promise<{ status: number; body: string }> {
+  const target = new URL(baseUrl);
+  return new Promise((resolve, reject) => {
+    let response = "";
+    let settled = false;
+    const socket = netConnect({
+      host: target.hostname,
+      port: Number(target.port),
+    });
+    const timeout = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      socket.destroy();
+      reject(new Error("Timed out waiting for raw upload response"));
+    }, 5_000);
+    socket.setEncoding("utf8");
+    socket.on("data", (chunk: string) => {
+      response += chunk;
+    });
+    socket.once("connect", () => {
+      socket.end(
+        "POST /v1/payload/upload HTTP/1.1\r\n"
+        + `Host: ${target.host}\r\n`
+        + `Authorization: Bearer ${token}\r\n`
+        + "Transfer-Encoding: chunked\r\n"
+        + "Connection: close\r\n\r\n"
+        + "1\r\na\r\n".repeat(byteCount)
+        + "0\r\n\r\n",
+      );
+    });
+    socket.once("error", (error: Error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      reject(error);
+    });
+    socket.once("end", () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      const separator = response.indexOf("\r\n\r\n");
+      const head = separator < 0 ? response : response.slice(0, separator);
+      let body = separator < 0 ? "" : response.slice(separator + 4);
+      if (/^Transfer-Encoding: chunked$/im.test(head)) {
+        let decoded = "";
+        let offset = 0;
+        while (offset < body.length) {
+          const lineEnd = body.indexOf("\r\n", offset);
+          assert.notEqual(lineEnd, -1);
+          const chunkBytes = Number.parseInt(body.slice(offset, lineEnd), 16);
+          assert.ok(Number.isSafeInteger(chunkBytes));
+          if (chunkBytes === 0) break;
+          const chunkStart = lineEnd + 2;
+          decoded += body.slice(chunkStart, chunkStart + chunkBytes);
+          offset = chunkStart + chunkBytes + 2;
+        }
+        body = decoded;
+      }
+      const status = Number(/^HTTP\/1\.1 ([0-9]{3})/.exec(head)?.[1] ?? 0);
+      resolve({ status, body });
+    });
+  });
+}
+
 interface ObservedUpload {
   chunkReceived: Promise<void>;
   aborted: Promise<void>;
@@ -122,6 +202,27 @@ function observeNextUpload(server: Server): ObservedUpload {
     request.once("close", () => resolveClose());
   });
   return observed;
+}
+
+function observeNextResponseWrites(
+  server: Server,
+): Promise<{ writeHead: number; end: number }> {
+  return new Promise((resolve) => {
+    server.once("request", (request, response) => {
+      const calls = { writeHead: 0, end: 0 };
+      response.writeHead = (() => {
+        calls.writeHead += 1;
+        return response;
+      }) as typeof response.writeHead;
+      response.end = (() => {
+        calls.end += 1;
+        return response;
+      }) as typeof response.end;
+      request.once("close", () => {
+        setImmediate(() => resolve(calls));
+      });
+    });
+  });
 }
 
 interface PartialUpload {
@@ -168,6 +269,33 @@ test("requires bearer auth for upload, download, and existence checks", async ()
     ] as const) {
       const response = await fetch(`${baseUrl}${path}`, { method });
       assert.equal(response.status, 401);
+    }
+  });
+});
+
+test("rejects inexact bearer values before operating on an existing payload", async () => {
+  await withRelay("gw-secret", async (baseUrl) => {
+    const existing = await upload(baseUrl, "gw-secret", "private report");
+    const payloadPath = `/v1/payload/${existing.payload_id}`;
+    const invalidTokens = [
+      ["wrong", "unrelated"],
+      ["equal-length wrong", "gw-secrex"],
+      ["prefix", "gw-secre"],
+      ["expected-token prefix", "gw-secret-extra"],
+      ["expected-token suffix", "extra-gw-secret"],
+    ] as const;
+
+    for (const [label, invalidToken] of invalidTokens) {
+      for (const method of ["POST", "GET", "HEAD"] as const) {
+        const path = method === "POST" ? "/v1/payload/upload" : payloadPath;
+        const response = await fetch(`${baseUrl}${path}`, {
+          method,
+          headers: { Authorization: `Bearer ${invalidToken}` },
+          body: method === "POST" ? "must not store" : undefined,
+        });
+        assert.equal(response.status, 401, `${label} ${method}`);
+        assert.doesNotMatch(await response.text(), /gw-secret/, `${label} ${method}`);
+      }
     }
   });
 });
@@ -262,9 +390,81 @@ test("preserves stored payloads when aggregate byte capacity rejects an upload",
   }, { limits: smallLimits });
 });
 
+test("charges retained page capacity to the aggregate byte limit", async () => {
+  await withRelay("gw-secret", async (baseUrl) => {
+    const originalBody = Buffer.alloc(9, "a");
+    const original = await postChunks(baseUrl, "gw-secret", [originalBody]);
+    assert.equal(original.status, 200);
+    const { payload_id: payloadId } = JSON.parse(original.body) as {
+      payload_id: string;
+    };
+
+    const rejected = await postChunks(baseUrl, "gw-secret", [Buffer.from("b")]);
+    assert.equal(rejected.status, 507);
+    assert.doesNotMatch(rejected.body, /payload_id/);
+
+    const stored = await fetch(`${baseUrl}/v1/payload/${payloadId}`, {
+      headers: { Authorization: "Bearer gw-secret" },
+    });
+    assert.equal(stored.status, 200);
+    assert.equal(await stored.text(), "a".repeat(9));
+  }, {
+    limits: {
+      maxPayloadBytes: 128,
+      maxRelayBytes: 12,
+      maxPayloads: 2,
+    },
+  });
+});
+
+interface PayloadStorageObservation {
+  allocatedBytes: number;
+  byteLength: number;
+  dataEvents: number;
+  segmentCount: number;
+}
+
+test("coalesces raw one-byte HTTP chunks into bounded retained pages", async () => {
+  const byteCount = 10_000;
+  let observation: PayloadStorageObservation | undefined;
+  const options = {
+    onPayloadStored(value: PayloadStorageObservation) {
+      observation = value;
+    },
+  } as GatewayHandlerOptions & {
+    onPayloadStored: (value: PayloadStorageObservation) => void;
+  };
+
+  await withRelay("gw-secret", async (baseUrl) => {
+    const uploaded = await postRawOneByteChunks(baseUrl, "gw-secret", byteCount);
+    assert.equal(uploaded.status, 200);
+    const { payload_id: payloadId } = JSON.parse(uploaded.body) as {
+      payload_id: string;
+    };
+
+    assert.deepEqual(observation, {
+      allocatedBytes: 64 * 1024,
+      byteLength: byteCount,
+      dataEvents: byteCount,
+      segmentCount: 1,
+    });
+    assert.ok(observation);
+    assert.ok(observation.segmentCount <= 32);
+
+    const stored = await fetch(`${baseUrl}/v1/payload/${payloadId}`, {
+      headers: { Authorization: "Bearer gw-secret" },
+    });
+    assert.equal(stored.status, 200);
+    const body = Buffer.from(await stored.arrayBuffer());
+    assert.equal(body.byteLength, byteCount);
+    assert.equal(body.equals(Buffer.alloc(byteCount, "a")), true);
+  }, options);
+});
+
 test("releases the active slot exactly once after an aborted upload", async () => {
   await withRelay("gw-secret", async (baseUrl, server) => {
     const lifecycle = observeNextUpload(server);
+    const responseWrites = observeNextResponseWrites(server);
     const partial = beginPartialUpload(baseUrl, "gw-secret", Buffer.alloc(1));
     await bounded(lifecycle.chunkReceived, "server to receive partial upload");
 
@@ -280,6 +480,10 @@ test("releases the active slot exactly once after an aborted upload", async () =
         lifecycle.closed,
       ]), "aborted upload cleanup");
     }
+    assert.deepEqual(
+      await bounded(responseWrites, "dead-socket response observation"),
+      { writeHead: 0, end: 0 },
+    );
 
     const recovered = await postChunks(baseUrl, "gw-secret", [Buffer.alloc(1)]);
     assert.equal(recovered.status, 200);
@@ -316,6 +520,53 @@ test("releases in-flight bytes exactly once after an upload stream error", async
     assert.equal(stillBounded.status, 507);
     assert.doesNotMatch(stillBounded.body, /payload_id/);
   }, { limits: smallLimits });
+});
+
+test("releases reservations on an error-only terminal event", async () => {
+  const handler = createGatewayHandler("gw-secret", {
+    limits: {
+      maxPayloadBytes: 8,
+      maxRelayBytes: 8,
+      maxPayloads: 1,
+    },
+  });
+  const request = Object.assign(new EventEmitter(), {
+    method: "POST",
+    url: "/v1/payload/upload",
+    headers: { authorization: "Bearer gw-secret" },
+    aborted: false,
+    destroyed: false,
+    socket: { destroyed: false },
+    resume() {
+      return this;
+    },
+  }) as unknown as IncomingMessage;
+  let status = 0;
+  const responseShape = {
+    destroyed: false,
+    headersSent: false,
+    writableEnded: false,
+    writeHead(code: number) {
+      status = code;
+      responseShape.headersSent = true;
+      return responseShape;
+    },
+    end() {
+      responseShape.writableEnded = true;
+      return responseShape;
+    },
+  };
+  const response = responseShape as unknown as ServerResponse;
+
+  handler(request, response);
+  request.emit("data", Buffer.alloc(8));
+  request.emit("error", new Error("error-only upload failure"));
+  assert.equal(status, 400);
+
+  await withHandler(handler, async (baseUrl) => {
+    const recovered = await postChunks(baseUrl, "gw-secret", [Buffer.alloc(8)]);
+    assert.equal(recovered.status, 200);
+  });
 });
 
 test("health response exposes no payload state", async () => {
@@ -371,6 +622,14 @@ test("sends the relay token only to canonical payloads on exact relay origins", 
   ]) {
     await fetchDeliverable(url, relay, fakeFetch);
     const call = calls.at(-1);
+    assert.ok(call);
+    assert.equal(call.url, url);
+    assert.equal(call.url.includes(relay.token), false);
+    const fetchedUrl = new URL(call.url);
+    assert.equal(fetchedUrl.username, "");
+    assert.equal(fetchedUrl.password, "");
+    assert.equal(fetchedUrl.search, "");
+    assert.equal(fetchedUrl.hash, "");
     assert.equal(
       new Headers(call?.init?.headers).get("Authorization"),
       "Bearer gw-secret",
@@ -382,6 +641,7 @@ test("sends the relay token only to canonical payloads on exact relay origins", 
     `https://evil.example/v1/payload/${payloadId}`,
     `https://buyer.trycloudflare.com.evil.example/v1/payload/${payloadId}`,
     `https://buyer.trycloudflare.com:8443/v1/payload/${payloadId}`,
+    `https://buyer.trycloudflare.com:0/v1/payload/${payloadId}`,
     `http://127.0.0.1:9445/v1/payload/${payloadId}`,
     `https://user@buyer.trycloudflare.com/v1/payload/${payloadId}`,
     `https://user:password@buyer.trycloudflare.com/v1/payload/${payloadId}`,
@@ -399,6 +659,7 @@ test("sends the relay token only to canonical payloads on exact relay origins", 
   for (const url of untrustedUrls) {
     await fetchDeliverable(url, relay, fakeFetch);
     const call = calls.at(-1);
+    assert.equal(call?.url, url);
     assert.equal(
       new Headers(call?.init?.headers).has("Authorization"),
       false,
@@ -438,6 +699,7 @@ test("does not authenticate raw locators normalized by URL parsing", async () =>
     assert.equal(target.origin, "https://buyer.trycloudflare.com");
     assert.equal(target.pathname, `/v1/payload/${payloadId}`);
     await fetchDeliverable(url, relay, fakeFetch);
+    assert.equal(calls.at(-1)?.url, url);
   }
 
   assert.deepEqual(
@@ -476,6 +738,7 @@ test("does not authenticate empty query or fragment delimiters", async () => {
     assert.equal(target.search, "");
     assert.equal(target.hash, "");
     await fetchDeliverable(url, relay, fakeFetch);
+    assert.equal(calls.at(-1)?.url, url);
   }
 
   assert.deepEqual(
