@@ -1,76 +1,90 @@
-# Task 1: Prompt Input Hardening Report
+# Task 1 report: Verify SDK manifests against the on-chain commitment
 
-## RED
+## Implementation
+
+- Added `lossless-json` as a production dependency.
+- Added `verifyDeliverableManifest(rawText, expected)`, which enforces the 2 MiB byte limit, losslessly parses JSON numeric tokens, recursively produces the SDK-compatible sorted compact JSON, checks version/job/chain/contracts/response fields, and compares the Keccak-256 commitment before returning response content.
+- Added `ERC8183Buyer.getDeliverableCommitment(jobId)`, which reads and shape-validates the on-chain 32-byte deliverable commitment.
+- Added focused verifier and commitment-reader tests, including a job ID above `2^53`.
+
+## Files
+
+- `buyer-client/package.json`
+- `buyer-client/package-lock.json`
+- `buyer-client/src/deliverable.ts`
+- `buyer-client/src/deliverable.test.ts`
+- `buyer-client/src/erc8183.ts`
+- `buyer-client/src/erc8183.test.ts`
+
+## TDD evidence
+
+### RED: verifier
 
 Command:
 
-```bash
-stockanalyst/app/agent/.venv/bin/python -m unittest \
-  stockanalyst.app.agent.tests.test_prompt_builder -v
+```sh
+cd buyer-client && npm run build
 ```
 
-Result: failed as expected before production changes with
-`ModuleNotFoundError: No module named 'stockanalyst.app.agent.prompt_builder'`.
+Result: expected failure, before `deliverable.ts` existed:
 
-## GREEN
-
-Focused command:
-
-```bash
-stockanalyst/app/agent/.venv/bin/python -m unittest \
-  stockanalyst.app.agent.tests.test_prompt_builder -v
+```text
+src/deliverable.test.ts(5,43): error TS2307: Cannot find module './deliverable.js'
 ```
 
-Result: `Ran 4 tests ... OK`.
+### GREEN: verifier
 
-Required related-suite command:
+Command:
 
-```bash
-stockanalyst/app/agent/.venv/bin/python -m unittest \
-  stockanalyst.app.agent.tests.test_prompt_builder \
-  stockanalyst.app.agent.tests.test_notify_security \
-  stockanalyst.app.agent.tests.test_seller_core_notify -v
+```sh
+cd buyer-client && npm run build && /Users/zhaoyu/.nvm/versions/node/v20.9.0/bin/node --test dist/deliverable.test.js
 ```
 
-Result: `Ran 54 tests ... OK`.
+Result: build succeeded; 9 tests passed.
 
-Additional checks:
+### RED: commitment reader
 
-```bash
-stockanalyst/app/agent/.venv/bin/python -m py_compile \
-  stockanalyst/app/agent/prompt_builder.py \
-  stockanalyst/app/agent/notify_security.py \
-  stockanalyst/app/agent/seller_core.py
-git diff --check
+Command:
+
+```sh
+cd buyer-client && npm run build
 ```
 
-Result: both completed successfully with no output. A direct local prompt assertion
-also verified the client-context delimiters, normalized context rendering, and the
-untrusted-data instruction.
+Result: expected failure, before the method existed:
 
-## Modified files
+```text
+src/erc8183.test.ts(16,17): error TS2339: Property 'getDeliverableCommitment' does not exist on type 'ERC8183Buyer'.
+```
 
-- Created `stockanalyst/app/agent/prompt_builder.py`.
-- Created `stockanalyst/app/agent/tests/test_prompt_builder.py`.
-- Renamed the context parser functions to public `parse_portfolio` and
-  `parse_risk_profile` in `stockanalyst/app/agent/notify_security.py` without
-  changing their validation or exception semantics.
-- Delegated `seller_core._build_stock_analysis_prompt` to the deployment-compatible
-  prompt-builder import path and removed the old in-file implementation.
+### GREEN: commitment reader
 
-## Compatibility
+Command:
 
-Valid signed-context portfolio and risk-profile data retain the established prompt
-wording, values, JSON schema, field rules, and `(prompt, symbols)` return contract.
-The only intentional successful-path additions are the security instruction and
-the `BEGIN CLIENT CONTEXT DATA` / `END CLIENT CONTEXT DATA` delimiters around
-personalized data. Invalid context values now safely degrade to no context rather
-than being stringified into the prompt.
+```sh
+cd buyer-client && npm run build && /Users/zhaoyu/.nvm/versions/node/v20.9.0/bin/node --test dist/erc8183.test.js
+```
 
-## Self-review conclusion
+Result: build succeeded; 1 test passed.
 
-The task scope is limited to prompt construction and existing context-parser
-visibility. Job symbols are exact uppercase ticker tokens, are deduplicated and
-bounded to ten, analysis type is allowlisted, and context rendering only consumes
-validated `Holding` and `RiskProfile` objects. No wallet, signing, policy,
-deployment, browser, chain, or network behavior was changed or exercised.
+### Full buyer suite
+
+Command:
+
+```sh
+cd buyer-client && npm run build && /Users/zhaoyu/.nvm/versions/node/v20.9.0/bin/node --test dist/*.test.js
+```
+
+Result: build succeeded; 41 tests passed, 0 failed. The run was repeated outside the filesystem sandbox solely because existing gateway tests bind local `127.0.0.1` servers, which the sandbox rejects with `EPERM`.
+
+## Self-review
+
+- Confirmed numbers remain `LosslessNumber` tokens until integer validation; no `Number` conversion is used for manifest values.
+- Confirmed canonicalization recursively sorts object keys, emits compact JSON, preserves numeric token text, and escapes non-ASCII text in Python-compatible UTF-16 escape units.
+- Confirmed the commitment is checked only after context validation and comparison is case-insensitive for an EVM hex hash.
+- Confirmed EVM contract addresses are checksum-normalized before comparison.
+- Ran `git diff --check`; no whitespace errors.
+
+## Concerns
+
+- The workspace default Node is v16.16.0, which does not support `node --test`. Node v20.9.0 is installed locally and was used for all test executions.
+- The supplied test fixture labeled `canonicalManifest` ordered a nested object as `b,a`; SDK-compatible recursive sorting requires `a,b`. The fixture was corrected so its expected commitment is genuinely canonical rather than weakening the required protocol.

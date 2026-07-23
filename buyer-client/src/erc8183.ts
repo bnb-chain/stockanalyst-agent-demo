@@ -180,6 +180,14 @@ export class ERC8183Buyer {
     return { status: JobStatus[statusCode] ?? "UNKNOWN", statusCode };
   }
 
+  async getDeliverableCommitment(jobId: bigint): Promise<string> {
+    const job = await this.commerce.getJob(jobId) as { deliverable?: unknown };
+    if (typeof job.deliverable !== "string" || !/^0x[0-9a-fA-F]{64}$/.test(job.deliverable)) {
+      throw new Error("On-chain job has no valid deliverable commitment");
+    }
+    return job.deliverable;
+  }
+
   /**
    * Poll until job reaches SUBMITTED (or a terminal error status).
    * Returns the final status string.
