@@ -8,52 +8,76 @@ const unsafeLifecycle: Parameters<PageLike["setContent"]>[1]["waitUntil"] = "net
 void lifecycle;
 void unsafeLifecycle;
 
-test("renders with sandbox, JavaScript disabled, and every request aborted", async () => {
+test("renders with sandbox, JavaScript disabled, and every request aborted during content loading", async () => {
   const calls: string[] = [];
   let requestHandler: ((request: { abort(): Promise<void> }) => void) | undefined;
   let launchOptions: Record<string, unknown> | undefined;
-  let aborted = false;
+  let pdfOptions: Parameters<PageLike["pdf"]>[0] | undefined;
 
   const setContent: PageLike["setContent"] = async (
-    _html: string,
+    html: string,
     options: { waitUntil: "domcontentloaded" },
   ) => {
-    calls.push(`content:${options.waitUntil}`);
+    calls.push(`content:${options.waitUntil}:${html}`);
+    assert.ok(requestHandler, "the request handler must be registered before content loads");
+    requestHandler({
+      async abort() {
+        calls.push("request-abort");
+      },
+    });
+    await Promise.resolve();
   };
   const page: PageLike = {
     async setJavaScriptEnabled(value: boolean) { calls.push(`js:${value}`); },
     async setRequestInterception(value: boolean) { calls.push(`intercept:${value}`); },
     on(event: string, handler: typeof requestHandler) {
       assert.equal(event, "request");
+      calls.push(`on:${event}`);
       requestHandler = handler;
     },
     setContent,
-    async pdf() { calls.push("pdf"); },
+    async pdf(options) {
+      calls.push("pdf");
+      pdfOptions = options;
+    },
     async close() { calls.push("page-close"); },
   };
   const browser = {
-    async newPage() { return page; },
+    async newPage() {
+      calls.push("new-page");
+      return page;
+    },
     async close() { calls.push("browser-close"); },
   };
   const puppeteer = {
     async launch(options: Record<string, unknown>) {
+      calls.push("launch");
       launchOptions = options;
       return browser;
     },
   };
 
   await renderPdf(puppeteer, "<p>safe</p>", "/tmp/report.pdf");
-  requestHandler?.({ async abort() { aborted = true; } });
-  await Promise.resolve();
 
   assert.deepEqual(launchOptions, { headless: true });
-  assert.deepEqual(calls.slice(0, 3), [
+  assert.deepEqual(calls, [
+    "launch",
+    "new-page",
     "js:false",
     "intercept:true",
-    "content:domcontentloaded",
+    "on:request",
+    "content:domcontentloaded:<p>safe</p>",
+    "request-abort",
+    "pdf",
+    "page-close",
+    "browser-close",
   ]);
-  assert.equal(aborted, true);
-  assert.deepEqual(calls.slice(-2), ["page-close", "browser-close"]);
+  assert.deepEqual(pdfOptions, {
+    path: "/tmp/report.pdf",
+    format: "A4",
+    printBackground: true,
+    margin: { top: "0", right: "0", bottom: "0", left: "0" },
+  });
 });
 
 test("closes page and browser when loading content fails", async () => {

@@ -196,7 +196,7 @@ function mdToHtml(md: string): string {
     .replace(/^## (.+)$/gm,   (_, t) => `<h2>${inlineToHtml(t)}</h2>`)
     .replace(/^# (.+)$/gm,    (_, t) => `<h1>${inlineToHtml(t)}</h1>`)
     // Blockquotes — process inline markup inside them
-    .replace(/^> (.+)$/gm, (_, content) => {
+    .replace(/^&gt; (.+)$/gm, (_, content) => {
       // Strip any stray heading markers left inside a blockquote
       const clean = content.replace(/^#{1,4}\s+/, "");
       return `<blockquote><p>${inlineToHtml(clean)}</p></blockquote>`;

