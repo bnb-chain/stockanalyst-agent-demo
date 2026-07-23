@@ -45,29 +45,29 @@ def _response_error_code(value: object) -> str | None:
 def _json_candidates(text: str) -> Iterator[dict[str, object]]:
     decoder = json.JSONDecoder()
     seen_offsets: set[int] = set()
-    decoded_count = 0
+    attempt_count = 0
 
     def decode_at(offset: int) -> dict[str, object] | None:
-        nonlocal decoded_count
-        if offset in seen_offsets or decoded_count >= _MAX_JSON_CANDIDATES:
+        nonlocal attempt_count
+        if offset in seen_offsets or attempt_count >= _MAX_JSON_CANDIDATES:
             return None
         seen_offsets.add(offset)
+        attempt_count += 1
         try:
             candidate, _ = decoder.raw_decode(text, offset)
         except (ValueError, RecursionError):
             return None
-        decoded_count += 1
         return candidate if isinstance(candidate, dict) else None
 
     for match in _FENCE_OPEN.finditer(text):
         candidate = decode_at(match.end())
         if candidate is not None:
             yield candidate
-        if decoded_count >= _MAX_JSON_CANDIDATES:
+        if attempt_count >= _MAX_JSON_CANDIDATES:
             return
 
     offset = text.find("{")
-    while offset != -1 and decoded_count < _MAX_JSON_CANDIDATES:
+    while offset != -1 and attempt_count < _MAX_JSON_CANDIDATES:
         candidate = decode_at(offset)
         if candidate is not None:
             yield candidate

@@ -465,6 +465,65 @@ class ReportPipelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(rejected, SAFE_FAILURE_REPORT)
         self.assertEqual(rejected_calls, 2)
 
+    async def test_malformed_openings_share_the_64_attempt_budget(
+        self,
+    ) -> None:
+        response = (
+            ("```json\n{\n```\n" * 32)
+            + ("x{" * 100_000)
+            + "MALFORMED_OPENING_SECRET"
+        )
+        self.assertEqual(response.count("{"), 100_032)
+        self.assertLessEqual(len(response.encode("utf-8")), 2_097_152)
+        original_raw_decode = json.JSONDecoder.raw_decode
+        attempts = 0
+        attempted_offsets: list[int] = []
+        calls = 0
+
+        def counting_raw_decode(
+            decoder: json.JSONDecoder,
+            text: str,
+            offset: int = 0,
+        ):
+            nonlocal attempts
+            attempts += 1
+            attempted_offsets.append(offset)
+            return original_raw_decode(decoder, text, offset)
+
+        async def call_runner(prompt: str, session_id: str) -> str:
+            nonlocal calls
+            del prompt
+            self.assertEqual(session_id, "42")
+            calls += 1
+            return response if calls == 1 else "no JSON object"
+
+        with (
+            patch(
+                "stockanalyst.app.agent.report_pipeline.json.JSONDecoder.raw_decode",
+                new=counting_raw_decode,
+            ),
+            self.assertLogs(
+                "seller-agent.report_pipeline",
+                level="WARNING",
+            ) as captured,
+        ):
+            result = await generate_validated_report(
+                "original prompt",
+                session_id="42",
+                symbols=["AAPL"],
+                call_runner=call_runner,
+            )
+
+        self.assertEqual(result, SAFE_FAILURE_REPORT)
+        self.assertEqual(calls, 2)
+        self.assertEqual(attempts, 64)
+        self.assertEqual(len(set(attempted_offsets)), 64)
+        self.assertIn("no_json_candidate", "\n".join(captured.output))
+        self.assertNotIn(
+            "MALFORMED_OPENING_SECRET",
+            "\n".join(captured.output),
+        )
+
     async def test_json_decoding_uses_offsets_without_suffix_slices(self) -> None:
         class NoSuffixSlices(str):
             def __getitem__(self, key):

@@ -237,3 +237,54 @@ deletion-sensitive provider tests.
 Verdict: **APPROVED — no remaining High/Medium/Low blocker or concern.**
 
 Remaining concerns: **none**.
+
+## Follow-up: Malformed Candidate Attempt Budget
+
+A subsequent final review identified one remaining Medium availability issue:
+the 64-candidate counter advanced only after successful JSON decoding, so every
+malformed `{` still invoked `JSONDecoder.raw_decode`.
+
+Strict RED:
+
+```zsh
+stockanalyst/app/agent/.venv/bin/python -B -m unittest \
+  stockanalyst.app.agent.tests.test_report_pipeline.ReportPipelineTests.test_malformed_openings_share_the_64_attempt_budget \
+  -v
+```
+
+The bounded fixture contains 100,032 malformed openings in 200,000-plus bytes,
+well below the 2 MiB response ceiling. Before the fix it made **100,032**
+decoder calls and failed the expected `64` assertion after approximately
+7.445 seconds.
+
+The minimum correction replaces the successful-decode counter with a shared
+attempt counter and increments it immediately before each `raw_decode`.
+Fenced and bare offsets share that counter; already-seen offsets do not consume
+it. The same focused test then passed with exactly **64 calls at 64 unique
+offsets** in approximately 0.01 seconds while returning the stable fixed
+failure report and keeping the marker out of logs.
+
+Deletion-sensitive compatibility evidence:
+
+- the existing boundary test still accepts a valid report on attempt 64 and
+  ignores one on attempt 65;
+- the direct `JSONDecoder.raw_decode` `MemoryError` test still propagates the
+  resource exception; and
+- the new unique-offset assertion fails if fenced openings are retried during
+  the bare scan.
+
+Final post-fix verification:
+
+```text
+Report/schema pipeline: 26/26 passed
+Prompt/provider/report focused: 54/54 passed
+Related Python suites: 104/104 passed
+Full Python discovery: 134/134 passed
+py_compile: passed
+git diff --check: passed
+```
+
+The original final reviewer independently reran the former one-million-`{`
+probe and measured approximately 0.00059 seconds after the correction.
+Independent read-only re-review verdict: **APPROVED**, with no remaining High,
+Medium, or Low finding.
