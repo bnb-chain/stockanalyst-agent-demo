@@ -10,6 +10,10 @@ import {
 import { MAX_PAYLOAD_BYTES } from "./gateway.js";
 
 const jobId = 42n;
+const MAX_JSON_NESTING_DEPTH = 128;
+const NESTING_DEPTH_ERROR =
+  "DeliverableManifest exceeds the maximum JSON nesting depth";
+const overDepthSecret = "over-depth-content-must-not-leak";
 const contracts = {
   commerce: "0xa206c0517b6371c6638cd9e4a42cc9f02a33b0de",
   router: "0xd7d36d66d2f1b608a0f943f722d27e3744f66f25",
@@ -48,6 +52,14 @@ const markerDuplicateCommitted = manifest.replace(
   '"metadata":{}',
   '"metadata":{"value":7}',
 );
+const overDepthManifest = manifest.replace(
+  '"metadata":{}',
+  `"metadata":${nestedObjects(MAX_JSON_NESTING_DEPTH, JSON.stringify(overDepthSecret))}`,
+);
+
+function nestedObjects(depth: number, leaf: string): string {
+  return `${'{"level":'.repeat(depth)}${leaf}${"}".repeat(depth)}`;
+}
 
 function dependencies(overrides: Partial<CompletionDependencies> = {}) {
   let settleCalls = 0;
@@ -117,6 +129,30 @@ for (const [name, maliciousManifest, committedManifest] of [
     assert.equal(fixture.settleCalls(), 0);
   });
 }
+
+test("over-depth deliverables are typed blockers and cannot reach settlement", async () => {
+  const fixture = dependencies({
+    fetchDeliverable: async () => new Response(overDepthManifest, { status: 200 }),
+    getDeliverableCommitment: async () => keccak256(toUtf8Bytes(overDepthManifest)),
+  });
+  await assert.rejects(
+    completeSubmittedJob(
+      { jobId, fundTxBlock: 1, chainId: 97n, contracts },
+      fixture.deps,
+    ),
+    (error: unknown) => {
+      if (!(error instanceof SettlementBlockedError)) return false;
+      assert.equal(
+        error.message,
+        `Settlement blocked: ${NESTING_DEPTH_ERROR}`,
+      );
+      assert.doesNotMatch(error.message, new RegExp(overDepthSecret));
+      assert.equal(error instanceof SettlementAttemptError, false);
+      return true;
+    },
+  );
+  assert.equal(fixture.settleCalls(), 0);
+});
 
 test("URL lookup failure blocks settlement without leaking dependency errors", async () => {
   const secret = "rpc-token-must-not-leak";

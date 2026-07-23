@@ -4,6 +4,9 @@ import { MAX_PAYLOAD_BYTES } from "./gateway.js";
 
 const MAX_INTEGER_DIGITS = 4_300;
 const MAX_INTEGER_DIGITS_LABEL = "4,300";
+const MAX_JSON_NESTING_DEPTH = 128;
+const JSON_NESTING_DEPTH_ERROR =
+  "DeliverableManifest exceeds the maximum JSON nesting depth";
 
 type JsonValue =
   | null
@@ -34,6 +37,13 @@ interface JsonStringToken {
 type JsonContainerScope =
   | { kind: "object"; keys: Set<string> }
   | { kind: "array" };
+
+class JsonNestingDepthError extends Error {
+  constructor() {
+    super(JSON_NESTING_DEPTH_ERROR);
+    this.name = "JsonNestingDepthError";
+  }
+}
 
 function isNumberNode(value: unknown): value is LosslessNumber {
   return value instanceof LosslessNumber;
@@ -88,10 +98,15 @@ function rejectDuplicateObjectKeys(
       continue;
     }
 
-    if (rawText[index] === "{") {
-      scopes.push({ kind: "object", keys: new Set<string>() });
-    } else if (rawText[index] === "[") {
-      scopes.push({ kind: "array" });
+    if (rawText[index] === "{" || rawText[index] === "[") {
+      if (scopes.length >= MAX_JSON_NESTING_DEPTH) {
+        throw new JsonNestingDepthError();
+      }
+      if (rawText[index] === "{") {
+        scopes.push({ kind: "object", keys: new Set<string>() });
+      } else {
+        scopes.push({ kind: "array" });
+      }
     } else if (
       (rawText[index] === "}" && scopes[scopes.length - 1]?.kind === "object")
       || (rawText[index] === "]" && scopes[scopes.length - 1]?.kind === "array")
@@ -301,7 +316,10 @@ export function verifyDeliverableManifest(
   let parsed: JsonValue;
   try {
     parsed = parseJson(rawText);
-  } catch {
+  } catch (error) {
+    if (error instanceof JsonNestingDepthError) {
+      throw new Error(JSON_NESTING_DEPTH_ERROR);
+    }
     throw new Error("DeliverableManifest is not valid JSON");
   }
 

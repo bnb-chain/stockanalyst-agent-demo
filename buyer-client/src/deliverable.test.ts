@@ -5,6 +5,9 @@ import { MAX_PAYLOAD_BYTES } from "./gateway.js";
 import { verifyDeliverableManifest } from "./deliverable.js";
 
 const JOB_ID = 2n ** 60n + 7n;
+const MAX_JSON_NESTING_DEPTH = 128;
+const NESTING_DEPTH_ERROR =
+  "DeliverableManifest exceeds the maximum JSON nesting depth";
 const CONTRACTS = {
   commerce: "0xa206c0517b6371c6638cd9e4a42cc9f02a33b0de",
   router: "0xd7d36d66d2f1b608a0f943f722d27e3744f66f25",
@@ -26,6 +29,22 @@ function expectation(raw: string) {
     contracts: CONTRACTS,
     commitment: keccak256(toUtf8Bytes(raw)),
   };
+}
+
+function nestedObjects(depth: number): string {
+  return `${'{"level":'.repeat(depth)}"leaf"${"}".repeat(depth)}`;
+}
+
+function nestedArrays(depth: number): string {
+  return `${"[".repeat(depth)}"leaf"${"]".repeat(depth)}`;
+}
+
+function assertNestingDepthError(callback: () => unknown): void {
+  assert.throws(callback, (error: unknown) => {
+    assert.ok(error instanceof Error);
+    assert.equal(error.message, NESTING_DEPTH_ERROR);
+    return true;
+  });
 }
 
 test("verifies an SDK manifest with a job id above 2^53", () => {
@@ -170,6 +189,44 @@ test("rejects marker-object and number values under a duplicate key", () => {
   assert.throws(
     () => verifyDeliverableManifest(duplicated, expectation(canonical)),
     /JSON|duplicate/i,
+  );
+});
+
+test("rejects object nesting deeper than 128 containers", () => {
+  const overDepth = manifestWithMetadata(
+    nestedObjects(MAX_JSON_NESTING_DEPTH),
+  );
+  assertNestingDepthError(
+    () => verifyDeliverableManifest(overDepth, expectation(overDepth)),
+  );
+});
+
+test("rejects array nesting deeper than 128 containers", () => {
+  const overDepth = manifestWithMetadata(
+    nestedArrays(MAX_JSON_NESTING_DEPTH),
+  );
+  assertNestingDepthError(
+    () => verifyDeliverableManifest(overDepth, expectation(overDepth)),
+  );
+});
+
+test("accepts object nesting at exactly 128 containers", () => {
+  const atBoundary = manifestWithMetadata(
+    nestedObjects(MAX_JSON_NESTING_DEPTH - 1),
+  );
+  assert.equal(
+    verifyDeliverableManifest(atBoundary, expectation(atBoundary)),
+    "# verified",
+  );
+});
+
+test("accepts array nesting at exactly 128 containers", () => {
+  const atBoundary = manifestWithMetadata(
+    nestedArrays(MAX_JSON_NESTING_DEPTH - 1),
+  );
+  assert.equal(
+    verifyDeliverableManifest(atBoundary, expectation(atBoundary)),
+    "# verified",
   );
 });
 
