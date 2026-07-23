@@ -95,6 +95,8 @@ Payload IDs use:
 ```
 
 The timestamp is removed because it contributes no secrecy.
+If an ID collides with an existing payload, the relay generates another ID
+instead of overwriting the existing on-chain target.
 
 ## Client Changes
 
@@ -103,15 +105,21 @@ The buyer's report fetch sends:
 ```ts
 fetch(deliverableUrl, {
   headers: { Authorization: `Bearer ${relay.token}` },
+  redirect: "error",
 })
 ```
 
-If no relay exists, an authenticated relay URL cannot be fetched and the
-client reports the existing fetch failure rather than attempting anonymous
-access.
+The buyer adds this header only when the URL has no userinfo, query, or
+fragment; its origin exactly matches the relay's public or local origin; and
+its path matches the canonical payload-ID route. Redirects are rejected. A
+different origin or non-payload path is fetched without relay credentials so
+the token cannot be disclosed to seller-controlled URLs. If no relay exists,
+the existing credential-free fetch behavior remains for non-relay storage.
 
 `UOMPGatewayStorageProvider.download` and `.exists` send the same Authorization
 header they already use for upload. No token is added to returned URLs.
+The provider accepts only canonical `pay_` plus 32-lowercase-hex IDs in upload
+responses and payload paths, matching the relay and buyer fetch helper.
 
 The unauthenticated health endpoint returns only `{"status":"ok"}` and does not
 expose payload counts.
