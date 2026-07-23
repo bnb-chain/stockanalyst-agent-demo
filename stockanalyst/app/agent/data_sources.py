@@ -13,7 +13,9 @@ SEC EDGAR is fully public — no key required. A User-Agent header is mandatory.
 """
 from __future__ import annotations
 
+import json
 import logging
+import math
 import os
 from typing import Any
 
@@ -35,6 +37,105 @@ _MAX_HEADLINES = 5
 _MAX_HEADLINE_CHARS = 300
 _MAX_SOURCE_CHARS = 100
 _MAX_DATE_CHARS = 10
+_MAX_PROVIDER_BODY_BYTES = 1_048_576
+_PROVIDER_CHUNK_BYTES = 64 * 1024
+_MAX_ALPHA_ARTICLES = 20
+_MAX_TICKER_SENTIMENT_ENTRIES = 100
+_MAX_TOTAL_ARTICLES = 1_000_000_000
+
+
+class _ProviderResponseError(Exception):
+    def __init__(self, code: str) -> None:
+        super().__init__(code)
+        self.code = code
+
+
+def _read_provider_json(
+    url: str,
+    *,
+    params: dict[str, str],
+) -> dict[str, Any]:
+    request_error: str | None = None
+    try:
+        response = requests.get(
+            url,
+            params=params,
+            timeout=_TIMEOUT,
+            stream=True,
+        )
+    except requests.HTTPError:
+        request_error = "provider_http_error"
+    except (requests.RequestException, OSError):
+        request_error = "provider_transport_error"
+    if request_error is not None:
+        raise _ProviderResponseError(request_error) from None
+
+    primary_failed = False
+    try:
+        http_failed = False
+        try:
+            response.raise_for_status()
+        except requests.HTTPError:
+            http_failed = True
+        if http_failed:
+            raise _ProviderResponseError("provider_http_error") from None
+
+        content_length = response.headers.get("Content-Length")
+        if content_length is not None:
+            invalid_length = False
+            try:
+                declared_bytes = int(content_length)
+            except (TypeError, ValueError):
+                invalid_length = True
+                declared_bytes = -1
+            if invalid_length or declared_bytes < 0:
+                raise _ProviderResponseError("provider_invalid_response")
+            if declared_bytes > _MAX_PROVIDER_BODY_BYTES:
+                raise _ProviderResponseError("provider_response_too_large")
+
+        body = bytearray()
+        stream_failed = False
+        try:
+            for chunk in response.iter_content(chunk_size=_PROVIDER_CHUNK_BYTES):
+                if not chunk:
+                    continue
+                if not isinstance(chunk, (bytes, bytearray)):
+                    raise _ProviderResponseError("provider_invalid_response")
+                if len(body) + len(chunk) > _MAX_PROVIDER_BODY_BYTES:
+                    raise _ProviderResponseError("provider_response_too_large")
+                body.extend(chunk)
+        except (requests.RequestException, OSError):
+            stream_failed = True
+        if stream_failed:
+            raise _ProviderResponseError("provider_transport_error") from None
+
+        invalid_json = False
+        try:
+            data = json.loads(body)
+        except (ValueError, RecursionError):
+            invalid_json = True
+            data = None
+        if invalid_json:
+            raise _ProviderResponseError("provider_invalid_response") from None
+        if not isinstance(data, dict):
+            raise _ProviderResponseError("provider_invalid_response")
+        return data
+    except BaseException:
+        primary_failed = True
+        raise
+    finally:
+        close_memory_error: MemoryError | None = None
+        close_transport_failed = False
+        try:
+            response.close()
+        except MemoryError as error:
+            close_memory_error = error
+        except (requests.RequestException, OSError):
+            close_transport_failed = True
+        if close_memory_error is not None:
+            raise close_memory_error from None
+        if close_transport_failed and not primary_failed:
+            raise _ProviderResponseError("provider_transport_error") from None
 
 
 # ── Macro context (FRED + VIX) ────────────────────────────────────────────────
@@ -219,7 +320,7 @@ def fetch_alpha_vantage_sentiment(symbol: str) -> dict[str, Any]:
         return {"symbol": symbol, "note": "ALPHA_VANTAGE_API_KEY not set"}
 
     try:
-        resp = requests.get(
+        data = _read_provider_json(
             "https://www.alphavantage.co/query",
             params={
                 "function": "NEWS_SENTIMENT",
@@ -227,31 +328,52 @@ def fetch_alpha_vantage_sentiment(symbol: str) -> dict[str, Any]:
                 "limit": "20",
                 "apikey": api_key,
             },
-            timeout=_TIMEOUT,
         )
-        resp.raise_for_status()
-        data = resp.json()
 
         if "Information" in data:  # rate-limited
-            return {"symbol": symbol, "note": data["Information"]}
+            return {
+                "symbol": symbol,
+                "note": normalize_untrusted_text(
+                    data["Information"],
+                    max_chars=_MAX_HEADLINE_CHARS,
+                ),
+            }
 
-        feed = data.get("feed", [])
+        raw_feed = data.get("feed")
+        feed = raw_feed if isinstance(raw_feed, list) else []
+        feed = feed[:_MAX_ALPHA_ARTICLES]
         if not feed:
             return {"symbol": symbol, "article_count": 0}
 
         ticker_scores: list[float] = []
         headlines: list[str] = []
-        for article in feed[:20]:
+        for article in feed:
             if not isinstance(article, dict):
                 continue
-            for ts in article.get("ticker_sentiment", []):
+            raw_ticker_sentiment = article.get("ticker_sentiment")
+            ticker_sentiment = (
+                raw_ticker_sentiment
+                if isinstance(raw_ticker_sentiment, list)
+                else []
+            )
+            for ts in ticker_sentiment[:_MAX_TICKER_SENTIMENT_ENTRIES]:
                 if not isinstance(ts, dict):
                     continue
-                if ts.get("ticker", "").upper() == symbol.upper():
-                    try:
-                        ticker_scores.append(float(ts["ticker_sentiment_score"]))
-                    except (KeyError, ValueError):
-                        pass
+                ticker = ts.get("ticker")
+                if not isinstance(ticker, str) or ticker.upper() != symbol.upper():
+                    continue
+                raw_score = ts.get("ticker_sentiment_score")
+                if isinstance(raw_score, bool) or not isinstance(
+                    raw_score,
+                    (int, float, str),
+                ):
+                    continue
+                try:
+                    score = float(raw_score)
+                except (TypeError, ValueError, OverflowError):
+                    continue
+                if math.isfinite(score) and -1.0 <= score <= 1.0:
+                    ticker_scores.append(score)
             if len(headlines) < _MAX_HEADLINES:
                 headlines.append(
                     normalize_untrusted_text(
@@ -276,9 +398,13 @@ def fetch_alpha_vantage_sentiment(symbol: str) -> dict[str, Any]:
             "article_count": len(feed),
             "top_headlines": headlines,
         }
-    except Exception as e:
-        logger.warning("Alpha Vantage sentiment failed for %s: %s", symbol, e)
-        return {"symbol": symbol, "error": str(e)}
+    except _ProviderResponseError as error:
+        logger.warning(
+            "Alpha Vantage sentiment failed for %s: %s",
+            symbol,
+            error.code,
+        )
+        return {"symbol": symbol, "error": error.code}
 
 
 # ── GNews — latest headlines ──────────────────────────────────────────────────
@@ -299,7 +425,7 @@ def fetch_gnews_headlines(symbol: str, company_name: str = "") -> dict[str, Any]
 
     query = company_name or symbol
     try:
-        resp = requests.get(
+        data = _read_provider_json(
             "https://gnews.io/api/v4/search",
             params={
                 "q": query,
@@ -308,12 +434,10 @@ def fetch_gnews_headlines(symbol: str, company_name: str = "") -> dict[str, Any]
                 "sortby": "relevance",
                 "token": api_key,
             },
-            timeout=_TIMEOUT,
         )
-        resp.raise_for_status()
-        data = resp.json()
 
-        articles = data.get("articles", [])
+        raw_articles = data.get("articles")
+        articles = raw_articles if isinstance(raw_articles, list) else []
         headlines: list[dict[str, str]] = []
         for article in articles[:_MAX_HEADLINES]:
             if not isinstance(article, dict):
@@ -336,12 +460,22 @@ def fetch_gnews_headlines(symbol: str, company_name: str = "") -> dict[str, Any]
                     max_chars=_MAX_DATE_CHARS,
                 ),
             })
+        raw_total = data.get("totalArticles")
+        total_results = (
+            raw_total
+            if (
+                isinstance(raw_total, int)
+                and not isinstance(raw_total, bool)
+                and 0 <= raw_total <= _MAX_TOTAL_ARTICLES
+            )
+            else len(headlines)
+        )
         return {
             "symbol": symbol,
             "query": query,
-            "total_results": data.get("totalArticles", len(articles)),
+            "total_results": total_results,
             "headlines": headlines,
         }
-    except Exception as e:
-        logger.warning("GNews fetch failed for %s: %s", symbol, e)
-        return {"symbol": symbol, "error": str(e)}
+    except _ProviderResponseError as error:
+        logger.warning("GNews fetch failed for %s: %s", symbol, error.code)
+        return {"symbol": symbol, "error": error.code}

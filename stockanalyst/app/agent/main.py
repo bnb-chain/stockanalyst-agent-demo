@@ -54,6 +54,10 @@ from bnbagent_studio_core.wallet import (
 )
 
 from agent_card import build_agent_card
+try:
+    from .agent_instruction import SYSTEM_INSTRUCTION
+except ImportError:
+    from agent_instruction import SYSTEM_INSTRUCTION
 from executor import SellerAgentExecutor
 from report_pipeline import generate_validated_report
 from tools import LLM_READ_TOOLS
@@ -182,31 +186,7 @@ _model = build_model()  # managed model with the auto-renew hook (fulfill only)
 agent = Agent(
     name="seller_agent",
     model=_model,
-    instruction=(
-        "You are a professional buy-side portfolio analyst. A client has paid for a premium, actionable report.\n\n"
-        "STAGE 1 — DATA COLLECTION (call ALL tools before writing anything):\n"
-        "For EACH symbol call in order:\n"
-        "  1. get_stock_quote(symbol)       — price, PE, PB, PEG, beta, analyst target\n"
-        "  2. get_technical_signals(symbol) — RSI-14, weekly RSI, MACD, Bollinger, MA50/200, ADX, OBV, ATR, VaR\n"
-        "  3. get_options_sentiment(symbol) — put/call ratio, implied volatility\n"
-        "  4. get_insider_activity(symbol)  — SEC Form 4 insider filing count\n"
-        "  5. get_news_sentiment(symbol)    — AI sentiment score + recent headlines\n"
-        "Call once: get_macro_context() — VIX, Fed rate, 10Y yield, CPI, unemployment\n\n"
-        "NEVER fabricate numbers. Use ONLY data returned by tool calls.\n\n"
-        "STAGE 2 — WRITE A SCANNABLE, ACTIONABLE REPORT:\n"
-        "Use tables for data, direct language, no padding. Every sentence must add value.\n"
-        "Sections required:\n"
-        "  1. Market Snapshot — macro table + one-line risk-on/off verdict\n"
-        "  2. Per-stock analysis — verdict banner, fundamentals table, technical signals table,\n"
-        "     bull/bear thesis, sentiment signals, portfolio P&L (if client holds), recommendation\n"
-        "  3. Portfolio Rebalancing Plan — current allocation table, specific TRIM/ADD/HOLD actions\n"
-        "     with share counts and rationale; if recommending a new BUY, name which holding to trim\n"
-        "  4. Watchlist: Related Stocks — 3-5 sector peers or thematic names worth monitoring,\n"
-        "     using your market knowledge; include entry zone and catalyst\n"
-        "  5. Risk Dashboard — concentration, rate sensitivity, correlation in a table\n"
-        "  6. Disclaimer\n\n"
-        "If a symbol returns an error, note it briefly and continue with the remaining symbols."
-    ),
+    instruction=SYSTEM_INSTRUCTION,
     # LLM_READ_TOOLS = read-only chain tools (wallet, balances, ERC-8004/8183
     # queries). Edit `tools.py` to add/remove. These are READ-ONLY — the agent
     # never signs via a tool; all signing is in signing.py (fixed code).
