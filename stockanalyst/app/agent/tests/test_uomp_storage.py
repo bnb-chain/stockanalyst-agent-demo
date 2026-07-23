@@ -110,7 +110,11 @@ class SlowDripResponse(FakeResponse):
 
 
 class FakeOpener:
-    def __init__(self, body: bytes = b'{"payload_id":"payload_123"}', error=None) -> None:
+    def __init__(
+        self,
+        body: bytes = b'{"payload_id":"pay_0123456789abcdef0123456789abcdef"}',
+        error=None,
+    ) -> None:
         self.response = FakeResponse(body)
         self.error = error
         self.requests: list[tuple[urllib.request.Request, int]] = []
@@ -526,12 +530,20 @@ class ProviderConstructionTests(unittest.TestCase):
 
 class UploadTests(unittest.IsolatedAsyncioTestCase):
     async def test_upload_uses_validated_origin_and_bounded_json_response(self) -> None:
-        opener = FakeOpener(b'{"payload_id":"payload_123"}')
+        opener = FakeOpener(
+            b'{"payload_id":"pay_0123456789abcdef0123456789abcdef"}'
+        )
         instance = provider(opener)
 
         result = await instance.upload({"response": {"content": "report"}})
 
-        self.assertEqual(result, "https://buyer.trycloudflare.com/v1/payload/payload_123")
+        self.assertEqual(
+            result,
+            "https://buyer.trycloudflare.com/v1/payload/"
+            "pay_0123456789abcdef0123456789abcdef",
+        )
+        self.assertNotIn("token", result)
+        self.assertNotIn("?", result)
         request, timeout = opener.requests[0]
         self.assertEqual(request.full_url, "https://buyer.trycloudflare.com/v1/payload/upload")
         self.assertEqual(request.get_method(), "POST")
@@ -546,7 +558,18 @@ class UploadTests(unittest.IsolatedAsyncioTestCase):
                 await provider(FakeOpener(body)).upload({"response": {"content": "report"}})
 
     async def test_upload_rejects_invalid_payload_id(self) -> None:
-        invalid_ids = ["", "../../admin", "with/slash", "percent%2Fescape", "a" * 129, 42]
+        invalid_ids = [
+            "",
+            "pay_0123456789ABCDEF0123456789abcdef",
+            "pay_0123456789abcdef",
+            "pay_0123456789abcdef0123456789abcdeg",
+            "payload_123",
+            "../../admin",
+            "with/slash",
+            "percent%2Fescape",
+            "a" * 129,
+            42,
+        ]
         for payload_id in invalid_ids:
             body = ("{\"payload_id\":" + repr(payload_id).replace("'", '"') + "}").encode()
             with self.subTest(payload_id=payload_id), self.assertRaises(ValueError):
@@ -595,7 +618,11 @@ class UploadTests(unittest.IsolatedAsyncioTestCase):
         clock = FakeClock()
         opener = FakeOpener()
         opener.response = SlowDripResponse(
-            [b'{"payload_id":', b'"payload_123"', b"}"],
+            [
+                b'{"payload_id":',
+                b'"pay_0123456789abcdef0123456789abcdef"',
+                b"}",
+            ],
             clock,
         )
         instance = provider(opener)
@@ -616,16 +643,19 @@ class ResourceUrlTests(unittest.IsolatedAsyncioTestCase):
         instance = provider(opener)
 
         result = await instance.download(
-            "HTTPS://BUYER.TRYCLOUDFLARE.COM:443/v1/payload/payload_123"
+            "HTTPS://BUYER.TRYCLOUDFLARE.COM:443/v1/payload/"
+            "pay_0123456789abcdef0123456789abcdef"
         )
 
         self.assertEqual(result, {"response": {"content": "report"}})
         request, timeout = opener.requests[0]
         self.assertEqual(
             request.full_url,
-            "https://buyer.trycloudflare.com/v1/payload/payload_123",
+            "https://buyer.trycloudflare.com/v1/payload/"
+            "pay_0123456789abcdef0123456789abcdef",
         )
         self.assertEqual(request.get_method(), "GET")
+        self.assertEqual(request.get_header("Authorization"), "Bearer token")
         self.assertEqual(timeout, 30)
         self.assertEqual(opener.response.read_sizes, [65_537])
 
@@ -634,13 +664,15 @@ class ResourceUrlTests(unittest.IsolatedAsyncioTestCase):
         instance = provider(opener)
 
         await instance.download(
-            "HTTPS://BUYER.TRYCLOUDFLARE.COM/v1/payload/payload_123"
+            "HTTPS://BUYER.TRYCLOUDFLARE.COM/v1/payload/"
+            "pay_0123456789abcdef0123456789abcdef"
         )
 
         request, _ = opener.requests[0]
         self.assertEqual(
             request.full_url,
-            "https://buyer.trycloudflare.com/v1/payload/payload_123",
+            "https://buyer.trycloudflare.com/v1/payload/"
+            "pay_0123456789abcdef0123456789abcdef",
         )
 
     async def test_download_rejects_non_ascii_host_before_normalization(self) -> None:
@@ -652,7 +684,10 @@ class ResourceUrlTests(unittest.IsolatedAsyncioTestCase):
         )
 
         with self.assertRaises(ValueError):
-            await instance.download("https://K.trycloudflare.com/v1/payload/payload_123")
+            await instance.download(
+                "https://K.trycloudflare.com/v1/payload/"
+                "pay_0123456789abcdef0123456789abcdef"
+            )
 
     async def test_download_enforces_one_total_slow_drip_deadline(self) -> None:
         clock = FakeClock()
@@ -669,22 +704,27 @@ class ResourceUrlTests(unittest.IsolatedAsyncioTestCase):
             self.assertRaises(TimeoutError),
         ):
             await instance.download(
-                "https://buyer.trycloudflare.com/v1/payload/payload_123"
+                "https://buyer.trycloudflare.com/v1/payload/"
+                "pay_0123456789abcdef0123456789abcdef"
             )
 
         self.assertTrue(opener.response.closed)
 
     async def test_download_rejects_cross_origin_and_path_smuggling(self) -> None:
         urls = [
-            "https://evil.trycloudflare.com/v1/payload/payload_123",
-            "http://buyer.trycloudflare.com/v1/payload/payload_123",
-            "https://buyer.trycloudflare.com:8443/v1/payload/payload_123",
-            "https://user@buyer.trycloudflare.com/v1/payload/payload_123",
-            "https://buyer.trycloudflare.com/v1/payload/payload_123/extra",
+            "https://evil.trycloudflare.com/v1/payload/pay_0123456789abcdef0123456789abcdef",
+            "http://buyer.trycloudflare.com/v1/payload/pay_0123456789abcdef0123456789abcdef",
+            "https://buyer.trycloudflare.com:8443/v1/payload/pay_0123456789abcdef0123456789abcdef",
+            "https://user@buyer.trycloudflare.com/v1/payload/pay_0123456789abcdef0123456789abcdef",
+            "https://buyer.trycloudflare.com/v1/payload/pay_0123456789abcdef0123456789abcdef/extra",
+            "https://buyer.trycloudflare.com/v1/payload/pay_0123456789ABCDEF0123456789abcdef",
+            "https://buyer.trycloudflare.com/v1/payload/pay_0123456789abcdef",
+            "https://buyer.trycloudflare.com/v1/payload/pay_0123456789abcdef0123456789abcdeg",
+            "https://buyer.trycloudflare.com/v1/payload/payload_123",
             "https://buyer.trycloudflare.com/v1/payload/../admin",
             "https://buyer.trycloudflare.com/v1/payload/%2Fadmin",
-            "https://buyer.trycloudflare.com/v1/payload/payload_123?next=/admin",
-            "https://buyer.trycloudflare.com/v1/payload/payload_123#fragment",
+            "https://buyer.trycloudflare.com/v1/payload/pay_0123456789abcdef0123456789abcdef?next=/admin",
+            "https://buyer.trycloudflare.com/v1/payload/pay_0123456789abcdef0123456789abcdef#fragment",
         ]
         instance = provider()
         for url in urls:
@@ -696,19 +736,29 @@ class ResourceUrlTests(unittest.IsolatedAsyncioTestCase):
         instance = provider(opener)
 
         self.assertTrue(
-            await instance.exists("https://buyer.trycloudflare.com/v1/payload/payload_123")
+            await instance.exists(
+                "https://buyer.trycloudflare.com/v1/payload/"
+                "pay_0123456789abcdef0123456789abcdef"
+            )
         )
         request, timeout = opener.requests[0]
         self.assertEqual(request.get_method(), "HEAD")
+        self.assertEqual(request.get_header("Authorization"), "Bearer token")
         self.assertEqual(timeout, 10)
         with self.assertRaises(ValueError):
-            await instance.exists("https://evil.example/v1/payload/payload_123")
+            await instance.exists(
+                "https://evil.example/v1/payload/"
+                "pay_0123456789abcdef0123456789abcdef"
+            )
 
     async def test_exists_returns_false_on_transport_error(self) -> None:
         instance = provider(FakeOpener(error=OSError("offline")))
 
         self.assertFalse(
-            await instance.exists("https://buyer.trycloudflare.com/v1/payload/payload_123")
+            await instance.exists(
+                "https://buyer.trycloudflare.com/v1/payload/"
+                "pay_0123456789abcdef0123456789abcdef"
+            )
         )
 
     async def test_exists_rejects_a_response_opened_after_total_deadline(self) -> None:
@@ -721,7 +771,8 @@ class ResourceUrlTests(unittest.IsolatedAsyncioTestCase):
             patch.object(storage_module, "_TIMEOUT_EXISTS", 1, create=True),
         ):
             exists = await instance.exists(
-                "https://buyer.trycloudflare.com/v1/payload/payload_123"
+                "https://buyer.trycloudflare.com/v1/payload/"
+                "pay_0123456789abcdef0123456789abcdef"
             )
 
         self.assertFalse(exists)
@@ -746,7 +797,9 @@ class ResourceUrlTests(unittest.IsolatedAsyncioTestCase):
             ]
 
         factory = FakeConnectionFactory(
-            FakeTransportResponse(b'{"payload_id":"payload_123"}'),
+            FakeTransportResponse(
+                b'{"payload_id":"pay_0123456789abcdef0123456789abcdef"}'
+            ),
             FakeTransportResponse(b'{"response":{"content":"report"}}'),
             FakeTransportResponse(b""),
         )
@@ -759,11 +812,13 @@ class ResourceUrlTests(unittest.IsolatedAsyncioTestCase):
 
         await instance.upload({"response": {"content": "report"}})
         await instance.download(
-            "HTTPS://BUYER.TRYCLOUDFLARE.COM:443/v1/payload/payload_123"
+            "HTTPS://BUYER.TRYCLOUDFLARE.COM:443/v1/payload/"
+            "pay_0123456789abcdef0123456789abcdef"
         )
         self.assertTrue(
             await instance.exists(
-                "HTTPS://BUYER.TRYCLOUDFLARE.COM:443/v1/payload/payload_123"
+                "HTTPS://BUYER.TRYCLOUDFLARE.COM:443/v1/payload/"
+                "pay_0123456789abcdef0123456789abcdef"
             )
         )
 

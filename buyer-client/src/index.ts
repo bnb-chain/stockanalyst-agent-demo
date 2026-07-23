@@ -27,7 +27,11 @@ import { Wallet, type BaseWallet } from "ethers";
 import { GuardUserMemory, buildTaskFromMemory } from "./uomp.js";
 import { negotiate, buildJobDescription, notifyFunded } from "./negotiate.js";
 import { ERC8183Buyer } from "./erc8183.js";
-import { startGatewayRelay, type GatewayRelay } from "./gateway.js";
+import {
+  fetchDeliverable,
+  startGatewayRelay,
+  type GatewayRelay,
+} from "./gateway.js";
 import { saveReport } from "./pdf-report.js";
 
 // ── Config from environment ──────────────────────────────────────────────────
@@ -171,7 +175,7 @@ async function main(): Promise<void> {
         // The buyer's relay is still running — we can fetch via the public tunnel URL.
         // If the seller is on the same machine (no tunnel), localUrl and publicUrl are
         // identical so this fetch goes straight to localhost.
-        const resp = await fetch(deliverableUrl);
+        const resp = await fetchDeliverable(deliverableUrl, relay);
         if (resp.ok) {
           // The UOMP gateway stores the full DeliverableManifest JSON.
           // Extract response.content (the actual report) when present;

@@ -26,8 +26,8 @@ _TIMEOUT_DOWNLOAD = 30
 _TIMEOUT_EXISTS = 10
 _MAX_RESPONSE_BYTES = 65_536
 _READ_CHUNK_BYTES = 8_192
-_PAYLOAD_ID_PATTERN = re.compile(r"[A-Za-z0-9_-]{1,128}\Z")
-_PAYLOAD_PATH_PATTERN = re.compile(r"/v1/payload/([A-Za-z0-9_-]{1,128})\Z")
+_PAYLOAD_ID_PATTERN = re.compile(r"pay_[0-9a-f]{32}\Z")
+_PAYLOAD_PATH_PATTERN = re.compile(r"/v1/payload/(pay_[0-9a-f]{32})\Z")
 _monotonic = time.monotonic
 _request_deadline = threading.local()
 _SOCKET_TYPE = socket.socket
@@ -440,7 +440,11 @@ class UOMPGatewayStorageProvider(StorageProvider):
 
     async def download(self, url: str) -> dict:
         target = self._validate_payload_url(url)
-        request = urllib.request.Request(target, method="GET")
+        request = urllib.request.Request(
+            target,
+            headers={"Authorization": f"Bearer {self._token}"},
+            method="GET",
+        )
         response, deadline = self._open_response(request, timeout=_TIMEOUT_DOWNLOAD)
         with response:
             result = _read_bounded_json(response, deadline=deadline)
@@ -451,7 +455,11 @@ class UOMPGatewayStorageProvider(StorageProvider):
     async def exists(self, url: str) -> bool:
         target = self._validate_payload_url(url)
         try:
-            request = urllib.request.Request(target, method="HEAD")
+            request = urllib.request.Request(
+                target,
+                headers={"Authorization": f"Bearer {self._token}"},
+                method="HEAD",
+            )
             response, deadline = self._open_response(request, timeout=_TIMEOUT_EXISTS)
             with response:
                 _ensure_before_deadline(response, deadline)

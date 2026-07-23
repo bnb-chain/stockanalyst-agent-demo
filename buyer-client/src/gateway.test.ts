@@ -6,7 +6,12 @@ import {
   type Server,
 } from "node:http";
 import test from "node:test";
-import { createGatewayHandler, type GatewayHandlerOptions } from "./gateway.js";
+import {
+  createGatewayHandler,
+  fetchDeliverable,
+  type GatewayHandlerOptions,
+  type GatewayRelay,
+} from "./gateway.js";
 
 const TEST_TIMEOUT_MS = 1_000;
 
@@ -341,4 +346,79 @@ test("retries an ID collision without overwriting the stored payload", async () 
   }, {
     idFactory: () => ids[nextId++] ?? freshId,
   });
+});
+
+test("sends the relay token only to canonical payloads on exact relay origins", async () => {
+  const calls: Array<{ url: string; init?: RequestInit }> = [];
+  const fakeFetch = async (
+    url: string | URL | Request,
+    init?: RequestInit,
+  ): Promise<Response> => {
+    calls.push({ url: String(url), init });
+    return new Response("ok");
+  };
+  const relay: GatewayRelay = {
+    localUrl: "http://127.0.0.1:9444",
+    publicUrl: "https://buyer.trycloudflare.com",
+    token: "gw-secret",
+    close() {},
+  };
+  const payloadId = "pay_0123456789abcdef0123456789abcdef";
+
+  for (const url of [
+    `https://buyer.trycloudflare.com/v1/payload/${payloadId}`,
+    `http://127.0.0.1:9444/v1/payload/${payloadId}`,
+  ]) {
+    await fetchDeliverable(url, relay, fakeFetch);
+    const call = calls.at(-1);
+    assert.equal(
+      new Headers(call?.init?.headers).get("Authorization"),
+      "Bearer gw-secret",
+    );
+    assert.equal(call?.init?.redirect, "error");
+  }
+
+  const untrustedUrls = [
+    `https://evil.example/v1/payload/${payloadId}`,
+    `https://buyer.trycloudflare.com.evil.example/v1/payload/${payloadId}`,
+    `https://buyer.trycloudflare.com:8443/v1/payload/${payloadId}`,
+    `http://127.0.0.1:9445/v1/payload/${payloadId}`,
+    `https://user@buyer.trycloudflare.com/v1/payload/${payloadId}`,
+    `https://user:password@buyer.trycloudflare.com/v1/payload/${payloadId}`,
+    `https://buyer.trycloudflare.com/v1/payload/${payloadId}?download=1`,
+    `https://buyer.trycloudflare.com/v1/payload/${payloadId}#report`,
+    `https://buyer.trycloudflare.com/v1/payload/${payloadId}/extra`,
+    `https://buyer.trycloudflare.com/v1/payload/${payloadId}.pdf`,
+    `https://buyer.trycloudflare.com/v1/payload/pay_0123456789ABCDEF0123456789abcdef`,
+    `https://buyer.trycloudflare.com/v1/payload/pay_0123456789abcdef`,
+    `https://buyer.trycloudflare.com/v1/payload/pay_0123456789abcdef0123456789abcdeg`,
+    "https://buyer.trycloudflare.com/v1/payload/upload",
+    "https://buyer.trycloudflare.com/report",
+  ];
+
+  for (const url of untrustedUrls) {
+    await fetchDeliverable(url, relay, fakeFetch);
+    const call = calls.at(-1);
+    assert.equal(
+      new Headers(call?.init?.headers).has("Authorization"),
+      false,
+      url,
+    );
+  }
+});
+
+test("fetches without credentials when no relay is available", async () => {
+  const calls: Array<{ url: string; init?: RequestInit }> = [];
+  const fakeFetch = async (
+    url: string | URL | Request,
+    init?: RequestInit,
+  ): Promise<Response> => {
+    calls.push({ url: String(url), init });
+    return new Response("ok");
+  };
+  const url = "https://storage.example/report";
+
+  await fetchDeliverable(url, undefined, fakeFetch);
+
+  assert.deepEqual(calls, [{ url, init: undefined }]);
 });

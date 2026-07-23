@@ -5,15 +5,15 @@
  * then exposes it publicly via a Cloudflare Tunnel (reverse tunnel).
  *
  * The seller uploads the report to the public tunnel URL and gets back a
- * payload_id. That URL is stored on-chain. The buyer (and anyone else with
- * the tunnel URL) can download the payload by ID — no direct seller→buyer
- * connection needed, and the buyer has no public IP requirement.
+ * payload_id. That URL is stored on-chain as a locator, while the signed
+ * off-chain gateway token remains required for reads. No direct seller→buyer
+ * connection or public buyer IP is needed.
  *
  * Endpoints:
  *   POST /v1/payload/upload   Bearer <token>   → { payload_id }
  *   GET  /v1/payload/:id      Bearer <token>   → raw bytes
  *   HEAD /v1/payload/:id      Bearer <token>   → payload metadata
- *   GET  /v1/health           (no auth)        → { status }
+ *   GET  /v1/health           (unauthenticated) → { status }
  */
 
 import {
@@ -43,8 +43,34 @@ export interface GatewayHandlerOptions {
 export interface GatewayRelay {
   localUrl: string;    // http://127.0.0.1:PORT  (for buyer's own fetch)
   publicUrl: string;   // https://xxx.trycloudflare.com  (for seller to upload)
-  token: string;       // Bearer token seller must include on upload
+  token: string;       // Bearer token required for payload uploads and reads
   close(): void;
+}
+
+export async function fetchDeliverable(
+  url: string,
+  relay: GatewayRelay | undefined,
+  fetchImpl: typeof fetch = fetch,
+): Promise<Response> {
+  if (!relay) return fetchImpl(url);
+  const target = new URL(url);
+  const relayOrigins = new Set([
+    new URL(relay.publicUrl).origin,
+    new URL(relay.localUrl).origin,
+  ]);
+  const isCanonicalPayload =
+    !target.username
+    && !target.password
+    && !target.search
+    && !target.hash
+    && /^\/v1\/payload\/pay_[0-9a-f]{32}$/.test(target.pathname);
+  if (!relayOrigins.has(target.origin) || !isCanonicalPayload) {
+    return fetchImpl(url);
+  }
+  return fetchImpl(url, {
+    headers: { Authorization: `Bearer ${relay.token}` },
+    redirect: "error",
+  });
 }
 
 function hasBearer(req: IncomingMessage, token: string): boolean {
@@ -109,7 +135,7 @@ export function createGatewayHandler(
   ): void => {
     const { method, url = "/" } = req;
 
-    // ── Health (no auth) ─────────────────────────────────────────────────────
+    // ── Public health check ──────────────────────────────────────────────────
     if (method === "GET" && url === "/v1/health") {
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ status: "ok" }));
@@ -325,8 +351,8 @@ function startCloudflaredTunnel(localPort: number): Promise<{ url: string; proc:
  * Start the UOMP payload relay and (optionally) a Cloudflare Tunnel.
  *
  * Returns the local URL for the buyer's own fetch calls, the public tunnel
- * URL to pass to the seller, and a Bearer token the seller must send on
- * upload requests.
+ * URL to pass to the seller, and a Bearer token required for payload uploads
+ * and reads.
  */
 export async function startGatewayRelay(port = 9444): Promise<GatewayRelay> {
   const token = `gw-${randomBytes(16).toString("hex")}`;
