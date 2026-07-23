@@ -407,6 +407,45 @@ test("sends the relay token only to canonical payloads on exact relay origins", 
   }
 });
 
+test("does not authenticate raw locators normalized by URL parsing", async () => {
+  const calls: Array<{ url: string; init?: RequestInit }> = [];
+  const fakeFetch = async (
+    url: string | URL | Request,
+    init?: RequestInit,
+  ): Promise<Response> => {
+    calls.push({ url: String(url), init });
+    return new Response("ok");
+  };
+  const relay: GatewayRelay = {
+    localUrl: "http://127.0.0.1:9444",
+    publicUrl: "https://buyer.trycloudflare.com",
+    token: "gw-secret",
+    close() {},
+  };
+  const payloadId = "pay_0123456789abcdef0123456789abcdef";
+  const noncanonicalUrls = [
+    `https://buyer.trycloudflare.com/v1/payload/ignored/../${payloadId}`,
+    `https://buyer.trycloudflare.com/v1/payload/ignored/%2e%2e/${payloadId}`,
+    `https://buyer.trycloudflare.com/v1/payload/ignored/%2E./${payloadId}`,
+    `https://buyer.trycloudflare.com/v1/payload/ignored\\..\\${payloadId}`,
+    `https://BUYER.TRYCLOUDFLARE.COM/v1/payload/${payloadId}`,
+    `https://buyer.trycloudflare.com:443/v1/payload/${payloadId}`,
+  ];
+
+  for (const url of noncanonicalUrls) {
+    const target = new URL(url);
+    assert.notEqual(target.href, url);
+    assert.equal(target.origin, "https://buyer.trycloudflare.com");
+    assert.equal(target.pathname, `/v1/payload/${payloadId}`);
+    await fetchDeliverable(url, relay, fakeFetch);
+  }
+
+  assert.deepEqual(
+    calls.map((call) => new Headers(call.init?.headers).has("Authorization")),
+    noncanonicalUrls.map(() => false),
+  );
+});
+
 test("fetches without credentials when no relay is available", async () => {
   const calls: Array<{ url: string; init?: RequestInit }> = [];
   const fakeFetch = async (
