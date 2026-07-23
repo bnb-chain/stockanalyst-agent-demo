@@ -31,6 +31,10 @@ interface JsonStringToken {
   isObjectKey: boolean;
 }
 
+type JsonContainerScope =
+  | { kind: "object"; keys: Set<string> }
+  | { kind: "array" };
+
 function isNumberNode(value: unknown): value is LosslessNumber {
   return value instanceof LosslessNumber;
 }
@@ -61,11 +65,50 @@ function scanJsonStrings(rawText: string): JsonStringToken[] {
   return tokens;
 }
 
-function protectPrototypeKeys(rawText: string): {
+function rejectDuplicateObjectKeys(
+  rawText: string,
+  stringTokens: readonly JsonStringToken[],
+): void {
+  const scopes: JsonContainerScope[] = [];
+  let tokenIndex = 0;
+  let index = 0;
+
+  while (index < rawText.length) {
+    const token = stringTokens[tokenIndex];
+    if (token?.start === index) {
+      const scope = scopes[scopes.length - 1];
+      if (token.isObjectKey && scope?.kind === "object") {
+        if (scope.keys.has(token.value)) {
+          throw new SyntaxError("Duplicate object key");
+        }
+        scope.keys.add(token.value);
+      }
+      index = token.end;
+      tokenIndex += 1;
+      continue;
+    }
+
+    if (rawText[index] === "{") {
+      scopes.push({ kind: "object", keys: new Set<string>() });
+    } else if (rawText[index] === "[") {
+      scopes.push({ kind: "array" });
+    } else if (
+      (rawText[index] === "}" && scopes[scopes.length - 1]?.kind === "object")
+      || (rawText[index] === "]" && scopes[scopes.length - 1]?.kind === "array")
+    ) {
+      scopes.pop();
+    }
+    index += 1;
+  }
+}
+
+function protectPrototypeKeys(
+  rawText: string,
+  tokens: readonly JsonStringToken[],
+): {
   protectedText: string;
   sentinel: string;
 } {
-  const tokens = scanJsonStrings(rawText);
   const strings = new Set(tokens.map(({ value }) => value));
   let sentinel = "\u0000__proto__";
   while (strings.has(sentinel)) sentinel += "\u0000";
@@ -113,7 +156,9 @@ function nullPrototypeRecords(
 }
 
 function parseJson(rawText: string): JsonValue {
-  const { protectedText, sentinel } = protectPrototypeKeys(rawText);
+  const stringTokens = scanJsonStrings(rawText);
+  rejectDuplicateObjectKeys(rawText, stringTokens);
+  const { protectedText, sentinel } = protectPrototypeKeys(rawText, stringTokens);
   return nullPrototypeRecords(parse(protectedText), sentinel);
 }
 

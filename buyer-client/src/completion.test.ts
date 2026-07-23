@@ -20,6 +20,34 @@ const commitment = keccak256(toUtf8Bytes(manifest));
 const rootPrototypeManifest = `{"\\u005f\\u005fproto\\u005f\\u005f":{"chain_id":97,"contracts":{"commerce":"${contracts.commerce}","policy":"${contracts.policy}","router":"${contracts.router}"},"job_id":42,"metadata":{},"response":{"content":"uncommitted root report","content_type":"text/plain"},"version":1}}`;
 const nestedPrototypeManifest = `{"chain_id":97,"contracts":{"commerce":"${contracts.commerce}","policy":"${contracts.policy}","router":"${contracts.router}"},"job_id":42,"metadata":{},"response":{"__pro\\u0074o__":{"content":"uncommitted nested report","content_type":"text/plain"}},"version":1}`;
 const nestedPrototypeCommitted = `{"chain_id":97,"contracts":{"commerce":"${contracts.commerce}","policy":"${contracts.policy}","router":"${contracts.router}"},"job_id":42,"metadata":{},"response":{},"version":1}`;
+const duplicateVersionManifest = manifest.replace(
+  '"version":1',
+  '"version":1,"version":1',
+);
+const nestedDuplicateManifest = manifest.replace(
+  '"metadata":{}',
+  '"metadata":{"nested":{"same":"value","same":"value"}}',
+);
+const nestedDuplicateCommitted = manifest.replace(
+  '"metadata":{}',
+  '"metadata":{"nested":{"same":"value"}}',
+);
+const escapedDuplicateManifest = manifest.replace(
+  '"metadata":{}',
+  '"metadata":{"nested":{"x":1,"\\u0078":1}}',
+);
+const escapedDuplicateCommitted = manifest.replace(
+  '"metadata":{}',
+  '"metadata":{"nested":{"x":1}}',
+);
+const markerDuplicateManifest = manifest.replace(
+  '"metadata":{}',
+  '"metadata":{"value":{"isLosslessNumber":true,"value":"7"},"value":7}',
+);
+const markerDuplicateCommitted = manifest.replace(
+  '"metadata":{}',
+  '"metadata":{"value":7}',
+);
 
 function dependencies(overrides: Partial<CompletionDependencies> = {}) {
   let settleCalls = 0;
@@ -53,6 +81,28 @@ for (const [name, maliciousManifest, committedManifest] of [
   ["nested", nestedPrototypeManifest, nestedPrototypeCommitted],
 ] as const) {
   test(`${name} __proto__ fields cannot supply uncommitted report data`, async () => {
+    const fixture = dependencies({
+      fetchDeliverable: async () => new Response(maliciousManifest, { status: 200 }),
+      getDeliverableCommitment: async () => keccak256(toUtf8Bytes(committedManifest)),
+    });
+    await assert.rejects(
+      completeSubmittedJob(
+        { jobId, fundTxBlock: 1, chainId: 97n, contracts },
+        fixture.deps,
+      ),
+      /settlement blocked/i,
+    );
+    assert.equal(fixture.settleCalls(), 0);
+  });
+}
+
+for (const [name, maliciousManifest, committedManifest] of [
+  ["root required-key", duplicateVersionManifest, manifest],
+  ["nested identical-value", nestedDuplicateManifest, nestedDuplicateCommitted],
+  ["escaped-name", escapedDuplicateManifest, escapedDuplicateCommitted],
+  ["marker-object-versus-number", markerDuplicateManifest, markerDuplicateCommitted],
+] as const) {
+  test(`${name} duplicate keys cannot reach settlement`, async () => {
     const fixture = dependencies({
       fetchDeliverable: async () => new Response(maliciousManifest, { status: 200 }),
       getDeliverableCommitment: async () => keccak256(toUtf8Bytes(committedManifest)),

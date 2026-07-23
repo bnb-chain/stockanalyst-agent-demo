@@ -96,6 +96,83 @@ test("does not omit a marker-spoofed extension object from the commitment", () =
   );
 });
 
+test("does not confuse array values, sibling keys, or string contents with duplicates", () => {
+  const canonical = manifestWithMetadata(
+    '{"array":["same","same"],"left":{"x":1},"right":{"x":2},"text":"{\\"x\\":1,\\"x\\":2}"}',
+  );
+  assert.equal(
+    verifyDeliverableManifest(canonical, expectation(canonical)),
+    "# verified",
+  );
+});
+
+test("rejects duplicate required keys at the manifest root", () => {
+  const canonical = canonicalManifest();
+  const duplicated = canonical.replace(
+    '"version":1',
+    '"version":1,"version":1',
+  );
+  assert.throws(
+    () => verifyDeliverableManifest(duplicated, expectation(canonical)),
+    /JSON|duplicate/i,
+  );
+});
+
+test("rejects identical duplicate keys in a nested object", () => {
+  const canonical = manifestWithMetadata('{"nested":{"same":"value"}}');
+  const duplicated = manifestWithMetadata(
+    '{"nested":{"same":"value","same":"value"}}',
+  );
+  assert.throws(
+    () => verifyDeliverableManifest(duplicated, expectation(canonical)),
+    /JSON|duplicate/i,
+  );
+});
+
+test("rejects duplicate keys inside an object nested in an array", () => {
+  const canonical = manifestWithMetadata('{"items":[{"same":"value"}]}');
+  const duplicated = manifestWithMetadata(
+    '{"items":[{"same":"value","same":"value"}]}',
+  );
+  assert.throws(
+    () => verifyDeliverableManifest(duplicated, expectation(canonical)),
+    /JSON|duplicate/i,
+  );
+});
+
+test("rejects duplicate decoded keys with different escape spellings", () => {
+  const canonical = manifestWithMetadata('{"nested":{"x":1}}');
+  const duplicated = manifestWithMetadata(
+    '{"nested":{"x":1,"\\u0078":1}}',
+  );
+  assert.throws(
+    () => verifyDeliverableManifest(duplicated, expectation(canonical)),
+    /JSON|duplicate/i,
+  );
+});
+
+test("rejects escaped duplicate __proto__ keys before sentinel protection", () => {
+  const canonical = manifestWithMetadata('{"__proto__":{"retained":true}}');
+  const duplicated = manifestWithMetadata(
+    '{"__proto__":{"retained":true},"\\u005f\\u005fproto\\u005f\\u005f":{"retained":true}}',
+  );
+  assert.throws(
+    () => verifyDeliverableManifest(duplicated, expectation(canonical)),
+    /JSON|duplicate/i,
+  );
+});
+
+test("rejects marker-object and number values under a duplicate key", () => {
+  const canonical = manifestWithMetadata('{"value":7}');
+  const duplicated = manifestWithMetadata(
+    '{"value":{"isLosslessNumber":true,"value":"7"},"value":7}',
+  );
+  assert.throws(
+    () => verifyDeliverableManifest(duplicated, expectation(canonical)),
+    /JSON|duplicate/i,
+  );
+});
+
 // Fixed outputs from CPython 3.14.5:
 // json.dumps(json.loads(token), separators=(",", ":"))
 for (const { name, canonicalToken, spellings } of [
