@@ -11,13 +11,34 @@
  *
  * Endpoints:
  *   POST /v1/payload/upload   Bearer <token>   → { payload_id }
- *   GET  /v1/payload/:id      (no auth)        → raw bytes
- *   GET  /v1/health           (no auth)        → { status, payloads }
+ *   GET  /v1/payload/:id      Bearer <token>   → raw bytes
+ *   HEAD /v1/payload/:id      Bearer <token>   → payload metadata
+ *   GET  /v1/health           (no auth)        → { status }
  */
 
-import { createServer, type IncomingMessage, type ServerResponse } from "http";
+import {
+  createServer,
+  type IncomingMessage,
+  type RequestListener,
+  type ServerResponse,
+} from "http";
 import { spawn, type ChildProcess } from "child_process";
-import { randomBytes } from "crypto";
+import { randomBytes, timingSafeEqual } from "crypto";
+
+export const MAX_PAYLOAD_BYTES = 2 * 1024 * 1024;
+export const MAX_RELAY_BYTES = 16 * 1024 * 1024;
+export const MAX_RELAY_PAYLOADS = 32;
+
+export interface RelayLimits {
+  maxPayloadBytes: number;
+  maxRelayBytes: number;
+  maxPayloads: number;
+}
+
+export interface GatewayHandlerOptions {
+  idFactory?: () => string;
+  limits?: Partial<RelayLimits>;
+}
 
 export interface GatewayRelay {
   localUrl: string;    // http://127.0.0.1:PORT  (for buyer's own fetch)
@@ -26,69 +47,105 @@ export interface GatewayRelay {
   close(): void;
 }
 
-// In-memory payload store — scoped to this process lifetime.
-const payloads = new Map<string, Buffer>();
+function hasBearer(req: IncomingMessage, token: string): boolean {
+  const header = req.headers.authorization;
+  if (typeof header !== "string" || !header.startsWith("Bearer ")) return false;
+  const supplied = Buffer.from(header.slice(7), "utf8");
+  const expected = Buffer.from(token, "utf8");
+  return supplied.length === expected.length && timingSafeEqual(supplied, expected);
+}
 
-function handleRequest(
-  req: IncomingMessage,
-  res: ServerResponse,
+function sendUnauthorized(res: ServerResponse): void {
+  res.writeHead(401, { "Content-Type": "application/json" });
+  res.end(JSON.stringify({ error: { code: "UNAUTHORIZED", message: "Invalid or missing Bearer token" } }));
+}
+
+function sendNotFound(res: ServerResponse): void {
+  res.writeHead(404, { "Content-Type": "application/json" });
+  res.end(JSON.stringify({ error: { code: "NOT_FOUND", message: "Payload not found" } }));
+}
+
+/**
+ * Create an isolated handler for one relay. Its payload store intentionally
+ * belongs to this closure so concurrently running relays cannot share data.
+ */
+export function createGatewayHandler(
   token: string,
-): void {
-  const { method, url = "/" } = req;
+  options: GatewayHandlerOptions = {},
+): RequestListener {
+  const payloads = new Map<string, Buffer>();
+  const idFactory = options.idFactory ?? (() => `pay_${randomBytes(16).toString("hex")}`);
 
-  // ── Health (no auth) ───────────────────────────────────────────────────────
-  if (method === "GET" && url === "/v1/health") {
-    res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ status: "ok", payloads: payloads.size }));
-    return;
-  }
+  return (
+    req: IncomingMessage,
+    res: ServerResponse,
+  ): void => {
+    const { method, url = "/" } = req;
 
-  // ── Upload (requires Bearer token) ────────────────────────────────────────
-  if (method === "POST" && url === "/v1/payload/upload") {
-    const auth = req.headers["authorization"] ?? "";
-    if (!auth.startsWith("Bearer ") || auth.slice(7) !== token) {
-      res.writeHead(401, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: { code: "UNAUTHORIZED", message: "Invalid or missing Bearer token" } }));
-      return;
-    }
-
-    const chunks: Buffer[] = [];
-    req.on("data", (c: Buffer) => chunks.push(c));
-    req.on("end", () => {
-      const id = `pay_${Date.now()}_${randomBytes(4).toString("hex")}`;
-      const data = Buffer.concat(chunks);
-      payloads.set(id, data);
+    // ── Health (no auth) ─────────────────────────────────────────────────────
+    if (method === "GET" && url === "/v1/health") {
       res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ payload_id: id, size: data.byteLength }));
-    });
-    return;
-  }
-
-  // ── Download (no auth — payload_id is unguessable) ─────────────────────────
-  const getMatch = url.match(/^\/v1\/payload\/([^/]+)$/);
-  if (method === "GET" && getMatch) {
-    const id = decodeURIComponent(getMatch[1]);
-    const data = payloads.get(id);
-    if (!data) {
-      res.writeHead(404, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: { code: "NOT_FOUND", message: `Payload ${id} not found` } }));
+      res.end(JSON.stringify({ status: "ok" }));
       return;
     }
-    res.writeHead(200, {
-      "Content-Type": "application/octet-stream",
-      "Content-Length": String(data.byteLength),
-    });
-    res.end(data);
-    return;
-  }
 
-  res.writeHead(404);
-  res.end();
+    // ── Upload (requires Bearer token) ──────────────────────────────────────
+    if (method === "POST" && url === "/v1/payload/upload") {
+      if (!hasBearer(req, token)) {
+        sendUnauthorized(res);
+        req.resume();
+        return;
+      }
+
+      const chunks: Buffer[] = [];
+      req.on("data", (chunk: Buffer) => chunks.push(chunk));
+      req.on("end", () => {
+        let id = idFactory();
+        while (payloads.has(id)) {
+          id = idFactory();
+        }
+        const data = Buffer.concat(chunks);
+        payloads.set(id, data);
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ payload_id: id, size: data.byteLength }));
+      });
+      return;
+    }
+
+    // ── Download and existence checks (requires Bearer token) ──────────────
+    if ((method === "GET" || method === "HEAD") && url.startsWith("/v1/payload/")) {
+      if (!hasBearer(req, token)) {
+        sendUnauthorized(res);
+        return;
+      }
+
+      const match = url.match(/^\/v1\/payload\/(pay_[0-9a-f]{32})$/);
+      if (!match) {
+        sendNotFound(res);
+        return;
+      }
+
+      const data = payloads.get(match[1]);
+      if (!data) {
+        sendNotFound(res);
+        return;
+      }
+      res.writeHead(200, {
+        "Content-Type": "application/octet-stream",
+        "Content-Length": String(data.byteLength),
+      });
+      res.end(method === "HEAD" ? undefined : data);
+      return;
+    }
+
+    res.writeHead(404);
+    res.end();
+  };
 }
 
 function createRelayServer(port: number, token: string): Promise<() => void> {
   return new Promise((resolve, reject) => {
-    const server = createServer((req, res) => handleRequest(req, res, token));
+    const server = createServer(createGatewayHandler(token));
     server.listen(port, "127.0.0.1", () => resolve(() => server.close()));
     server.on("error", reject);
   });
