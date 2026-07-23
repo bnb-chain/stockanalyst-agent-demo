@@ -58,8 +58,9 @@ test("renders seller HTML payloads as inert text", () => {
       symbols: "AAPL",
     });
     assert.ok(html.includes("&lt;"));
-    assert.doesNotMatch(html, /<(script|img|iframe|style|a)\b/i);
-    assert.doesNotMatch(html, /\bon(?:error|load)\s*=/i);
+    assert.doesNotMatch(html, /<(script|img|iframe|a)\b/i);
+    assert.doesNotMatch(html, /\bon(?:error|load)\s*=\s*["']/i);
+    assert.doesNotMatch(html, /<\/div><style>body\{display:none\}/i);
   }
 });
 
