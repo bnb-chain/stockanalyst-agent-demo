@@ -26,13 +26,14 @@ import { resolve } from "path";
 import { Wallet, type BaseWallet } from "ethers";
 import { GuardUserMemory, buildTaskFromMemory } from "./uomp.js";
 import { negotiate, buildJobDescription, notifyFunded } from "./negotiate.js";
-import { ERC8183Buyer } from "./erc8183.js";
+import { CONTRACTS, ERC8183Buyer } from "./erc8183.js";
 import {
   fetchDeliverable,
   startGatewayRelay,
   type GatewayRelay,
 } from "./gateway.js";
 import { saveReport } from "./pdf-report.js";
+import { completeSubmittedJob } from "./completion.js";
 
 // ── Config from environment ──────────────────────────────────────────────────
 const KEYSTORE_PATH  = process.env["KEYSTORE_PATH"]  ?? "../stockanalyst/.studio/wallets/0x1FF095E1C5Cf4bC72a3DC54be17B6cf85043Fb67.json";
@@ -164,70 +165,39 @@ async function main(): Promise<void> {
   });
   console.log(`  ✓ Job reached  ${finalStatus}`);
 
-  // ── Step 6: Fetch deliverable ────────────────────────────────────────────
-  hr("Step 6: Fetch deliverable URL from chain");
-  const deliverableUrl = await buyer.getDeliverableUrl(buy.jobId, buy.fundTxBlock);
-  if (deliverableUrl) {
-    console.log(`  ✓ Deliverable URL: ${deliverableUrl}`);
-    if (deliverableUrl.startsWith("http")) {
-      console.log("  Fetching report content...");
-      try {
-        // The buyer's relay is still running — we can fetch via the public tunnel URL.
-        // If the seller is on the same machine (no tunnel), localUrl and publicUrl are
-        // identical so this fetch goes straight to localhost.
-        const resp = await fetchDeliverable(deliverableUrl, relay);
-        if (resp.ok) {
-          // The UOMP gateway stores the full DeliverableManifest JSON.
-          // Extract response.content (the actual report) when present;
-          // fall back to displaying the raw text for other storage backends.
-          let reportText: string;
-          const rawText = await resp.text();
-          try {
-            const manifest = JSON.parse(rawText) as {
-              response?: { content?: string };
-              [key: string]: unknown;
-            };
-            reportText = manifest.response?.content ?? rawText;
-          } catch {
-            reportText = rawText;
-          }
-          console.log("\n┌─ REPORT " + "─".repeat(50) + "┐");
-          for (const line of reportText.split("\n")) {
-            console.log("│ " + line);
-          }
-          console.log("└" + "─".repeat(52) + "┘");
-
-          // Save HTML + PDF versions of the report
-          console.log("\n  Generating PDF report...");
-          try {
-            const { pdfPath, htmlPath } = await saveReport(reportText, buy.jobId.toString(), symbols);
-            console.log(`  ✓ HTML report  ${htmlPath}`);
-            if (pdfPath) {
-              console.log(`  ✓ PDF report   ${pdfPath}`);
-            } else {
-              console.log("  ℹ  PDF skipped (puppeteer/Chrome unavailable) — HTML report saved.");
-            }
-          } catch (pdfErr) {
-            console.log(`  ⚠  Report save failed: ${pdfErr}`);
-          }
-        } else {
-          console.log(`  (HTTP ${resp.status} fetching report — check URL manually)`);
-        }
-      } catch (err) {
-        console.log(`  (Could not fetch report: ${err})`);
-      }
-    } else {
-      console.log(`  (Non-HTTP URL — fetch manually: ${deliverableUrl})`);
-    }
-  } else {
-    console.log("  (Deliverable URL not found in Policy events — job may not be submitted yet)");
-  }
-
-  // ── Step 7: Settle ───────────────────────────────────────────────────────
-  hr("Step 7: Settle — approve job, release escrow to seller");
+  // ── Step 6: Verify deliverable and settle ─────────────────────────────────
+  hr("Step 6: Verify deliverable, then settle escrow");
   try {
-    const settleTx = await buyer.settle(buy.jobId);
-    console.log(`  ✓ settle_tx    ${settleTx}`);
+    const completion = await completeSubmittedJob(
+      {
+        jobId: buy.jobId,
+        fundTxBlock: buy.fundTxBlock,
+        chainId: BigInt(CONTRACTS.CHAIN_ID),
+        contracts: {
+          commerce: CONTRACTS.COMMERCE,
+          router: CONTRACTS.ROUTER,
+          policy: CONTRACTS.POLICY,
+        },
+      },
+      {
+        getDeliverableUrl: (jobId, block) => buyer.getDeliverableUrl(jobId, block),
+        getDeliverableCommitment: (jobId) => buyer.getDeliverableCommitment(jobId),
+        fetchDeliverable: (url) => fetchDeliverable(url, relay),
+        renderReport: async (reportText) => {
+          console.log("\n┌─ VERIFIED REPORT " + "─".repeat(41) + "┐");
+          for (const line of reportText.split("\n")) console.log(`│ ${line}`);
+          console.log("└" + "─".repeat(58) + "┘");
+          const result = await saveReport(reportText, buy.jobId.toString(), symbols);
+          console.log(`  ✓ HTML report  ${result.htmlPath}`);
+          if (result.pdfPath) console.log(`  ✓ PDF report   ${result.pdfPath}`);
+        },
+        settle: (jobId) => buyer.settle(jobId),
+      },
+    );
+    if (completion.renderError) {
+      console.log(`  ⚠  Report save failed: ${completion.renderError}`);
+    }
+    console.log(`  ✓ settle_tx    ${completion.settleTx}`);
     banner([
       `✓ E2E PASSED — job #${buy.jobId} settled on BSC testnet`,
       `  Seller received: ${priceU} U`,
