@@ -4,6 +4,7 @@ import { keccak256, toUtf8Bytes } from "ethers";
 import {
   completeSubmittedJob,
   SettlementAttemptError,
+  SettlementBlockedError,
   type CompletionDependencies,
 } from "./completion.js";
 import { MAX_PAYLOAD_BYTES } from "./gateway.js";
@@ -16,6 +17,9 @@ const contracts = {
 };
 const manifest = `{"chain_id":97,"contracts":{"commerce":"${contracts.commerce}","policy":"${contracts.policy}","router":"${contracts.router}"},"job_id":42,"metadata":{},"response":{"content":"report","content_type":"text/plain"},"version":1}`;
 const commitment = keccak256(toUtf8Bytes(manifest));
+const rootPrototypeManifest = `{"\\u005f\\u005fproto\\u005f\\u005f":{"chain_id":97,"contracts":{"commerce":"${contracts.commerce}","policy":"${contracts.policy}","router":"${contracts.router}"},"job_id":42,"metadata":{},"response":{"content":"uncommitted root report","content_type":"text/plain"},"version":1}}`;
+const nestedPrototypeManifest = `{"chain_id":97,"contracts":{"commerce":"${contracts.commerce}","policy":"${contracts.policy}","router":"${contracts.router}"},"job_id":42,"metadata":{},"response":{"__pro\\u0074o__":{"content":"uncommitted nested report","content_type":"text/plain"}},"version":1}`;
+const nestedPrototypeCommitted = `{"chain_id":97,"contracts":{"commerce":"${contracts.commerce}","policy":"${contracts.policy}","router":"${contracts.router}"},"job_id":42,"metadata":{},"response":{},"version":1}`;
 
 function dependencies(overrides: Partial<CompletionDependencies> = {}) {
   let settleCalls = 0;
@@ -44,6 +48,26 @@ test("settles once after fetch and manifest verification succeed", async () => {
   assert.equal(fixture.settleCalls(), 1);
 });
 
+for (const [name, maliciousManifest, committedManifest] of [
+  ["root", rootPrototypeManifest, "{}"],
+  ["nested", nestedPrototypeManifest, nestedPrototypeCommitted],
+] as const) {
+  test(`${name} __proto__ fields cannot supply uncommitted report data`, async () => {
+    const fixture = dependencies({
+      fetchDeliverable: async () => new Response(maliciousManifest, { status: 200 }),
+      getDeliverableCommitment: async () => keccak256(toUtf8Bytes(committedManifest)),
+    });
+    await assert.rejects(
+      completeSubmittedJob(
+        { jobId, fundTxBlock: 1, chainId: 97n, contracts },
+        fixture.deps,
+      ),
+      /settlement blocked/i,
+    );
+    assert.equal(fixture.settleCalls(), 0);
+  });
+}
+
 test("URL lookup failure blocks settlement without leaking dependency errors", async () => {
   const secret = "rpc-token-must-not-leak";
   const fixture = dependencies({
@@ -66,8 +90,44 @@ test("URL lookup failure blocks settlement without leaking dependency errors", a
   assert.equal(fixture.settleCalls(), 0);
 });
 
+test("a dependency cannot spoof the internal settlement-blocked prefix", async () => {
+  const secret = "commitment-secret-must-not-leak";
+  const fixture = dependencies({
+    getDeliverableCommitment: async () => {
+      throw new Error(`Settlement blocked: ${secret}`);
+    },
+  });
+  await assert.rejects(
+    completeSubmittedJob(
+      { jobId, fundTxBlock: 1, chainId: 97n, contracts },
+      fixture.deps,
+    ),
+    (error: unknown) => {
+      if (!(error instanceof SettlementBlockedError)) return false;
+      assert.equal(
+        error.message,
+        "Settlement blocked: deliverable body or on-chain commitment could not be read",
+      );
+      assert.doesNotMatch(error.message, new RegExp(secret));
+      assert.equal(error instanceof SettlementAttemptError, false);
+      return true;
+    },
+  );
+  assert.equal(fixture.settleCalls(), 0);
+});
+
 for (const [name, overrides] of [
   ["missing URL", { getDeliverableUrl: async () => null }],
+  ["array URL", {
+    getDeliverableUrl: async () => [
+      "https://relay.example/v1/payload/pay_0123456789abcdef0123456789abcdef",
+    ],
+  }],
+  ["object URL", {
+    getDeliverableUrl: async () => ({
+      toString: () => "https://relay.example/v1/payload/pay_0123456789abcdef0123456789abcdef",
+    }),
+  }],
   ["unsupported URL", { getDeliverableUrl: async () => "ipfs://payload" }],
   ["fetch rejection", { fetchDeliverable: async () => { throw new Error("offline"); } }],
   ["HTTP failure", { fetchDeliverable: async () => new Response("", { status: 503 }) }],

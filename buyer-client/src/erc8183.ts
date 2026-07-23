@@ -256,8 +256,12 @@ export class ERC8183Buyer {
       const hex = optParamsHex.startsWith("0x") ? optParamsHex.slice(2) : optParamsHex;
       const bytes = Buffer.from(hex, "hex");
       const json = bytes.toString("utf8");
-      const parsed = JSON.parse(json) as { deliverable_url?: string };
-      return parsed.deliverable_url ?? null;
+      const parsed: unknown = JSON.parse(json);
+      if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+        return null;
+      }
+      const deliverableUrl = (parsed as Record<string, unknown>)["deliverable_url"];
+      return typeof deliverableUrl === "string" ? deliverableUrl : null;
     } catch {
       return null;
     }

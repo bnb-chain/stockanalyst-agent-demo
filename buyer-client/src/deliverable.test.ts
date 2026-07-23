@@ -15,6 +15,10 @@ function canonicalManifest(content = "# verified"): string {
   return `{"chain_id":97,"contracts":{"commerce":"${CONTRACTS.commerce}","policy":"${CONTRACTS.policy}","router":"${CONTRACTS.router}"},"job_id":${JOB_ID},"metadata":{"job_id":${JOB_ID},"nested":[{"a":1,"b":2}]},"response":{"content":${JSON.stringify(content)},"content_type":"text/plain"},"version":1}`;
 }
 
+function manifestWithMetadata(metadataJson: string): string {
+  return `{"chain_id":97,"contracts":{"commerce":"${CONTRACTS.commerce}","policy":"${CONTRACTS.policy}","router":"${CONTRACTS.router}"},"job_id":${JOB_ID},"metadata":${metadataJson},"response":{"content":"# verified","content_type":"text/plain"},"version":1}`;
+}
+
 function expectation(raw: string) {
   return {
     jobId: JOB_ID,
@@ -54,6 +58,115 @@ test("matches SDK key ordering for BMP and astral metadata keys", () => {
   assert.equal(
     verifyDeliverableManifest(sdkCanonical, expectation(sdkCanonical)),
     "# verified",
+  );
+});
+
+test("keeps root and nested __proto__ extension keys in the commitment", () => {
+  const sdkCanonical = `{"\\u0000__proto__":"sentinel collision","__proto__":{"retained":true},"chain_id":97,"contracts":{"commerce":"${CONTRACTS.commerce}","policy":"${CONTRACTS.policy}","router":"${CONTRACTS.router}"},"job_id":${JOB_ID},"metadata":{"__proto__":{"nested":true}},"response":{"content":"# verified","content_type":"text/plain"},"version":1}`;
+  assert.equal(
+    verifyDeliverableManifest(sdkCanonical, expectation(sdkCanonical)),
+    "# verified",
+  );
+});
+
+test("rejects a JSON object spoofing the required version number node", () => {
+  const canonical = canonicalManifest();
+  const spoofed = canonical.replace(
+    '"version":1',
+    '"version":{"hidden":"uncommitted","isLosslessNumber":true,"value":"1"}',
+  );
+  assert.throws(
+    () => verifyDeliverableManifest(spoofed, expectation(canonical)),
+    /version/i,
+  );
+});
+
+test("does not omit a marker-spoofed extension object from the commitment", () => {
+  const canonical = canonicalManifest().replace(
+    `"metadata":{"job_id":${JOB_ID},"nested":[{"a":1,"b":2}]}`,
+    '"metadata":{"spoofed":7}',
+  );
+  const spoofed = canonical.replace(
+    '"spoofed":7',
+    '"spoofed":{"hidden":"uncommitted","isLosslessNumber":true,"value":"7"}',
+  );
+  assert.throws(
+    () => verifyDeliverableManifest(spoofed, expectation(canonical)),
+    /commitment does not match/i,
+  );
+});
+
+// Fixed outputs from CPython 3.14.5:
+// json.dumps(json.loads(token), separators=(",", ":"))
+for (const { name, canonicalToken, spellings } of [
+  {
+    name: "1.0",
+    canonicalToken: "1.0",
+    spellings: ["1.0", "1e0", "1.00"],
+  },
+  {
+    name: "1e-07",
+    canonicalToken: "1e-07",
+    spellings: ["1e-07", "0.0000001", "10e-8"],
+  },
+  {
+    name: "1e+20",
+    canonicalToken: "1e+20",
+    spellings: ["1e+20", "100000000000000000000.0", "10e19"],
+  },
+  {
+    name: "-0.0",
+    canonicalToken: "-0.0",
+    spellings: ["-0.0", "-0e0", "-0.000"],
+  },
+] as const) {
+  test(`matches the CPython numeric canonical form for ${name} and equivalent spellings`, () => {
+    const sdkCanonical = manifestWithMetadata(`{"value":${canonicalToken}}`);
+    for (const spelling of spellings) {
+      assert.equal(
+        verifyDeliverableManifest(
+          manifestWithMetadata(`{"value":${spelling}}`),
+          expectation(sdkCanonical),
+        ),
+        "# verified",
+      );
+    }
+  });
+}
+
+for (const { name, inputToken, canonicalToken } of [
+  { name: "positive overflow", inputToken: "1e400", canonicalToken: "Infinity" },
+  { name: "negative overflow", inputToken: "-1e400", canonicalToken: "-Infinity" },
+  { name: "positive underflow", inputToken: "1e-4000", canonicalToken: "0.0" },
+  { name: "negative underflow", inputToken: "-1e-4000", canonicalToken: "-0.0" },
+] as const) {
+  test(`matches CPython json.loads/json.dumps ${name} behavior`, () => {
+    const sdkCanonical = manifestWithMetadata(`{"value":${canonicalToken}}`);
+    assert.equal(
+      verifyDeliverableManifest(
+        manifestWithMetadata(`{"value":${inputToken}}`),
+        expectation(sdkCanonical),
+      ),
+      "# verified",
+    );
+  });
+}
+
+test("preserves CPython's maximum exact integer and rejects the next digit", () => {
+  const maximumInteger = "1".repeat(4_300);
+  const sdkCanonical = manifestWithMetadata(`{"value":${maximumInteger}}`);
+  assert.equal(
+    verifyDeliverableManifest(sdkCanonical, expectation(sdkCanonical)),
+    "# verified",
+  );
+
+  const oversizedInteger = `1${maximumInteger}`;
+  assert.throws(
+    () => verifyDeliverableManifest(
+      manifestWithMetadata(`{"value":${oversizedInteger}}`),
+      expectation(manifestWithMetadata(`{"value":${oversizedInteger}}`)),
+    ),
+    /integer.*4,?300|4,?300.*integer/i,
   );
 });
 

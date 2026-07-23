@@ -12,7 +12,7 @@ export interface CompletionParams {
 }
 
 export interface CompletionDependencies {
-  getDeliverableUrl(jobId: bigint, fundTxBlock?: number): Promise<string | null>;
+  getDeliverableUrl(jobId: bigint, fundTxBlock?: number): Promise<unknown>;
   getDeliverableCommitment(jobId: bigint): Promise<string>;
   fetchDeliverable(url: string): Promise<Response>;
   renderReport(reportText: string): Promise<void>;
@@ -33,8 +33,15 @@ export class SettlementAttemptError extends Error {
   }
 }
 
-function blocked(reason: string): Error {
-  return new Error(`Settlement blocked: ${reason}`);
+export class SettlementBlockedError extends Error {
+  constructor(reason: string) {
+    super(`Settlement blocked: ${reason}`);
+    this.name = "SettlementBlockedError";
+  }
+}
+
+function blocked(reason: string): SettlementBlockedError {
+  return new SettlementBlockedError(reason);
 }
 
 async function readBoundedBody(response: Response): Promise<string> {
@@ -68,13 +75,18 @@ export async function completeSubmittedJob(
   params: CompletionParams,
   dependencies: CompletionDependencies,
 ): Promise<CompletionResult> {
-  let url: string | null;
+  let url: unknown;
   try {
     url = await dependencies.getDeliverableUrl(params.jobId, params.fundTxBlock);
   } catch {
     throw blocked("deliverable URL could not be read");
   }
-  if (!url) throw blocked("deliverable URL is missing");
+  if (url === null || url === undefined || url === "") {
+    throw blocked("deliverable URL is missing");
+  }
+  if (typeof url !== "string") {
+    throw blocked("deliverable URL must be a string");
+  }
 
   let parsedUrl: URL;
   try {
@@ -104,7 +116,7 @@ export async function completeSubmittedJob(
       dependencies.getDeliverableCommitment(params.jobId),
     ]);
   } catch (error) {
-    if (error instanceof Error && error.message.startsWith("Settlement blocked:")) throw error;
+    if (error instanceof SettlementBlockedError) throw error;
     throw blocked("deliverable body or on-chain commitment could not be read");
   }
 

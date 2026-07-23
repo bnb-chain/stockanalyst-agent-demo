@@ -1,12 +1,15 @@
 import { getAddress, keccak256, toUtf8Bytes } from "ethers";
-import { isLosslessNumber, parse } from "lossless-json";
+import { LosslessNumber, parse } from "lossless-json";
 import { MAX_PAYLOAD_BYTES } from "./gateway.js";
+
+const MAX_INTEGER_DIGITS = 4_300;
+const MAX_INTEGER_DIGITS_LABEL = "4,300";
 
 type JsonValue =
   | null
   | boolean
   | string
-  | { value: string; isLosslessNumber: true }
+  | LosslessNumber
   | JsonValue[]
   | { [key: string]: JsonValue };
 
@@ -19,6 +22,99 @@ export interface DeliverableExpectation {
     policy: string;
   };
   commitment: string;
+}
+
+interface JsonStringToken {
+  start: number;
+  end: number;
+  value: string;
+  isObjectKey: boolean;
+}
+
+function isNumberNode(value: unknown): value is LosslessNumber {
+  return value instanceof LosslessNumber;
+}
+
+function scanJsonStrings(rawText: string): JsonStringToken[] {
+  const tokens: JsonStringToken[] = [];
+  let index = 0;
+  while (index < rawText.length) {
+    if (rawText[index] !== '"') {
+      index += 1;
+      continue;
+    }
+
+    const start = index;
+    index += 1;
+    while (index < rawText.length && rawText[index] !== '"') {
+      index += rawText[index] === "\\" ? 2 : 1;
+    }
+    if (index >= rawText.length) break;
+
+    const end = index + 1;
+    const value = JSON.parse(rawText.slice(start, end)) as string;
+    let next = end;
+    while (next < rawText.length && /\s/.test(rawText[next]!)) next += 1;
+    tokens.push({ start, end, value, isObjectKey: rawText[next] === ":" });
+    index = end;
+  }
+  return tokens;
+}
+
+function protectPrototypeKeys(rawText: string): {
+  protectedText: string;
+  sentinel: string;
+} {
+  const tokens = scanJsonStrings(rawText);
+  const strings = new Set(tokens.map(({ value }) => value));
+  let sentinel = "\u0000__proto__";
+  while (strings.has(sentinel)) sentinel += "\u0000";
+
+  let protectedText = "";
+  let previousEnd = 0;
+  for (const token of tokens) {
+    if (!token.isObjectKey || token.value !== "__proto__") continue;
+    protectedText += rawText.slice(previousEnd, token.start);
+    protectedText += JSON.stringify(sentinel);
+    previousEnd = token.end;
+  }
+  protectedText += rawText.slice(previousEnd);
+  return { protectedText, sentinel };
+}
+
+function nullPrototypeRecords(
+  value: unknown,
+  prototypeKeySentinel: string,
+): JsonValue {
+  if (
+    value === null
+    || typeof value === "boolean"
+    || typeof value === "string"
+    || isNumberNode(value)
+  ) {
+    return value;
+  }
+  if (Array.isArray(value)) {
+    return value.map((item) => nullPrototypeRecords(item, prototypeKeySentinel));
+  }
+  if (typeof value !== "object") {
+    throw new Error("unsupported JSON value");
+  }
+
+  const record = Object.create(null) as Record<string, JsonValue>;
+  for (const key of Object.keys(value)) {
+    const ownKey = key === prototypeKeySentinel ? "__proto__" : key;
+    record[ownKey] = nullPrototypeRecords(
+      (value as Record<string, unknown>)[key],
+      prototypeKeySentinel,
+    );
+  }
+  return record;
+}
+
+function parseJson(rawText: string): JsonValue {
+  const { protectedText, sentinel } = protectPrototypeKeys(rawText);
+  return nullPrototypeRecords(parse(protectedText), sentinel);
 }
 
 function jsonString(value: string): string {
@@ -47,10 +143,56 @@ function compareUnicodeCodePoints(left: string, right: string): number {
   return leftPoints.length - rightPoints.length;
 }
 
+function pythonFloat(value: number): string {
+  if (Number.isNaN(value)) return "NaN";
+  if (value === Number.POSITIVE_INFINITY) return "Infinity";
+  if (value === Number.NEGATIVE_INFINITY) return "-Infinity";
+  if (Object.is(value, -0)) return "-0.0";
+  if (value === 0) return "0.0";
+
+  const sign = value < 0 ? "-" : "";
+  const [coefficient, exponentText] = Math.abs(value).toExponential().split("e");
+  const exponent = Number(exponentText);
+  const digits = coefficient!.replace(".", "");
+
+  // CPython repr/json use fixed notation for decimal exponents -4 through 15.
+  if (exponent >= -4 && exponent < 16) {
+    const point = exponent + 1;
+    if (point <= 0) {
+      return `${sign}0.${"0".repeat(-point)}${digits}`;
+    }
+    if (point >= digits.length) {
+      return `${sign}${digits}${"0".repeat(point - digits.length)}.0`;
+    }
+    return `${sign}${digits.slice(0, point)}.${digits.slice(point)}`;
+  }
+
+  const fraction = digits.length > 1 ? `.${digits.slice(1)}` : "";
+  const exponentSign = exponent >= 0 ? "+" : "-";
+  return `${sign}${digits[0]}${fraction}e${exponentSign}${String(
+    Math.abs(exponent),
+  ).padStart(2, "0")}`;
+}
+
+function canonicalNumber(value: LosslessNumber): string {
+  if (/^-?(?:0|[1-9][0-9]*)$/.test(value.value)) {
+    const digitCount = value.value.startsWith("-")
+      ? value.value.length - 1
+      : value.value.length;
+    if (digitCount > MAX_INTEGER_DIGITS) {
+      throw new Error(
+        `DeliverableManifest integer exceeds the ${MAX_INTEGER_DIGITS_LABEL}-digit limit`,
+      );
+    }
+    return value.value === "-0" ? "0" : value.value;
+  }
+  return pythonFloat(Number(value.value));
+}
+
 function canonicalJson(value: JsonValue): string {
   if (value === null || typeof value === "boolean") return String(value);
   if (typeof value === "string") return jsonString(value);
-  if (isLosslessNumber(value)) return value.value;
+  if (isNumberNode(value)) return canonicalNumber(value);
   if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
   const objectValue = value as { [key: string]: JsonValue };
   return `{${Object.keys(objectValue).sort(compareUnicodeCodePoints).map(
@@ -59,15 +201,31 @@ function canonicalJson(value: JsonValue): string {
 }
 
 function object(value: JsonValue, field: string): Record<string, JsonValue> {
-  if (value === null || Array.isArray(value) || typeof value !== "object" || isLosslessNumber(value)) {
+  if (value === null || Array.isArray(value) || typeof value !== "object" || isNumberNode(value)) {
     throw new Error(`DeliverableManifest.${field} must be an object`);
   }
   return value;
 }
 
+function required(
+  value: Record<string, JsonValue>,
+  key: string,
+  field: string,
+): JsonValue {
+  if (!Object.prototype.hasOwnProperty.call(value, key)) {
+    throw new Error(`DeliverableManifest.${field} is required`);
+  }
+  return value[key]!;
+}
+
 function integer(value: JsonValue, field: string): bigint {
-  if (!isLosslessNumber(value) || !/^(0|[1-9][0-9]*)$/.test(value.value)) {
+  if (!isNumberNode(value) || !/^(0|[1-9][0-9]*)$/.test(value.value)) {
     throw new Error(`DeliverableManifest.${field} must be an unsigned integer`);
+  }
+  if (value.value.length > MAX_INTEGER_DIGITS) {
+    throw new Error(
+      `DeliverableManifest.${field} integer exceeds the ${MAX_INTEGER_DIGITS_LABEL}-digit limit`,
+    );
   }
   return BigInt(value.value);
 }
@@ -97,32 +255,43 @@ export function verifyDeliverableManifest(
 
   let parsed: JsonValue;
   try {
-    parsed = parse(rawText) as JsonValue;
+    parsed = parseJson(rawText);
   } catch {
     throw new Error("DeliverableManifest is not valid JSON");
   }
 
   const manifest = object(parsed, "root");
-  if (integer(manifest["version"]!, "version") !== 1n) {
+  if (integer(required(manifest, "version", "version"), "version") !== 1n) {
     throw new Error("Unsupported DeliverableManifest version");
   }
-  if (integer(manifest["job_id"]!, "job_id") !== expected.jobId) {
+  if (integer(required(manifest, "job_id", "job_id"), "job_id") !== expected.jobId) {
     throw new Error("DeliverableManifest job_id does not match the current job");
   }
-  if (integer(manifest["chain_id"]!, "chain_id") !== expected.chainId) {
+  if (integer(required(manifest, "chain_id", "chain_id"), "chain_id") !== expected.chainId) {
     throw new Error("DeliverableManifest chain_id does not match the current chain");
   }
 
-  const contracts = object(manifest["contracts"]!, "contracts");
+  const contracts = object(required(manifest, "contracts", "contracts"), "contracts");
   for (const key of ["commerce", "router", "policy"] as const) {
-    if (address(contracts[key]!, `contracts.${key}`) !== getAddress(expected.contracts[key])) {
+    if (
+      address(
+        required(contracts, key, `contracts.${key}`),
+        `contracts.${key}`,
+      ) !== getAddress(expected.contracts[key])
+    ) {
       throw new Error(`DeliverableManifest contracts.${key} does not match configuration`);
     }
   }
 
-  const response = object(manifest["response"]!, "response");
-  const content = string(response["content"]!, "response.content");
-  string(response["content_type"]!, "response.content_type");
+  const response = object(required(manifest, "response", "response"), "response");
+  const content = string(
+    required(response, "content", "response.content"),
+    "response.content",
+  );
+  string(
+    required(response, "content_type", "response.content_type"),
+    "response.content_type",
+  );
 
   const actual = keccak256(toUtf8Bytes(canonicalJson(parsed)));
   if (actual.toLowerCase() !== expected.commitment.toLowerCase()) {
