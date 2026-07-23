@@ -163,6 +163,30 @@ class ReportBoundsTests(unittest.TestCase):
 
 
 class ReportPipelineTests(unittest.IsolatedAsyncioTestCase):
+    async def test_renders_fenced_json_with_braces_and_escapes_in_strings(self) -> None:
+        payload = json.loads(_valid_report_json())
+        summary = 'AAPL uses } plus an escaped "quote" and C:\\reports safely.'
+        payload["executive_summary"] = summary
+        fenced = f"Here is the report:\n```json\n{json.dumps(payload)}\n```\n"
+        calls = 0
+
+        async def call_runner(prompt: str, session_id: str) -> str:
+            nonlocal calls
+            self.assertEqual(session_id, "42")
+            calls += 1
+            return fenced
+
+        result = await generate_validated_report(
+            "original prompt",
+            session_id="42",
+            symbols=["AAPL"],
+            call_runner=call_runner,
+        )
+
+        self.assertEqual(calls, 1)
+        self.assertIn(summary, result)
+        self.assertNotEqual(result, SAFE_FAILURE_REPORT)
+
     async def test_preserves_valid_structured_report_rendering(self) -> None:
         calls = 0
 

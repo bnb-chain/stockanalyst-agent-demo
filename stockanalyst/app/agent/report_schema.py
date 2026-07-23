@@ -105,8 +105,8 @@ class SymbolAnalysis(_BoundedModel):
     technicals_commentary: str              # 2-3 sentences on the overall technical picture
 
     # ── Thesis ────────────────────────────────────────────────────────────
-    upside_catalysts: list[str]             # exactly 3, formal numbered prose
-    principal_risks: list[str]              # exactly 3, formal numbered prose
+    upside_catalysts: list[str]             # 3-10 items, formal numbered prose
+    principal_risks: list[str]              # 3-10 items, formal numbered prose
 
     # ── Sentiment ─────────────────────────────────────────────────────────
     insider_activity: str                   # e.g. "5 buy transactions by CFO/CEO (90 days)"

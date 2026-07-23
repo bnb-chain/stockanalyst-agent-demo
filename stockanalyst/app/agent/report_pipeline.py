@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
+import json
 import logging
 
 try:
@@ -20,21 +21,16 @@ _log = logging.getLogger("seller-agent.report_pipeline")
 
 
 def _extract_json(text: str) -> str:
-    stripped = text.strip()
-    if stripped.startswith("{") and stripped.endswith("}"):
-        return stripped
     start = text.find("{")
     if start == -1:
         raise ValueError("No JSON object found in LLM response")
-    depth = 0
-    for index, char in enumerate(text[start:], start):
-        if char == "{":
-            depth += 1
-        elif char == "}":
-            depth -= 1
-            if depth == 0:
-                return text[start:index + 1]
-    raise ValueError("Unmatched braces")
+    candidate = text[start:]
+    decoder = json.JSONDecoder()
+    try:
+        _, end = decoder.raw_decode(candidate)
+    except json.JSONDecodeError as error:
+        raise ValueError("Invalid JSON object in LLM response") from error
+    return candidate[:end]
 
 
 async def generate_validated_report(
