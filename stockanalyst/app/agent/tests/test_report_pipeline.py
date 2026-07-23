@@ -163,6 +163,58 @@ class ReportBoundsTests(unittest.TestCase):
 
 
 class ReportPipelineTests(unittest.IsolatedAsyncioTestCase):
+    async def test_prefers_fenced_report_after_invalid_braced_prose(self) -> None:
+        payload = json.loads(_valid_report_json())
+        payload["executive_summary"] = "Fenced report after braced prose."
+        response = (
+            "Here is {the requested report}:\n"
+            f"```json\n{json.dumps(payload)}\n```\n"
+        )
+        calls = 0
+
+        async def call_runner(prompt: str, session_id: str) -> str:
+            nonlocal calls
+            self.assertEqual(session_id, "42")
+            calls += 1
+            return response
+
+        result = await generate_validated_report(
+            "original prompt",
+            session_id="42",
+            symbols=["AAPL"],
+            call_runner=call_runner,
+        )
+
+        self.assertEqual(calls, 1)
+        self.assertIn("Fenced report after braced prose.", result)
+        self.assertNotEqual(result, SAFE_FAILURE_REPORT)
+
+    async def test_prefers_fenced_report_over_unrelated_json_preamble(self) -> None:
+        payload = json.loads(_valid_report_json())
+        payload["executive_summary"] = "Fenced report after JSON metadata."
+        response = (
+            'Metadata: {"status":"ready"}\n'
+            f"```json\n{json.dumps(payload)}\n```\n"
+        )
+        calls = 0
+
+        async def call_runner(prompt: str, session_id: str) -> str:
+            nonlocal calls
+            self.assertEqual(session_id, "42")
+            calls += 1
+            return response
+
+        result = await generate_validated_report(
+            "original prompt",
+            session_id="42",
+            symbols=["AAPL"],
+            call_runner=call_runner,
+        )
+
+        self.assertEqual(calls, 1)
+        self.assertIn("Fenced report after JSON metadata.", result)
+        self.assertNotEqual(result, SAFE_FAILURE_REPORT)
+
     async def test_renders_fenced_json_with_braces_and_escapes_in_strings(self) -> None:
         payload = json.loads(_valid_report_json())
         summary = 'AAPL uses } plus an escaped "quote" and C:\\reports safely.'

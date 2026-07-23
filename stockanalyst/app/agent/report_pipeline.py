@@ -1,8 +1,9 @@
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterator
 import json
 import logging
+import re
 
 try:
     from .report_renderer import render_report
@@ -18,9 +19,10 @@ The analysis engine could not produce a valid structured report. No unvalidated
 model output was delivered. Please retry with a new job."""
 
 _log = logging.getLogger("seller-agent.report_pipeline")
+_FENCED_JSON = re.compile(r"```(?:json)?\s*(.*?)```", re.DOTALL | re.IGNORECASE)
 
 
-def _extract_json(text: str) -> str:
+def _decode_json_object(text: str) -> str:
     start = text.find("{")
     if start == -1:
         raise ValueError("No JSON object found in LLM response")
@@ -33,6 +35,32 @@ def _extract_json(text: str) -> str:
     return candidate[:end]
 
 
+def _json_candidates(text: str) -> Iterator[str]:
+    seen: set[str] = set()
+    for match in _FENCED_JSON.finditer(text):
+        try:
+            candidate = _decode_json_object(match.group(1))
+        except ValueError:
+            continue
+        if candidate not in seen:
+            seen.add(candidate)
+            yield candidate
+
+    try:
+        candidate = _decode_json_object(text)
+    except ValueError:
+        return
+    if candidate not in seen:
+        yield candidate
+
+
+def _extract_json(text: str) -> str:
+    try:
+        return next(_json_candidates(text))
+    except StopIteration as error:
+        raise ValueError("No valid JSON object found in LLM response") from error
+
+
 async def generate_validated_report(
     prompt: str,
     *,
@@ -43,11 +71,17 @@ async def generate_validated_report(
     raw = await call_runner(prompt, session_id)
 
     def parse(value: str) -> StockReport | None:
+        error: Exception = ValueError("No valid JSON object found in LLM response")
         try:
-            return StockReport.model_validate_json(_extract_json(value))
-        except Exception as error:
-            _log.warning("report parse/validation failed: %s", error)
-            return None
+            for candidate in _json_candidates(value):
+                try:
+                    return StockReport.model_validate_json(candidate)
+                except Exception as candidate_error:
+                    error = candidate_error
+        except Exception as candidate_error:
+            error = candidate_error
+        _log.warning("report parse/validation failed: %s", error)
+        return None
 
     report = parse(raw)
     if report is None:
