@@ -446,6 +446,44 @@ test("does not authenticate raw locators normalized by URL parsing", async () =>
   );
 });
 
+test("does not authenticate empty query or fragment delimiters", async () => {
+  const calls: Array<{ url: string; init?: RequestInit }> = [];
+  const fakeFetch = async (
+    url: string | URL | Request,
+    init?: RequestInit,
+  ): Promise<Response> => {
+    calls.push({ url: String(url), init });
+    return new Response("ok");
+  };
+  const relay: GatewayRelay = {
+    localUrl: "http://127.0.0.1:9444",
+    publicUrl: "https://buyer.trycloudflare.com",
+    token: "gw-secret",
+    close() {},
+  };
+  const canonicalUrl =
+    "https://buyer.trycloudflare.com/v1/payload/"
+    + "pay_0123456789abcdef0123456789abcdef";
+  const delimitedUrls = [
+    `${canonicalUrl}?`,
+    `${canonicalUrl}#`,
+    `${canonicalUrl}?#`,
+  ];
+
+  for (const url of delimitedUrls) {
+    const target = new URL(url);
+    assert.equal(target.href, url);
+    assert.equal(target.search, "");
+    assert.equal(target.hash, "");
+    await fetchDeliverable(url, relay, fakeFetch);
+  }
+
+  assert.deepEqual(
+    calls.map((call) => new Headers(call.init?.headers).has("Authorization")),
+    delimitedUrls.map(() => false),
+  );
+});
+
 test("fetches without credentials when no relay is available", async () => {
   const calls: Array<{ url: string; init?: RequestInit }> = [];
   const fakeFetch = async (

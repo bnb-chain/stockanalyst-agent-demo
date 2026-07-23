@@ -59,7 +59,9 @@ export async function fetchDeliverable(
     new URL(relay.localUrl).origin,
   ]);
   const isCanonicalPayload =
-    target.href === url
+    !url.includes("?")
+    && !url.includes("#")
+    && target.href === url
     && !target.username
     && !target.password
     && !target.search
