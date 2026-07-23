@@ -20,8 +20,24 @@ const LOGO_SVG = `<svg width="54" height="54" viewBox="0 0 54 54" xmlns="http://
   <circle cx="13" cy="38" r="2.2" fill="#aab8d4"/>
 </svg>`;
 
+export interface ReportMeta {
+  jobId: string;
+  date: string;
+  symbols: string;
+}
+
+function escapeHtml(value: string): string {
+  return value.replace(/[&<>"']/g, (char) => ({
+    "&": "&amp;",
+    "<": "&lt;",
+    ">": "&gt;",
+    '"': "&quot;",
+    "'": "&#39;",
+  })[char] ?? char);
+}
+
 // ── HTML template ─────────────────────────────────────────────────────────────
-function buildHtml(markdownHtml: string, meta: { jobId: string; date: string; symbols: string }): string {
+function buildHtml(markdownHtml: string, meta: ReportMeta): string {
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -84,7 +100,7 @@ em{color:#5a6f8a}
 /* Code (used for tickers) */
 code{background:#e8ecf4;border-radius:3px;padding:1px 5px;font-family:monospace;font-size:9pt;color:var(--navy)}
 
-/* BUY / HOLD / SELL inline badges — applied by JS post-processing */
+/* BUY / HOLD / SELL inline badges — applied by trusted Markdown conversion */
 .badge{display:inline-block;padding:2px 9px;border-radius:3px;font-family:Arial,sans-serif;font-weight:700;font-size:9pt;color:#fff;letter-spacing:.5px}
 .badge-buy{background:var(--green)}
 .badge-hold{background:var(--amber)}
@@ -143,22 +159,6 @@ ${markdownHtml}
   <span class="right">This report is for informational purposes only and does not constitute investment advice.</span>
 </div>
 
-<script>
-// Post-process: badge-ify BUY / HOLD / SELL text in the rendered HTML
-(function(){
-  const body = document.getElementById('report-body');
-  if (!body) return;
-  body.innerHTML = body.innerHTML
-    .replace(/\b(BUY)\b/g, '<span class="badge badge-buy">BUY</span>')
-    .replace(/\b(HOLD)\b/g, '<span class="badge badge-hold">HOLD</span>')
-    .replace(/\b(SELL)\b/g, '<span class="badge badge-sell">SELL</span>');
-
-  // Colourise P&L numbers: e.g. +12.5% green, -3.2% red
-  body.innerHTML = body.innerHTML
-    .replace(/(\+\d+(?:\.\d+)?%)/g, '<span class="pos">$1</span>')
-    .replace(/(?<![="])(−|\-)\d+(?:\.\d+)?%/g, m => '<span class="neg">' + m + '</span>');
-})();
-</script>
 </body>
 </html>`;
 }
@@ -169,7 +169,12 @@ function inlineToHtml(s: string): string {
     .replace(/\*\*\*(.+?)\*\*\*/g, "<strong><em>$1</em></strong>")
     .replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>")
     .replace(/\*(.+?)\*/g, "<em>$1</em>")
-    .replace(/`([^`]+)`/g, "<code>$1</code>");
+    .replace(/`([^`]+)`/g, "<code>$1</code>")
+    .replace(/\b(BUY)\b/g, '<span class="badge badge-buy">BUY</span>')
+    .replace(/\b(HOLD)\b/g, '<span class="badge badge-hold">HOLD</span>')
+    .replace(/\b(SELL)\b/g, '<span class="badge badge-sell">SELL</span>')
+    .replace(/(\+\d+(?:\.\d+)?%)/g, '<span class="pos">$1</span>')
+    .replace(/(−|-)\d+(?:\.\d+)?%/g, (value) => `<span class="neg">${value}</span>`);
 }
 
 // ── Markdown → HTML ───────────────────────────────────────────────────────────
@@ -177,7 +182,7 @@ function mdToHtml(md: string): string {
   // Block-level element tag names — paragraph catch-all skips these
   const BLOCK = /^<(h[1-6]|table|thead|tbody|tr|ul|ol|li|blockquote|hr|div|p)\b/;
 
-  return md
+  return escapeHtml(md)
     // Fenced code blocks (strip — reports shouldn't have code)
     .replace(/```[\s\S]*?```/g, "")
     // HR
@@ -193,11 +198,6 @@ function mdToHtml(md: string): string {
       const clean = content.replace(/^#{1,4}\s+/, "");
       return `<blockquote><p>${inlineToHtml(clean)}</p></blockquote>`;
     })
-    // Inline markup for remaining prose (not already inside block tags)
-    .replace(/\*\*\*(.+?)\*\*\*/g, "<strong><em>$1</em></strong>")
-    .replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>")
-    .replace(/\*(.+?)\*/g, "<em>$1</em>")
-    .replace(/`([^`]+)`/g, "<code>$1</code>")
     // Unordered lists
     .replace(/^(\s*[-*] .+(\n\s*[-*] .+)*)/gm, (block) => {
       const items = block
@@ -248,10 +248,18 @@ function mdToHtml(md: string): string {
       if (BLOCK.test(line)) return line;
       // Already wrapped by a previous rule (e.g. heading lines that were converted inline)
       if (/^<(tr-row|cell)/.test(line)) return line;
-      return `<p>${line}</p>`;
+      return `<p>${inlineToHtml(line)}</p>`;
     })
     // Cleanup
     .replace(/<p>\s*<\/p>/g, "");
+}
+
+export function renderReportHtml(reportText: string, meta: ReportMeta): string {
+  return buildHtml(mdToHtml(reportText), {
+    jobId: escapeHtml(meta.jobId),
+    date: escapeHtml(meta.date),
+    symbols: escapeHtml(meta.symbols),
+  });
 }
 
 // ── Main export ───────────────────────────────────────────────────────────────
@@ -264,8 +272,7 @@ export async function saveReport(
     year: "numeric", month: "long", day: "numeric",
   });
   const meta = { jobId, date, symbols: symbols.join(", ") };
-  const markdownHtml = mdToHtml(reportText);
-  const html = buildHtml(markdownHtml, meta);
+  const html = renderReportHtml(reportText, meta);
 
   const base = `stock-analysis-${jobId}`;
   const htmlPath = resolve(process.cwd(), `${base}.html`);
