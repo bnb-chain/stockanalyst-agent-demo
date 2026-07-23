@@ -1,6 +1,12 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { renderPdf } from "./pdf-renderer.js";
+import { renderPdf, type PageLike } from "./pdf-renderer.js";
+
+const lifecycle: Parameters<PageLike["setContent"]>[1]["waitUntil"] = "domcontentloaded";
+// @ts-expect-error PDF rendering permits only the DOM content lifecycle event.
+const unsafeLifecycle: Parameters<PageLike["setContent"]>[1]["waitUntil"] = "networkidle0";
+void lifecycle;
+void unsafeLifecycle;
 
 test("renders with sandbox, JavaScript disabled, and every request aborted", async () => {
   const calls: string[] = [];
@@ -8,16 +14,20 @@ test("renders with sandbox, JavaScript disabled, and every request aborted", asy
   let launchOptions: Record<string, unknown> | undefined;
   let aborted = false;
 
-  const page = {
+  const setContent: PageLike["setContent"] = async (
+    _html: string,
+    options: { waitUntil: "domcontentloaded" },
+  ) => {
+    calls.push(`content:${options.waitUntil}`);
+  };
+  const page: PageLike = {
     async setJavaScriptEnabled(value: boolean) { calls.push(`js:${value}`); },
     async setRequestInterception(value: boolean) { calls.push(`intercept:${value}`); },
     on(event: string, handler: typeof requestHandler) {
       assert.equal(event, "request");
       requestHandler = handler;
     },
-    async setContent(_html: string, options: { waitUntil: string }) {
-      calls.push(`content:${options.waitUntil}`);
-    },
+    setContent,
     async pdf() { calls.push("pdf"); },
     async close() { calls.push("page-close"); },
   };

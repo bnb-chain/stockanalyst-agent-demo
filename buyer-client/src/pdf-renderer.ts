@@ -6,7 +6,7 @@ export interface PageLike {
   setJavaScriptEnabled(value: boolean): Promise<void>;
   setRequestInterception(value: boolean): Promise<void>;
   on(event: "request", handler: (request: RequestLike) => void): void;
-  setContent(html: string, options: { waitUntil: string }): Promise<void>;
+  setContent(html: string, options: { waitUntil: "domcontentloaded" }): Promise<void>;
   pdf(options: {
     path: string;
     format: string;
