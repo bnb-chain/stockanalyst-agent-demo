@@ -19,6 +19,11 @@ from typing import Any
 
 import requests
 
+try:
+    from .untrusted_text import normalize_untrusted_text
+except ImportError:
+    from untrusted_text import normalize_untrusted_text
+
 logger = logging.getLogger("seller-agent.data_sources")
 
 _EDGAR_HEADERS = {
@@ -26,6 +31,10 @@ _EDGAR_HEADERS = {
     "Accept-Encoding": "gzip, deflate",
 }
 _TIMEOUT = 10
+_MAX_HEADLINES = 5
+_MAX_HEADLINE_CHARS = 300
+_MAX_SOURCE_CHARS = 100
+_MAX_DATE_CHARS = 10
 
 
 # ── Macro context (FRED + VIX) ────────────────────────────────────────────────
@@ -233,13 +242,23 @@ def fetch_alpha_vantage_sentiment(symbol: str) -> dict[str, Any]:
         ticker_scores: list[float] = []
         headlines: list[str] = []
         for article in feed[:20]:
+            if not isinstance(article, dict):
+                continue
             for ts in article.get("ticker_sentiment", []):
+                if not isinstance(ts, dict):
+                    continue
                 if ts.get("ticker", "").upper() == symbol.upper():
                     try:
                         ticker_scores.append(float(ts["ticker_sentiment_score"]))
                     except (KeyError, ValueError):
                         pass
-            headlines.append(article.get("title", ""))
+            if len(headlines) < _MAX_HEADLINES:
+                headlines.append(
+                    normalize_untrusted_text(
+                        article.get("title", ""),
+                        max_chars=_MAX_HEADLINE_CHARS,
+                    )
+                )
 
         avg = sum(ticker_scores) / len(ticker_scores) if ticker_scores else 0.0
         label = (
@@ -255,7 +274,7 @@ def fetch_alpha_vantage_sentiment(symbol: str) -> dict[str, Any]:
             "sentiment_score": round(avg, 3),
             "sentiment_label": label,
             "article_count": len(feed),
-            "top_headlines": headlines[:5],
+            "top_headlines": headlines,
         }
     except Exception as e:
         logger.warning("Alpha Vantage sentiment failed for %s: %s", symbol, e)
@@ -295,18 +314,33 @@ def fetch_gnews_headlines(symbol: str, company_name: str = "") -> dict[str, Any]
         data = resp.json()
 
         articles = data.get("articles", [])
+        headlines: list[dict[str, str]] = []
+        for article in articles[:_MAX_HEADLINES]:
+            if not isinstance(article, dict):
+                headlines.append({"title": "", "source": "", "published": ""})
+                continue
+            source = article.get("source")
+            source_name = source.get("name", "") if isinstance(source, dict) else ""
+            headlines.append({
+                "title": normalize_untrusted_text(
+                    article.get("title", ""),
+                    max_chars=_MAX_HEADLINE_CHARS,
+                ),
+                "source": normalize_untrusted_text(
+                    source_name,
+                    max_chars=_MAX_SOURCE_CHARS,
+                ),
+                "published": normalize_untrusted_text(
+                    article.get("publishedAt", "")[:_MAX_DATE_CHARS]
+                    if isinstance(article.get("publishedAt"), str) else "",
+                    max_chars=_MAX_DATE_CHARS,
+                ),
+            })
         return {
             "symbol": symbol,
             "query": query,
             "total_results": data.get("totalArticles", len(articles)),
-            "headlines": [
-                {
-                    "title": a.get("title", ""),
-                    "source": (a.get("source") or {}).get("name", ""),
-                    "published": (a.get("publishedAt") or "")[:10],
-                }
-                for a in articles
-            ],
+            "headlines": headlines,
         }
     except Exception as e:
         logger.warning("GNews fetch failed for %s: %s", symbol, e)
