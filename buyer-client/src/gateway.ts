@@ -65,6 +65,25 @@ function sendNotFound(res: ServerResponse): void {
   res.end(JSON.stringify({ error: { code: "NOT_FOUND", message: "Payload not found" } }));
 }
 
+function sendUploadError(
+  res: ServerResponse,
+  status: number,
+  code: string,
+  message: string,
+): void {
+  if (res.headersSent || res.writableEnded || res.destroyed) return;
+  res.writeHead(status, {
+    "Content-Type": "application/json",
+    "Connection": "close",
+  });
+  res.end(JSON.stringify({ error: { code, message } }));
+}
+
+function drainRequest(req: IncomingMessage): void {
+  req.on("error", () => undefined);
+  req.resume();
+}
+
 /**
  * Create an isolated handler for one relay. Its payload store intentionally
  * belongs to this closure so concurrently running relays cannot share data.
@@ -75,6 +94,14 @@ export function createGatewayHandler(
 ): RequestListener {
   const payloads = new Map<string, Buffer>();
   const idFactory = options.idFactory ?? (() => `pay_${randomBytes(16).toString("hex")}`);
+  const limits: RelayLimits = {
+    maxPayloadBytes: options.limits?.maxPayloadBytes ?? MAX_PAYLOAD_BYTES,
+    maxRelayBytes: options.limits?.maxRelayBytes ?? MAX_RELAY_BYTES,
+    maxPayloads: options.limits?.maxPayloads ?? MAX_RELAY_PAYLOADS,
+  };
+  let storedBytes = 0;
+  let inFlightBytes = 0;
+  let activeUploads = 0;
 
   return (
     req: IncomingMessage,
@@ -93,21 +120,115 @@ export function createGatewayHandler(
     if (method === "POST" && url === "/v1/payload/upload") {
       if (!hasBearer(req, token)) {
         sendUnauthorized(res);
-        req.resume();
+        drainRequest(req);
+        return;
+      }
+
+      const contentLengthHeader = req.headers["content-length"];
+      let declaredBytes = 0;
+      if (contentLengthHeader !== undefined) {
+        if (
+          typeof contentLengthHeader !== "string"
+          || !/^[0-9]+$/.test(contentLengthHeader)
+        ) {
+          sendUploadError(res, 400, "BAD_REQUEST", "Invalid Content-Length");
+          drainRequest(req);
+          return;
+        }
+        const declaredBigInt = BigInt(contentLengthHeader);
+        if (declaredBigInt > BigInt(limits.maxPayloadBytes)) {
+          sendUploadError(res, 413, "PAYLOAD_TOO_LARGE", "Payload exceeds byte limit");
+          drainRequest(req);
+          return;
+        }
+        declaredBytes = Number(declaredBigInt);
+      }
+
+      if (payloads.size + activeUploads >= limits.maxPayloads) {
+        sendUploadError(res, 507, "INSUFFICIENT_STORAGE", "Payload slot limit reached");
+        drainRequest(req);
+        return;
+      }
+      if (declaredBytes > limits.maxRelayBytes - storedBytes - inFlightBytes) {
+        sendUploadError(res, 507, "INSUFFICIENT_STORAGE", "Relay byte limit reached");
+        drainRequest(req);
         return;
       }
 
       const chunks: Buffer[] = [];
-      req.on("data", (chunk: Buffer) => chunks.push(chunk));
+      let receivedBytes = 0;
+      let reservedBytes = declaredBytes;
+      let terminal = false;
+      let released = false;
+      activeUploads += 1;
+      inFlightBytes += declaredBytes;
+
+      const release = (committedBytes?: number): void => {
+        if (released) return;
+        released = true;
+        inFlightBytes -= reservedBytes;
+        activeUploads -= 1;
+        if (committedBytes !== undefined) {
+          storedBytes += committedBytes;
+        }
+        chunks.length = 0;
+      };
+
+      const rejectUpload = (
+        status: number,
+        code: string,
+        message: string,
+      ): void => {
+        if (terminal) return;
+        terminal = true;
+        release();
+        sendUploadError(res, status, code, message);
+        req.resume();
+      };
+
+      req.on("data", (chunk: Buffer) => {
+        if (terminal) return;
+        const nextReceivedBytes = receivedBytes + chunk.byteLength;
+        if (nextReceivedBytes > limits.maxPayloadBytes) {
+          rejectUpload(413, "PAYLOAD_TOO_LARGE", "Payload exceeds byte limit");
+          return;
+        }
+
+        const additionalBytes = Math.max(0, nextReceivedBytes - reservedBytes);
+        if (additionalBytes > limits.maxRelayBytes - storedBytes - inFlightBytes) {
+          rejectUpload(507, "INSUFFICIENT_STORAGE", "Relay byte limit reached");
+          return;
+        }
+        if (additionalBytes > 0) {
+          reservedBytes += additionalBytes;
+          inFlightBytes += additionalBytes;
+        }
+        receivedBytes = nextReceivedBytes;
+        chunks.push(chunk);
+      });
       req.on("end", () => {
+        if (terminal) return;
         let id = idFactory();
         while (payloads.has(id)) {
           id = idFactory();
         }
-        const data = Buffer.concat(chunks);
+        const data = Buffer.concat(chunks, receivedBytes);
         payloads.set(id, data);
+        terminal = true;
+        release(data.byteLength);
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ payload_id: id, size: data.byteLength }));
+      });
+      req.on("aborted", () => {
+        rejectUpload(400, "BAD_REQUEST", "Upload aborted");
+      });
+      req.on("error", () => {
+        rejectUpload(400, "BAD_REQUEST", "Upload failed");
+      });
+      req.on("close", () => {
+        if (!terminal) {
+          rejectUpload(400, "BAD_REQUEST", "Upload closed before completion");
+        }
       });
       return;
     }
