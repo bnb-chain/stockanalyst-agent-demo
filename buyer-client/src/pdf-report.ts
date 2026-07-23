@@ -6,9 +6,11 @@
  * Falls back to saving an HTML file if Chrome is unavailable.
  */
 
-import { writeFileSync } from "fs";
+import { rmSync, writeFileSync } from "fs";
 import { resolve } from "path";
 import { renderPdf, type PuppeteerLike } from "./pdf-renderer.js";
+
+const MAX_UINT256_DECIMAL = "115792089237316195423570985008687907853269984665640564039457584007913129639935";
 
 // ── Logo SVG (inline, no external deps) ──────────────────────────────────────
 const LOGO_SVG = `<svg width="54" height="54" viewBox="0 0 54 54" xmlns="http://www.w3.org/2000/svg">
@@ -265,12 +267,23 @@ export function renderReportHtml(reportText: string, meta: ReportMeta): string {
 
 export type PdfRenderer = (html: string, pdfPath: string) => Promise<void>;
 
+function assertCanonicalUint256(jobId: string): void {
+  if (
+    typeof jobId !== "string"
+    || !/^(0|[1-9]\d{0,77})$/.test(jobId)
+    || (jobId.length === MAX_UINT256_DECIMAL.length && jobId > MAX_UINT256_DECIMAL)
+  ) {
+    throw new TypeError("jobId must be a canonical decimal uint256");
+  }
+}
+
 export async function saveReportWithRenderer(
   reportText: string,
   jobId: string,
   symbols: string[],
   renderer: PdfRenderer,
 ): Promise<{ pdfPath: string | null; htmlPath: string }> {
+  assertCanonicalUint256(jobId);
   const date = new Date().toLocaleDateString("en-GB", {
     year: "numeric", month: "long", day: "numeric",
   });
@@ -285,6 +298,11 @@ export async function saveReportWithRenderer(
     await renderer(html, candidatePdfPath);
     return { pdfPath: candidatePdfPath, htmlPath };
   } catch {
+    try {
+      rmSync(candidatePdfPath, { force: true });
+    } catch {
+      // Preserve the inert HTML fallback if cleanup fails.
+    }
     return { pdfPath: null, htmlPath };
   }
 }

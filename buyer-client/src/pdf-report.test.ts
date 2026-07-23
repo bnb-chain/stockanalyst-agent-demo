@@ -1,5 +1,12 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import test from "node:test";
@@ -68,31 +75,66 @@ test("contains no browser-side script while preserving report styling", () => {
   assert.match(html, /<table>/);
 });
 
-test("keeps an inert HTML fallback when PDF rendering fails", async () => {
+test("removes a partial PDF while keeping an inert HTML fallback when rendering fails", async () => {
   await inTemporaryWorkingDirectory(async (directory) => {
     const result = await saveReportWithRenderer(
       "<script>alert('unsafe')</script>",
-      "render-failure",
+      "42",
       ["AAPL"],
-      async () => { throw new Error("sandbox unavailable"); },
+      async (_html, pdfPath) => {
+        writeFileSync(pdfPath, "partial pdf", "utf8");
+        throw new Error("sandbox unavailable");
+      },
     );
 
     assert.equal(result.pdfPath, null);
-    assert.equal(result.htmlPath, resolve(directory, "stock-analysis-render-failure.html"));
+    assert.equal(result.htmlPath, resolve(directory, "stock-analysis-42.html"));
+    assert.equal(existsSync(resolve(directory, "stock-analysis-42.pdf")), false);
     const html = readFileSync(result.htmlPath, "utf8");
     assert.match(html, /&lt;script&gt;/);
     assert.doesNotMatch(html, /<script\b/i);
   });
 });
 
+test("rejects noncanonical job IDs before writing files or calling the renderer", async () => {
+  await inTemporaryWorkingDirectory(async (directory) => {
+    const outsidePath = resolve(directory, "..", "pdf-report-escape.html");
+    const invalidJobIds = [
+      "01",
+      "",
+      "+1",
+      "-1",
+      " 1",
+      "1 ",
+      "1.0",
+      "1_000",
+      "0x1",
+      "..//..//../pdf-report-escape",
+      "115792089237316195423570985008687907853269984665640564039457584007913129639936",
+    ];
+    let rendererCalls = 0;
+
+    for (const jobId of invalidJobIds) {
+      await assert.rejects(
+        saveReportWithRenderer("safe", jobId, ["AAPL"], async () => { rendererCalls += 1; }),
+        /canonical decimal uint256/,
+      );
+    }
+
+    assert.equal(rendererCalls, 0);
+    assert.equal(existsSync(outsidePath), false);
+    assert.deepEqual(readdirSync(directory), []);
+  });
+});
+
 test("passes the saved inert HTML to a successful PDF renderer", async () => {
   await inTemporaryWorkingDirectory(async (directory) => {
     let renderedHtml: string | undefined;
-    const expectedPdfPath = resolve(directory, "stock-analysis-render-success.pdf");
+    const expectedPdfPath = resolve(directory, "stock-analysis-43.pdf");
 
     const result = await saveReportWithRenderer(
       "# **BUY** AAPL",
-      "render-success",
+      "43",
       ["AAPL"],
       async (html, pdfPath) => {
         renderedHtml = html;
@@ -102,7 +144,7 @@ test("passes the saved inert HTML to a successful PDF renderer", async () => {
     );
 
     assert.equal(result.pdfPath, expectedPdfPath);
-    assert.equal(result.htmlPath, resolve(directory, "stock-analysis-render-success.html"));
+    assert.equal(result.htmlPath, resolve(directory, "stock-analysis-43.html"));
     assert.equal(renderedHtml, readFileSync(result.htmlPath, "utf8"));
     assert.match(renderedHtml ?? "", /badge-buy/);
   });
