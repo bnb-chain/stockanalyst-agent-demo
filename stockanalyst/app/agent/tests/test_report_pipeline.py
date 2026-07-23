@@ -163,6 +163,33 @@ class ReportBoundsTests(unittest.TestCase):
 
 
 class ReportPipelineTests(unittest.IsolatedAsyncioTestCase):
+    async def test_fenced_report_allows_triple_backticks_inside_json_string(self) -> None:
+        payload = json.loads(_valid_report_json())
+        summary = "AAPL safely describes ```code``` markers in prose."
+        payload["executive_summary"] = summary
+        response = (
+            'Context {requested}; metadata: {"status":"ready"}\n'
+            f"```json\n{json.dumps(payload)}\n```\n"
+        )
+        calls = 0
+
+        async def call_runner(prompt: str, session_id: str) -> str:
+            nonlocal calls
+            self.assertEqual(session_id, "42")
+            calls += 1
+            return response
+
+        result = await generate_validated_report(
+            "original prompt",
+            session_id="42",
+            symbols=["AAPL"],
+            call_runner=call_runner,
+        )
+
+        self.assertEqual(calls, 1)
+        self.assertIn(summary, result)
+        self.assertNotEqual(result, SAFE_FAILURE_REPORT)
+
     async def test_prefers_fenced_report_after_invalid_braced_prose(self) -> None:
         payload = json.loads(_valid_report_json())
         payload["executive_summary"] = "Fenced report after braced prose."

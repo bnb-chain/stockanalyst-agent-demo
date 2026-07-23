@@ -19,7 +19,7 @@ The analysis engine could not produce a valid structured report. No unvalidated
 model output was delivered. Please retry with a new job."""
 
 _log = logging.getLogger("seller-agent.report_pipeline")
-_FENCED_JSON = re.compile(r"```(?:json)?\s*(.*?)```", re.DOTALL | re.IGNORECASE)
+_FENCE_OPEN = re.compile(r"```(?:json\b)?\s*(?=\{)", re.IGNORECASE)
 
 
 def _decode_json_object(text: str) -> str:
@@ -37,9 +37,9 @@ def _decode_json_object(text: str) -> str:
 
 def _json_candidates(text: str) -> Iterator[str]:
     seen: set[str] = set()
-    for match in _FENCED_JSON.finditer(text):
+    for match in _FENCE_OPEN.finditer(text):
         try:
-            candidate = _decode_json_object(match.group(1))
+            candidate = _decode_json_object(text[match.end():])
         except ValueError:
             continue
         if candidate not in seen:
