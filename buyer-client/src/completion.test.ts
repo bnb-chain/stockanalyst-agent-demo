@@ -1,7 +1,11 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { keccak256, toUtf8Bytes } from "ethers";
-import { completeSubmittedJob, type CompletionDependencies } from "./completion.js";
+import {
+  completeSubmittedJob,
+  SettlementAttemptError,
+  type CompletionDependencies,
+} from "./completion.js";
 import { MAX_PAYLOAD_BYTES } from "./gateway.js";
 
 const jobId = 42n;
@@ -74,4 +78,48 @@ test("rendering failure is reported but does not block a verified settlement", a
   );
   assert.match(result.renderError ?? "", /Chrome unavailable/);
   assert.equal(fixture.settleCalls(), 1);
+});
+
+test("a pre-verification DisputeWindow error stays blocked and never settles", async () => {
+  const fixture = dependencies({
+    fetchDeliverable: async () => { throw new Error("DisputeWindowActive"); },
+  });
+  await assert.rejects(
+    completeSubmittedJob(
+      { jobId, fundTxBlock: 1, chainId: 97n, contracts },
+      fixture.deps,
+    ),
+    (error: unknown) => {
+      if (!(error instanceof Error)) return false;
+      assert.match(error.message, /settlement blocked/i);
+      assert.equal(error instanceof SettlementAttemptError, false);
+      return true;
+    },
+  );
+  assert.equal(fixture.settleCalls(), 0);
+});
+
+test("a settle-stage DisputeWindow error is distinguishable for CLI guidance", async () => {
+  let settleCalls = 0;
+  const fixture = dependencies({
+    settle: async () => {
+      settleCalls += 1;
+      throw new Error("DisputeWindowActive");
+    },
+  });
+  await assert.rejects(
+    completeSubmittedJob(
+      { jobId, fundTxBlock: 1, chainId: 97n, contracts },
+      fixture.deps,
+    ),
+    (error: unknown) => {
+      if (!(error instanceof Error)) return false;
+      if (!(error instanceof SettlementAttemptError)) return false;
+      const cause = (error as Error & { cause?: unknown }).cause;
+      if (!(cause instanceof Error)) return false;
+      assert.match(cause.message, /DisputeWindowActive/);
+      return true;
+    },
+  );
+  assert.equal(settleCalls, 1);
 });

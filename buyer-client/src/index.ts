@@ -33,7 +33,7 @@ import {
   type GatewayRelay,
 } from "./gateway.js";
 import { saveReport } from "./pdf-report.js";
-import { completeSubmittedJob } from "./completion.js";
+import { completeSubmittedJob, SettlementAttemptError } from "./completion.js";
 
 // ── Config from environment ──────────────────────────────────────────────────
 const KEYSTORE_PATH  = process.env["KEYSTORE_PATH"]  ?? "../stockanalyst/.studio/wallets/0x1FF095E1C5Cf4bC72a3DC54be17B6cf85043Fb67.json";
@@ -203,19 +203,22 @@ async function main(): Promise<void> {
       `  Seller received: ${priceU} U`,
     ]);
   } catch (err: unknown) {
-    const msg = err instanceof Error ? err.message : String(err);
     // 0x17be5b7b = DisputeWindowActive — settle requires waiting 24h after submission
-    if (msg.includes("17be5b7b") || msg.includes("DisputeWindow")) {
-      console.log("  ⚠  Dispute window still active (24h on BSC testnet).");
-      console.log("     Run settle manually after the window elapses:");
-      console.log(`     bag erc8183 settle ${buy.jobId}`);
-      banner([
-        `✓ E2E PASSED — job #${buy.jobId} SUBMITTED (settle pending dispute window)`,
-        `  Run: bag erc8183 settle ${buy.jobId}  (available after ~24h)`,
-      ]);
-    } else {
-      throw err;
+    if (err instanceof SettlementAttemptError) {
+      const cause = err.cause;
+      const msg = cause instanceof Error ? cause.message : String(cause);
+      if (msg.includes("17be5b7b") || msg.includes("DisputeWindow")) {
+        console.log("  ⚠  Dispute window still active (24h on BSC testnet).");
+        console.log("     Run settle manually after the window elapses:");
+        console.log(`     bag erc8183 settle ${buy.jobId}`);
+        banner([
+          `✓ E2E PASSED — job #${buy.jobId} SUBMITTED (settle pending dispute window)`,
+          `  Run: bag erc8183 settle ${buy.jobId}  (available after ~24h)`,
+        ]);
+        return;
+      }
     }
+    throw err;
   }
 }
 

@@ -25,6 +25,14 @@ export interface CompletionResult {
   renderError?: string;
 }
 
+export class SettlementAttemptError extends Error {
+  constructor(cause: unknown) {
+    const message = cause instanceof Error ? cause.message : String(cause);
+    super(message, { cause });
+    this.name = "SettlementAttemptError";
+  }
+}
+
 function blocked(reason: string): Error {
   return new Error(`Settlement blocked: ${reason}`);
 }
@@ -115,6 +123,11 @@ export async function completeSubmittedJob(
     renderError = error instanceof Error ? error.message : String(error);
   }
 
-  const settleTx = await dependencies.settle(params.jobId);
+  let settleTx: string;
+  try {
+    settleTx = await dependencies.settle(params.jobId);
+  } catch (error) {
+    throw new SettlementAttemptError(error);
+  }
   return { reportText, settleTx, ...(renderError ? { renderError } : {}) };
 }
