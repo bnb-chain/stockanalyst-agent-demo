@@ -1,6 +1,23 @@
 import assert from "node:assert/strict";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
 import test from "node:test";
-import { renderReportHtml } from "./pdf-report.js";
+import { renderReportHtml, saveReportWithRenderer } from "./pdf-report.js";
+
+async function inTemporaryWorkingDirectory(
+  run: (directory: string) => Promise<void>,
+): Promise<void> {
+  const directory = mkdtempSync(join(tmpdir(), "stockanalyst-pdf-report-"));
+  const previousDirectory = process.cwd();
+  process.chdir(directory);
+  try {
+    await run(process.cwd());
+  } finally {
+    process.chdir(previousDirectory);
+    rmSync(directory, { recursive: true, force: true });
+  }
+}
 
 test("renders seller HTML payloads as inert text", () => {
   const payloads = [
@@ -49,4 +66,44 @@ test("contains no browser-side script while preserving report styling", () => {
   assert.match(html, /class="pos"/);
   assert.match(html, /class="neg"/);
   assert.match(html, /<table>/);
+});
+
+test("keeps an inert HTML fallback when PDF rendering fails", async () => {
+  await inTemporaryWorkingDirectory(async (directory) => {
+    const result = await saveReportWithRenderer(
+      "<script>alert('unsafe')</script>",
+      "render-failure",
+      ["AAPL"],
+      async () => { throw new Error("sandbox unavailable"); },
+    );
+
+    assert.equal(result.pdfPath, null);
+    assert.equal(result.htmlPath, resolve(directory, "stock-analysis-render-failure.html"));
+    const html = readFileSync(result.htmlPath, "utf8");
+    assert.match(html, /&lt;script&gt;/);
+    assert.doesNotMatch(html, /<script\b/i);
+  });
+});
+
+test("passes the saved inert HTML to a successful PDF renderer", async () => {
+  await inTemporaryWorkingDirectory(async (directory) => {
+    let renderedHtml: string | undefined;
+    const expectedPdfPath = resolve(directory, "stock-analysis-render-success.pdf");
+
+    const result = await saveReportWithRenderer(
+      "# **BUY** AAPL",
+      "render-success",
+      ["AAPL"],
+      async (html, pdfPath) => {
+        renderedHtml = html;
+        assert.equal(pdfPath, expectedPdfPath);
+        writeFileSync(pdfPath, "pdf", "utf8");
+      },
+    );
+
+    assert.equal(result.pdfPath, expectedPdfPath);
+    assert.equal(result.htmlPath, resolve(directory, "stock-analysis-render-success.html"));
+    assert.equal(renderedHtml, readFileSync(result.htmlPath, "utf8"));
+    assert.match(renderedHtml ?? "", /badge-buy/);
+  });
 });

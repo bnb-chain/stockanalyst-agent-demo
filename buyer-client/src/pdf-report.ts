@@ -8,6 +8,7 @@
 
 import { writeFileSync } from "fs";
 import { resolve } from "path";
+import { renderPdf, type PuppeteerLike } from "./pdf-renderer.js";
 
 // ── Logo SVG (inline, no external deps) ──────────────────────────────────────
 const LOGO_SVG = `<svg width="54" height="54" viewBox="0 0 54 54" xmlns="http://www.w3.org/2000/svg">
@@ -262,59 +263,40 @@ export function renderReportHtml(reportText: string, meta: ReportMeta): string {
   });
 }
 
+export type PdfRenderer = (html: string, pdfPath: string) => Promise<void>;
+
+export async function saveReportWithRenderer(
+  reportText: string,
+  jobId: string,
+  symbols: string[],
+  renderer: PdfRenderer,
+): Promise<{ pdfPath: string | null; htmlPath: string }> {
+  const date = new Date().toLocaleDateString("en-GB", {
+    year: "numeric", month: "long", day: "numeric",
+  });
+  const html = renderReportHtml(reportText, { jobId, date, symbols: symbols.join(", ") });
+
+  const base = `stock-analysis-${jobId}`;
+  const htmlPath = resolve(process.cwd(), `${base}.html`);
+  const candidatePdfPath = resolve(process.cwd(), `${base}.pdf`);
+  writeFileSync(htmlPath, html, "utf8");
+
+  try {
+    await renderer(html, candidatePdfPath);
+    return { pdfPath: candidatePdfPath, htmlPath };
+  } catch {
+    return { pdfPath: null, htmlPath };
+  }
+}
+
 // ── Main export ───────────────────────────────────────────────────────────────
 export async function saveReport(
   reportText: string,
   jobId: string,
   symbols: string[],
 ): Promise<{ pdfPath: string | null; htmlPath: string }> {
-  const date = new Date().toLocaleDateString("en-GB", {
-    year: "numeric", month: "long", day: "numeric",
-  });
-  const meta = { jobId, date, symbols: symbols.join(", ") };
-  const html = renderReportHtml(reportText, meta);
-
-  const base = `stock-analysis-${jobId}`;
-  const htmlPath = resolve(process.cwd(), `${base}.html`);
-  writeFileSync(htmlPath, html, "utf8");
-
-  // Try puppeteer PDF generation
-  let pdfPath: string | null = null;
-  try {
-    // Dynamic import so a missing puppeteer doesn't crash the whole process
+  return saveReportWithRenderer(reportText, jobId, symbols, async (html, pdfPath) => {
     const puppeteer = await import("puppeteer" as string);
-    // Prefer system Chrome on macOS if puppeteer's bundled Chrome failed to extract
-    const systemChrome = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
-    const { existsSync } = await import("fs");
-    const launchOpts: Record<string, unknown> = {
-      headless: true,
-      args: ["--no-sandbox", "--disable-setuid-sandbox"],
-    };
-    if (existsSync(systemChrome)) launchOpts["executablePath"] = systemChrome;
-    const browser = await (puppeteer as unknown as {
-      launch: (opts: object) => Promise<{
-        newPage: () => Promise<{
-          setContent: (html: string, opts: object) => Promise<void>;
-          pdf: (opts: object) => Promise<Buffer>;
-          close: () => Promise<void>;
-        }>;
-        close: () => Promise<void>;
-      }>;
-    }).launch(launchOpts);
-
-    const page = await browser.newPage();
-    await page.setContent(html, { waitUntil: "networkidle0" });
-    pdfPath = resolve(process.cwd(), `${base}.pdf`);
-    await page.pdf({
-      path: pdfPath,
-      format: "A4",
-      printBackground: true,
-      margin: { top: "0", right: "0", bottom: "0", left: "0" },
-    });
-    await browser.close();
-  } catch {
-    // puppeteer not installed or Chrome unavailable — HTML is the fallback
-  }
-
-  return { pdfPath, htmlPath };
+    await renderPdf(puppeteer as unknown as PuppeteerLike, html, pdfPath);
+  });
 }
