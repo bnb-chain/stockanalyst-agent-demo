@@ -6,12 +6,39 @@ All validation happens here — the renderer trusts the models are clean.
 """
 from __future__ import annotations
 
-from typing import Literal
+import math
+from typing import Any, Literal
 
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
-class ClientPosition(BaseModel):
+_MAX_MODEL_STRING_CHARS = 8_192
+
+
+def _validate_bounded_value(value: Any) -> None:
+    if isinstance(value, str):
+        if len(value) > _MAX_MODEL_STRING_CHARS:
+            raise ValueError("model string exceeds 8192 characters")
+        return
+    if isinstance(value, float) and not math.isfinite(value):
+        raise ValueError("model number must be finite")
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            _validate_bounded_value(item)
+    elif isinstance(value, dict):
+        for item in value.values():
+            _validate_bounded_value(item)
+
+
+class _BoundedModel(BaseModel):
+    @model_validator(mode="after")
+    def validate_bounded_values(self):
+        for name in type(self).model_fields:
+            _validate_bounded_value(getattr(self, name))
+        return self
+
+
+class ClientPosition(_BoundedModel):
     shares: float
     avg_cost: float
     unrealised_pnl_pct: float
@@ -20,7 +47,7 @@ class ClientPosition(BaseModel):
     action_summary: str         # e.g. "Hold — technical setup intact above stop-loss"
 
 
-class MacroSnapshot(BaseModel):
+class MacroSnapshot(_BoundedModel):
     vix: str
     vix_signal: str
     fed_rate: str
@@ -32,7 +59,7 @@ class MacroSnapshot(BaseModel):
     macro_posture: str          # 1-2 sentences: overall risk-on / risk-off verdict
 
 
-class SymbolAnalysis(BaseModel):
+class SymbolAnalysis(_BoundedModel):
     # ── Header ───────────────────────────────────────────────────────────────
     symbol: str
     company_name: str
@@ -94,13 +121,13 @@ class SymbolAnalysis(BaseModel):
 
     @field_validator("upside_catalysts", "principal_risks")
     @classmethod
-    def at_least_three(cls, v: list[str]) -> list[str]:
-        if len(v) < 3:
-            raise ValueError(f"must have at least 3 items, got {len(v)}")
+    def between_three_and_ten(cls, v: list[str]) -> list[str]:
+        if not 3 <= len(v) <= 10:
+            raise ValueError(f"must have between 3 and 10 items, got {len(v)}")
         return v
 
 
-class PortfolioAction(BaseModel):
+class PortfolioAction(_BoundedModel):
     priority: int
     action: Literal["Trim", "Add", "New Buy", "Hold"]
     symbol: str
@@ -110,7 +137,7 @@ class PortfolioAction(BaseModel):
     rationale: str      # one sentence, references a specific finding
 
 
-class StopLossEntry(BaseModel):
+class StopLossEntry(_BoundedModel):
     symbol: str
     avg_cost: float
     stop_loss_level: float
@@ -120,7 +147,7 @@ class StopLossEntry(BaseModel):
     technical_basis: str    # e.g. "MA-200 at $175.80 — closes below on weekly basis"
 
 
-class WatchlistEntry(BaseModel):
+class WatchlistEntry(_BoundedModel):
     ticker: str
     company: str
     strategic_rationale: str    # one sentence: why relevant to this portfolio
@@ -130,18 +157,18 @@ class WatchlistEntry(BaseModel):
     thesis: str                 # 2 sentences of investment thesis
 
 
-class RiskEntry(BaseModel):
+class RiskEntry(_BoundedModel):
     factor: str
     assessment: Literal["Low", "Moderate", "High"]
     supporting_observation: str # specific data point
     threshold_to_act: str       # the trigger level or event
 
 
-class StockReport(BaseModel):
+class StockReport(_BoundedModel):
     executive_summary: str      # 3-5 sentences: macro backdrop + one-line per stock + top action
     macro_snapshot: MacroSnapshot
-    analyses: list[SymbolAnalysis]  # one entry per requested symbol — validated in code
-    portfolio_actions: list[PortfolioAction]
-    stop_losses: list[StopLossEntry]
-    watchlist: list[WatchlistEntry]     # 3-5 entries
-    risk_factors: list[RiskEntry]       # 5 rows: concentration, rate, correlation, VaR, liquidity
+    analyses: list[SymbolAnalysis] = Field(max_length=10)  # one entry per requested symbol
+    portfolio_actions: list[PortfolioAction] = Field(max_length=50)
+    stop_losses: list[StopLossEntry] = Field(max_length=50)
+    watchlist: list[WatchlistEntry] = Field(max_length=5)     # 3-5 entries
+    risk_factors: list[RiskEntry] = Field(max_length=5)       # 5 dashboard rows

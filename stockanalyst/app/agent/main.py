@@ -40,7 +40,6 @@ import asyncio
 import json
 import logging
 import os
-import re
 import sys
 from typing import AsyncGenerator
 
@@ -56,9 +55,10 @@ from bnbagent_studio_core.wallet import (
 
 from agent_card import build_agent_card
 from executor import SellerAgentExecutor
+from report_pipeline import generate_validated_report
+from tools import LLM_READ_TOOLS
 from report_schema import StockReport
 from report_renderer import render_report
-from tools import LLM_READ_TOOLS
 
 APP_NAME = "agent"
 
@@ -255,7 +255,6 @@ def _extract_json(text: str) -> str:
 
 _log = logging.getLogger("seller-agent")
 
-
 async def _call_runner(prompt: str, session_id: str) -> str:
     """Run the ADK runner once and return raw final-response text (thought-filtered)."""
     session_service = runner.session_service
@@ -294,46 +293,12 @@ async def _run_llm(
     session_id: str,
     symbols: list[str] | None = None,
 ) -> str:
-    """Run the agent, parse its JSON output, validate the schema, render Markdown.
-
-    Flow:
-      1. Call the ADK runner → raw LLM text (thinking stripped).
-      2. Extract the JSON object from the text.
-      3. Parse + validate with StockReport (Pydantic).
-      4. Check that every requested symbol has an analyses entry.
-      5. Render to institutional Markdown via report_renderer.
-      On parse/validation failure: retry once with a correction prompt,
-      then fall back to delivering the raw LLM text so the buyer always gets
-      something.
-    """
-    raw = await _call_runner(prompt, session_id)
-
-    report = _try_parse_report(raw)
-
-    if report is None:
-        # Retry: ask the model to fix its output in the same session
-        _log.info("retrying with correction prompt (session %s)", session_id)
-        correction = (
-            "Your previous response could not be parsed as valid JSON matching the StockReport schema. "
-            "Output ONLY the corrected JSON object — no text before or after it, no code fences. "
-            "Ensure the analyses array has one entry per symbol and all required fields are present."
-        )
-        raw2 = await _call_runner(correction, session_id)
-        report = _try_parse_report(raw2)
-
-    if report is None:
-        _log.error("structured output failed after retry (session %s); delivering raw text", session_id)
-        return raw  # fall back: buyer still gets the LLM text
-
-    # Validate symbol completeness (code-level, not prompt-level)
-    if symbols:
-        returned = {a.symbol.upper() for a in report.analyses}
-        missing = [s for s in symbols if s.upper() not in returned]
-        if missing:
-            _log.warning("analyses missing for symbols %s (session %s)", missing, session_id)
-            # Deliver what we have — partial is better than nothing
-
-    return render_report(report)
+    return await generate_validated_report(
+        prompt,
+        session_id=session_id,
+        symbols=symbols,
+        call_runner=_call_runner,
+    )
 
 
 async def _stream_runner(
