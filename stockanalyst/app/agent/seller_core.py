@@ -152,9 +152,8 @@ class SellerCore:
         self._inflight_verified: dict[int, bool] = {}
         self._pending_verified_handoffs: set[int] = set()
         # A timed-out submit may still land before its uncancellable thread exits.
-        # Cleanup remains transient, but this process-lifetime marker blocks both
-        # a pending handoff and stale preverification from starting a second
-        # delivery after the first one landed.
+        # This temporary marker carries that success into the await-free terminal
+        # cleanup section, where _handled replaces it atomically.
         self._late_submit_successes: set[int] = set()
         # Terminal jobs are distinct from live work. This marker is checked in
         # the same no-await section as context compare-and-set, so a stale
@@ -466,7 +465,7 @@ class SellerCore:
             logger.exception("background delivery of job %s failed", job_id)
         finally:
             late_submit_succeeded = job_id in self._late_submit_successes
-            if terminal:
+            if terminal or late_submit_succeeded:
                 self._handled.add(job_id)
                 self._late_submit_successes.discard(job_id)
                 self._pending_verified_handoffs.discard(job_id)

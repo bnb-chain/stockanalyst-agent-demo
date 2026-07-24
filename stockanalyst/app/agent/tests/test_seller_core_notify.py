@@ -1538,6 +1538,10 @@ class NotifyFundedAuthorizationTests(unittest.IsolatedAsyncioTestCase):
         run_work = AsyncMock(return_value="report")
         core = SellerCore(run_work=run_work, generator="test")
         core._sweep = AsyncMock(return_value=None)
+        core._context_deadlines[JOB_ID] = (
+            asyncio.get_running_loop().time() + 60.0
+        )
+        core._context_events[JOB_ID] = asyncio.Event()
         job_spec_started = threading.Event()
         release_job_spec = threading.Event()
         submit_started = threading.Event()
@@ -1635,11 +1639,20 @@ class NotifyFundedAuthorizationTests(unittest.IsolatedAsyncioTestCase):
         run_work.assert_awaited_once()
         self.assertEqual(submit.call_count, 1)
         self.assertIsNotNone(submit.call_args.kwargs["gateway_url"])
-        self.assertNotIn(JOB_ID, core._handled)
-        self.assertIn(JOB_ID, core._job_contexts)
+        self.assertIn(JOB_ID, core._handled)
+        self.assertNotIn(JOB_ID, core._job_contexts)
+        self.assertNotIn(JOB_ID, core._context_deadlines)
+        self.assertNotIn(JOB_ID, core._context_events)
+        self.assertNotIn(JOB_ID, core._contextless_started)
         self.assertNotIn(JOB_ID, core._inflight)
+        self.assertNotIn(JOB_ID, core._inflight_verified)
         self.assertNotIn(JOB_ID, core._pending_verified_handoffs)
-        self.assertIn(JOB_ID, core._late_submit_successes)
+        self.assertNotIn(JOB_ID, core._late_submit_successes)
+
+        core._spawn_job(JOB_ID, verified=True)
+        await asyncio.sleep(0)
+        run_work.assert_awaited_once()
+        self.assertEqual(submit.call_count, 1)
 
     async def test_stale_named_validation_cannot_cross_late_success_cleanup(
         self,
@@ -1758,9 +1771,20 @@ class NotifyFundedAuthorizationTests(unittest.IsolatedAsyncioTestCase):
         run_work.assert_awaited_once()
         self.assertEqual(submit.call_count, 1)
         self.assertIsNone(submit.call_args.kwargs["gateway_url"])
-        self.assertIn(JOB_ID, core._late_submit_successes)
-        self.assertNotIn(JOB_ID, core._handled)
+        self.assertIn(JOB_ID, core._handled)
+        self.assertNotIn(JOB_ID, core._late_submit_successes)
         self.assertNotIn(JOB_ID, core._job_contexts)
+        self.assertNotIn(JOB_ID, core._context_deadlines)
+        self.assertNotIn(JOB_ID, core._context_events)
+        self.assertNotIn(JOB_ID, core._contextless_started)
+        self.assertNotIn(JOB_ID, core._inflight)
+        self.assertNotIn(JOB_ID, core._inflight_verified)
+        self.assertNotIn(JOB_ID, core._pending_verified_handoffs)
+
+        core._spawn_job(JOB_ID, verified=True)
+        await asyncio.sleep(0)
+        run_work.assert_awaited_once()
+        self.assertEqual(submit.call_count, 1)
 
     def test_only_exact_signed_marker_requires_context(self) -> None:
         required = SimpleNamespace(
