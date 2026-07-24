@@ -85,6 +85,15 @@ _JOB_DELIVERY_TIMEOUT_SECONDS = _env_seconds("NOTIFY_DELIVERY_TIMEOUT_SECONDS", 
 _SWEEP_TIMEOUT_SECONDS = _env_seconds("NOTIFY_SWEEP_TIMEOUT_SECONDS", 60)
 _PREVERIFY_TIMEOUT_SECONDS = _env_seconds("NOTIFY_PREVERIFY_TIMEOUT_SECONDS", 30)
 _MAX_NOTIFY_VALIDATION_WORKERS = 4
+# The funded-job snapshot read hits the chain BEFORE any signature check, so an
+# unauthenticated flood of structurally-valid notifications could otherwise open
+# an unbounded burst of RPC reads / thread-pool jobs. Bound their concurrency.
+_MAX_CHAIN_READ_WORKERS = 4
+# Ceiling on distinct jobs whose off-chain context/spec/grace state is retained
+# for retry. Un-delivered (funded-but-abandoned) jobs would otherwise accrete for
+# the whole VM lifetime; past the cap the oldest idle (non-inflight) entries are
+# evicted — a later notify/sweep re-supplies them idempotently.
+_MAX_TRACKED_JOBS = 1024
 _MAX_JOB_ID = 2**256 - 1
 _CONTEXT_REQUIRED_CRITERION = "uomp_notify_context_required_v1"
 _SWEEP_CONTEXT_GRACE_SECONDS = 60.0
@@ -175,6 +184,7 @@ class SellerCore:
         self._notify_validation_slots = asyncio.Semaphore(
             _MAX_NOTIFY_VALIDATION_WORKERS
         )
+        self._chain_read_slots = asyncio.Semaphore(_MAX_CHAIN_READ_WORKERS)
 
     def is_busy(self) -> bool:
         """True while any background delivery is in flight.
@@ -184,29 +194,29 @@ class SellerCore:
         """
         return bool(self._tasks)
 
-    async def _run_notify_validation(
-        self,
-        authorization: object,
-        *,
-        job_id: int,
-        expected_client: str,
-        chain_id: int,
-        verifying_contract: str,
-    ) -> JobContext:
-        await self._notify_validation_slots.acquire()
+    @staticmethod
+    async def _run_bounded_thread(
+        semaphore: asyncio.Semaphore,
+        func: Any,
+        /,
+        *args: Any,
+        **kwargs: Any,
+    ) -> Any:
+        """Run ``func`` on a worker thread while holding one ``semaphore`` slot.
+
+        The slot bounds concurrency of a blocking, uncancellable operation
+        (DNS + ecrecover, or a chain read). ``to_thread`` cancellation only
+        detaches the awaiter — the thread runs on — so if THIS caller is
+        cancelled (e.g. an outer ``wait_for`` deadline) the slot is not freed
+        eagerly; a completion callback releases it once the thread truly exits.
+        Otherwise a cancelled-but-still-running worker would leak its slot and a
+        hostile slow input could starve the pool.
+        """
+        await semaphore.acquire()
         release_in_finally = True
-        worker: asyncio.Task[JobContext] | None = None
+        worker: asyncio.Task[Any] | None = None
         try:
-            worker = asyncio.create_task(
-                asyncio.to_thread(
-                    _verify_and_validate_notify_context,
-                    authorization,
-                    job_id=job_id,
-                    expected_client=expected_client,
-                    chain_id=chain_id,
-                    verifying_contract=verifying_contract,
-                )
-            )
+            worker = asyncio.create_task(asyncio.to_thread(func, *args, **kwargs))
             try:
                 # ``wait`` observes the task without cancelling it with this
                 # caller and, unlike Python 3.14 ``shield``, does not log a
@@ -217,8 +227,8 @@ class SellerCore:
             except asyncio.CancelledError:
                 release_in_finally = False
 
-                def release_when_finished(done: asyncio.Task[JobContext]) -> None:
-                    self._notify_validation_slots.release()
+                def release_when_finished(done: asyncio.Task[Any]) -> None:
+                    semaphore.release()
                     try:
                         done.exception()
                     except asyncio.CancelledError:
@@ -228,7 +238,59 @@ class SellerCore:
                 raise
         finally:
             if release_in_finally:
-                self._notify_validation_slots.release()
+                semaphore.release()
+
+    async def _run_notify_validation(
+        self,
+        authorization: object,
+        *,
+        job_id: int,
+        expected_client: str,
+        chain_id: int,
+        verifying_contract: str,
+    ) -> JobContext:
+        return await self._run_bounded_thread(
+            self._notify_validation_slots,
+            _verify_and_validate_notify_context,
+            authorization,
+            job_id=job_id,
+            expected_client=expected_client,
+            chain_id=chain_id,
+            verifying_contract=verifying_contract,
+        )
+
+    def _prune_tracked_state(self, *, protect: int | None = None) -> None:
+        """Bound retained per-job off-chain state to ``_MAX_TRACKED_JOBS``.
+
+        Terminal jobs already release their state; jobs that were funded but never
+        reached a terminal outcome (buyer never notified / perpetual transient
+        retry) leave context/spec/grace entries behind. Over the VM lifetime those
+        would grow without bound. When the tracked set exceeds the cap, evict the
+        stalest entries that carry NO live work (not in-flight, not awaiting a
+        verified hand-off). Eviction is safe: a later notify or sweep re-derives
+        the same authorization-bound state idempotently.
+        """
+        tracked = (
+            self._job_contexts.keys()
+            | self._job_specs.keys()
+            | self._context_deadlines.keys()
+            | self._context_events.keys()
+        )
+        overflow = len(tracked) - _MAX_TRACKED_JOBS
+        if overflow <= 0:
+            return
+        protected = self._inflight | self._pending_verified_handoffs
+        if protect is not None:
+            protected = protected | {protect}
+        evictable = sorted(
+            (job for job in tracked if job not in protected),
+            key=lambda job: self._context_deadlines.get(job, float("inf")),
+        )
+        for job in evictable[:overflow]:
+            self._job_contexts.pop(job, None)
+            self._job_specs.pop(job, None)
+            self._context_deadlines.pop(job, None)
+            self._context_events.pop(job, None)
 
     # -- skills ----------------------------------------------------------------
     async def negotiate(self, data: dict[str, Any]) -> dict[str, Any]:
@@ -299,7 +361,11 @@ class SellerCore:
 
         try:
             snapshot, reason, permanent = await asyncio.wait_for(
-                asyncio.to_thread(signing.verify_signed_job_snapshot, job_id),
+                self._run_bounded_thread(
+                    self._chain_read_slots,
+                    signing.verify_signed_job_snapshot,
+                    job_id,
+                ),
                 timeout=_PREVERIFY_TIMEOUT_SECONDS,
             )
         except Exception:  # noqa: BLE001 — includes RPC and timeout failures
@@ -359,6 +425,7 @@ class SellerCore:
                 "job_id": job_id,
                 "reason": "delivery_already_started",
             }
+        self._prune_tracked_state(protect=job_id)
         existing_context = self._job_contexts.get(job_id)
         if existing_context is None:
             self._job_contexts[job_id] = context
@@ -492,6 +559,7 @@ class SellerCore:
 
     # -- internals -------------------------------------------------------------
     async def _await_sweep_context(self, job_id: int, *, required: bool) -> bool:
+        self._prune_tracked_state(protect=job_id)
         if job_id in self._job_contexts:
             return True
 

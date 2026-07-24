@@ -10,6 +10,7 @@ import math
 import os
 import re
 import socket
+import threading
 import time
 from typing import Any, Callable
 from urllib.parse import urlsplit
@@ -42,6 +43,7 @@ _MAX_UINT64 = 2**64 - 1
 _MAX_UINT256 = 2**256 - 1
 _DEFAULT_GATEWAY_HOST_RULES = (".trycloudflare.com",)
 _TRUE_ENV_VALUES = frozenset({"1", "true", "yes", "on"})
+_DEFAULT_DNS_TIMEOUT_SECONDS = 5.0
 _HOST_LABEL_PATTERN = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\Z")
 _EXPLICITLY_DENIED_GATEWAY_NETWORKS = tuple(
     ip_network(network)
@@ -147,11 +149,10 @@ def _validate_gateway_origin(
     if scheme == "https" and not _gateway_host_allowed(hostname):
         raise NotifySecurityError("invalid_gateway_url")
 
-    lookup = socket.getaddrinfo if resolver is None else resolver
     try:
-        answers = lookup(hostname, port or expected_port, type=socket.SOCK_STREAM)
+        answers = _resolve_addresses(hostname, port or expected_port, resolver=resolver)
         addresses = tuple(ip_address(answer[4][0]) for answer in answers)  # type: ignore[index]
-    except (OSError, TypeError, ValueError, IndexError):
+    except (OSError, TypeError, ValueError, IndexError, TimeoutError):
         raise NotifySecurityError("invalid_gateway_url") from None
     if not addresses:
         raise NotifySecurityError("invalid_gateway_url")
@@ -171,6 +172,55 @@ def _validate_gateway_origin(
         port=port or expected_port,
         addresses=tuple(dict.fromkeys(str(address) for address in addresses)),
     )
+
+
+def _dns_timeout_seconds() -> float:
+    """Positive DNS-resolution deadline (seconds), read from the env each call."""
+    raw = os.environ.get("GATEWAY_DNS_TIMEOUT_SECONDS", "")
+    try:
+        value = float(raw) if raw else _DEFAULT_DNS_TIMEOUT_SECONDS
+    except ValueError:
+        return _DEFAULT_DNS_TIMEOUT_SECONDS
+    return value if value > 0 else _DEFAULT_DNS_TIMEOUT_SECONDS
+
+
+def _resolve_addresses(
+    hostname: str,
+    port: int,
+    *,
+    resolver: Callable[..., object] | None,
+) -> object:
+    """Resolve ``hostname`` with a hard deadline on the system resolver.
+
+    A caller-supplied ``resolver`` (tests) is trusted to return promptly and is
+    invoked directly. The real ``socket.getaddrinfo`` ignores socket timeouts and
+    can block on a hostile/slow authority indefinitely, which would pin the
+    validation worker thread (and its bounded slot). Run it on a throwaway daemon
+    thread and abandon it once the deadline elapses so the validator fails closed
+    instead of hanging.
+    """
+    if resolver is not None:
+        return resolver(hostname, port, type=socket.SOCK_STREAM)
+
+    outcome: dict[str, object] = {}
+
+    def _run() -> None:
+        try:
+            outcome["answers"] = socket.getaddrinfo(
+                hostname, port, type=socket.SOCK_STREAM
+            )
+        except BaseException as exc:  # noqa: BLE001 — reraised on the caller thread
+            outcome["error"] = exc
+
+    worker = threading.Thread(target=_run, daemon=True)
+    worker.start()
+    worker.join(_dns_timeout_seconds())
+    if worker.is_alive():
+        raise TimeoutError("gateway DNS resolution timed out")
+    error = outcome.get("error")
+    if error is not None:
+        raise error  # type: ignore[misc]
+    return outcome.get("answers", [])
 
 
 def _is_public_gateway_address(address: Any) -> bool:

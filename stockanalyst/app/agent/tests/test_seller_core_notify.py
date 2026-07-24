@@ -1935,6 +1935,114 @@ class NotifyFundedAuthorizationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(second["status"], "accepted")
         self.assertEqual(core._run_job.await_count, 1)
 
+    async def test_chain_read_concurrency_is_bounded_before_validation(self) -> None:
+        core = RecordingSellerCore()
+        requests = [self._signed_request(job_id=JOB_ID + offset) for offset in range(5)]
+        active = 0
+        maximum_active = 0
+        started_reads = 0
+        lock = threading.Lock()
+        four_started = threading.Event()
+        release = threading.Event()
+
+        def blocking_snapshot(job_id: int):
+            nonlocal active, maximum_active, started_reads
+            with lock:
+                active += 1
+                started_reads += 1
+                maximum_active = max(maximum_active, active)
+                if started_reads == seller_core_module._MAX_CHAIN_READ_WORKERS:
+                    four_started.set()
+            try:
+                release.wait(timeout=2)
+                return (
+                    SimpleNamespace(
+                        client=self.client.address,
+                        chain_id=CHAIN_ID,
+                        verifying_contract=COMMERCE,
+                        spec=_job_spec(required=False),
+                    ),
+                    "",
+                    False,
+                )
+            finally:
+                with lock:
+                    active -= 1
+
+        cap = seller_core_module._MAX_CHAIN_READ_WORKERS
+        first_batch: list[asyncio.Task[dict[str, object]]] = []
+        try:
+            with (
+                patch.object(
+                    seller_core_module.signing,
+                    "verify_signed_job_snapshot",
+                    side_effect=blocking_snapshot,
+                    create=True,
+                ),
+                patch.object(seller_core_module, "_PREVERIFY_TIMEOUT_SECONDS", 5),
+            ):
+                first_batch = [
+                    asyncio.create_task(core.notify_funded(request))
+                    for request in requests[:cap]
+                ]
+                self.assertTrue(await asyncio.to_thread(four_started.wait, 2))
+
+                with patch.object(
+                    seller_core_module,
+                    "_PREVERIFY_TIMEOUT_SECONDS",
+                    0.05,
+                ):
+                    overflow = await core.notify_funded(requests[cap])
+
+                self.assertEqual(overflow["reason"], "verification_unavailable")
+                self.assertIs(overflow["retryable"], True)
+                self.assertEqual(started_reads, cap)
+                self.assertEqual(maximum_active, cap)
+                await asyncio.sleep(0.1)
+                self.assertEqual(started_reads, cap)
+        finally:
+            release.set()
+            if first_batch:
+                await asyncio.gather(*first_batch, return_exceptions=True)
+                await self._drain_tasks(core)
+
+        for _ in range(100):
+            if core._chain_read_slots._value == cap:
+                break
+            await asyncio.sleep(0.01)
+        self.assertEqual(core._chain_read_slots._value, cap)
+
+    def test_prune_evicts_the_stalest_idle_jobs_over_cap(self) -> None:
+        core = RecordingSellerCore()
+        with patch.object(seller_core_module, "_MAX_TRACKED_JOBS", 2):
+            for job in (1, 2, 3):
+                core._job_contexts[job] = SimpleNamespace(digest=str(job))
+                core._job_specs[job] = SimpleNamespace()
+                core._context_deadlines[job] = float(job)
+                core._context_events[job] = asyncio.Event()
+            core._prune_tracked_state()
+
+        # overflow of 1 → evict the single stalest (earliest-deadline) idle job.
+        self.assertNotIn(1, core._job_contexts)
+        self.assertNotIn(1, core._job_specs)
+        self.assertNotIn(1, core._context_deadlines)
+        self.assertNotIn(1, core._context_events)
+        self.assertEqual(set(core._job_contexts), {2, 3})
+
+    def test_prune_never_evicts_inflight_or_targeted_jobs(self) -> None:
+        core = RecordingSellerCore()
+        with patch.object(seller_core_module, "_MAX_TRACKED_JOBS", 1):
+            core._job_contexts[1] = SimpleNamespace(digest="1")
+            core._context_deadlines[1] = 1.0
+            core._inflight.add(1)
+            core._job_contexts[2] = SimpleNamespace(digest="2")
+            core._context_deadlines[2] = 2.0
+            core._prune_tracked_state(protect=2)
+
+        # Both are protected (one in-flight, one the current target), so neither
+        # is dropped even though the set is over the cap.
+        self.assertEqual(set(core._job_contexts), {1, 2})
+
 
 if __name__ == "__main__":
     unittest.main()

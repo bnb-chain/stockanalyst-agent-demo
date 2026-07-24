@@ -7,12 +7,48 @@ import {
   verifyMessage,
   Wallet,
 } from "ethers";
+import { parseUnits } from "ethers";
 import {
+  assertQuoteWithinBudget,
   buildJobDescription,
+  DEFAULT_MAX_PRICE_U,
   negotiate,
   NOTIFY_CONTEXT_REQUIRED,
+  resolveMaxBudgetWei,
   type NegotiationEnvelope,
 } from "./negotiate.js";
+
+test("resolveMaxBudgetWei falls back to the default cap when unset", () => {
+  assert.equal(resolveMaxBudgetWei({}), parseUnits(String(DEFAULT_MAX_PRICE_U), 18));
+  assert.equal(resolveMaxBudgetWei({ MAX_PRICE_U: "  " }), parseUnits(String(DEFAULT_MAX_PRICE_U), 18));
+});
+
+test("resolveMaxBudgetWei honours a configured cap", () => {
+  assert.equal(resolveMaxBudgetWei({ MAX_PRICE_U: "2.5" }), parseUnits("2.5", 18));
+});
+
+test("resolveMaxBudgetWei rejects a non-positive or non-numeric cap", () => {
+  for (const bad of ["0", "-1", "abc", "NaN", "Infinity"]) {
+    assert.throws(() => resolveMaxBudgetWei({ MAX_PRICE_U: bad }), /MAX_PRICE_U must be a positive number/);
+  }
+});
+
+test("assertQuoteWithinBudget accepts a quote at or below the cap", () => {
+  const cap = parseUnits("100", 18);
+  assert.doesNotThrow(() => assertQuoteWithinBudget(1n, cap));
+  assert.doesNotThrow(() => assertQuoteWithinBudget(cap, cap));
+});
+
+test("assertQuoteWithinBudget rejects a quote above the cap", () => {
+  const cap = parseUnits("100", 18);
+  assert.throws(() => assertQuoteWithinBudget(cap + 1n, cap), /exceeds the MAX_PRICE_U cap/);
+});
+
+test("assertQuoteWithinBudget rejects a non-positive quote", () => {
+  const cap = parseUnits("100", 18);
+  assert.throws(() => assertQuoteWithinBudget(0n, cap), /non-positive price/);
+  assert.throws(() => assertQuoteWithinBudget(-5n, cap), /non-positive price/);
+});
 
 test("requests the exact notify-context requirement", async () => {
   let requestBody = "";

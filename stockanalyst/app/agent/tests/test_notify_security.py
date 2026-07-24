@@ -673,5 +673,48 @@ class AuthorizationTests(unittest.TestCase):
 
         self.assertEqual(raised.exception.code, "invalid_authorization")
 
+
+class GatewayDnsTimeoutTests(unittest.TestCase):
+    """The default system resolver must fail closed under a hard deadline."""
+
+    def test_slow_system_resolver_is_bounded_and_rejected(self) -> None:
+        import threading
+        import time
+
+        release = threading.Event()
+        started = threading.Event()
+
+        def blocking_getaddrinfo(*args, **kwargs):
+            del args, kwargs
+            started.set()
+            release.wait(timeout=5)
+            return []
+
+        try:
+            with (
+                patch.dict(os.environ, {"GATEWAY_DNS_TIMEOUT_SECONDS": "0.1"}),
+                patch("stockanalyst.app.agent.notify_security.socket.getaddrinfo", blocking_getaddrinfo),
+            ):
+                began = time.monotonic()
+                with self.assertRaises(NotifySecurityError) as raised:
+                    # No custom resolver → exercises the bounded system-resolver path.
+                    validate_gateway_url("https://buyer.trycloudflare.com")
+                elapsed = time.monotonic() - began
+            self.assertTrue(started.wait(timeout=1))
+            self.assertEqual(raised.exception.code, "invalid_gateway_url")
+            self.assertLess(elapsed, 2.0)
+        finally:
+            release.set()
+
+    def test_custom_resolver_bypasses_the_deadline_thread(self) -> None:
+        # A supplied resolver (as the seller core passes in production tests) is
+        # invoked directly, so validation still succeeds for a public answer.
+        origin = validate_gateway_url(
+            "https://buyer.trycloudflare.com",
+            resolver=PUBLIC_RESOLVER,
+        )
+        self.assertEqual(origin, "https://buyer.trycloudflare.com")
+
+
 if __name__ == "__main__":
     unittest.main()

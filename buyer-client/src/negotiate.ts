@@ -6,7 +6,7 @@
  * them unset for local dev (the token fetch is skipped automatically).
  */
 
-import type { Signer } from "ethers";
+import { formatUnits, parseUnits, type Signer } from "ethers";
 import {
   buildNotifyContext,
   createNotifyAuthorization,
@@ -14,6 +14,43 @@ import {
 } from "./notify-auth.js";
 
 export type { NotifyOptions } from "./notify-auth.js";
+
+/** Default per-job spend ceiling (in U) when MAX_PRICE_U is unset. */
+export const DEFAULT_MAX_PRICE_U = 100;
+
+/**
+ * Resolve the buyer's per-job spend ceiling in raw wei from `MAX_PRICE_U`.
+ * The seller signs and returns its own price; without a client-side ceiling a
+ * hostile or misconfigured seller could quote an arbitrarily large amount that
+ * the buyer would fund up to its wallet balance. Fund nothing above this cap.
+ */
+export function resolveMaxBudgetWei(
+  env: Readonly<Record<string, string | undefined>> = process.env,
+): bigint {
+  const raw = env["MAX_PRICE_U"];
+  const maxU = raw !== undefined && raw.trim() !== "" ? Number(raw) : DEFAULT_MAX_PRICE_U;
+  if (!Number.isFinite(maxU) || maxU <= 0) {
+    throw new Error("MAX_PRICE_U must be a positive number");
+  }
+  return parseUnits(String(maxU), 18);
+}
+
+/**
+ * Reject a seller quote that is non-positive or exceeds the buyer's spend cap,
+ * BEFORE any on-chain funding. Comparison is exact (raw wei), never via float.
+ */
+export function assertQuoteWithinBudget(priceWei: bigint, maxBudgetWei: bigint): void {
+  if (priceWei <= 0n) {
+    throw new Error(`Seller quoted a non-positive price (${priceWei} wei); refusing to fund`);
+  }
+  if (priceWei > maxBudgetWei) {
+    throw new Error(
+      `Seller quote ${formatUnits(priceWei, 18)} U exceeds the MAX_PRICE_U cap of ` +
+        `${formatUnits(maxBudgetWei, 18)} U; refusing to fund. ` +
+        `Raise MAX_PRICE_U to accept a higher quote.`,
+    );
+  }
+}
 
 export const NOTIFY_CONTEXT_REQUIRED = "uomp_notify_context_required_v1";
 const INVALID_NOTIFY_CONTEXT_MARKER =

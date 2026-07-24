@@ -25,7 +25,13 @@ import { readFileSync } from "fs";
 import { resolve } from "path";
 import { Wallet, type BaseWallet } from "ethers";
 import { GuardUserMemory, buildTaskFromMemory } from "./uomp.js";
-import { negotiate, buildJobDescription, notifyFunded } from "./negotiate.js";
+import {
+  negotiate,
+  buildJobDescription,
+  notifyFunded,
+  resolveMaxBudgetWei,
+  assertQuoteWithinBudget,
+} from "./negotiate.js";
 import { CONTRACTS, ERC8183Buyer } from "./erc8183.js";
 import {
   fetchDeliverable,
@@ -123,6 +129,9 @@ async function main(): Promise<void> {
   hr("Step 2: Negotiate — get signed price quote from agent");
   const envelope = await negotiate(AGENT_ENDPOINT, task, deliverables, quality);
   const priceRaw = BigInt(envelope.response.terms.price);
+  // Refuse to fund a quote above the client-side spend ceiling BEFORE any
+  // on-chain spend — the seller signs its own price and could quote anything.
+  assertQuoteWithinBudget(priceRaw, resolveMaxBudgetWei());
   const priceU   = Number(priceRaw) / 1e18;
   console.log(`  ✓ Accepted     price=${priceU} U`);
   console.log(`  ✓ Estimated    completion=${envelope.response.estimated_completion_seconds}s`);
