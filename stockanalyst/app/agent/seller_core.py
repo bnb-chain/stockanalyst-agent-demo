@@ -84,7 +84,31 @@ def _env_seconds(name: str, default: int) -> float:
 _JOB_DELIVERY_TIMEOUT_SECONDS = _env_seconds("NOTIFY_DELIVERY_TIMEOUT_SECONDS", 1800)
 _SWEEP_TIMEOUT_SECONDS = _env_seconds("NOTIFY_SWEEP_TIMEOUT_SECONDS", 60)
 _PREVERIFY_TIMEOUT_SECONDS = _env_seconds("NOTIFY_PREVERIFY_TIMEOUT_SECONDS", 30)
+_MAX_NOTIFY_VALIDATION_WORKERS = 4
 _MAX_JOB_ID = 2**256 - 1
+
+
+def _verify_and_validate_notify_context(
+    authorization: object,
+    *,
+    job_id: int,
+    expected_client: str,
+    chain_id: int,
+    verifying_contract: str,
+) -> JobContext:
+    context = verify_notify_authorization(
+        authorization,
+        job_id=job_id,
+        expected_client=expected_client,
+        chain_id=chain_id,
+        verifying_contract=verifying_contract,
+    )
+    if context.gateway_url is not None:
+        context = replace(
+            context,
+            gateway_url=validate_gateway_url(context.gateway_url),
+        )
+    return context
 
 
 class SellerCore:
@@ -123,6 +147,9 @@ class SellerCore:
         # Immutable, authorization-bound off-chain context. This is installed
         # only after all on-chain and wallet checks succeed.
         self._job_contexts: dict[int, JobContext] = {}
+        self._notify_validation_slots = asyncio.Semaphore(
+            _MAX_NOTIFY_VALIDATION_WORKERS
+        )
 
     def is_busy(self) -> bool:
         """True while any background delivery is in flight.
@@ -131,6 +158,52 @@ class SellerCore:
         busy) so the scale-to-zero runtime is not reaped on idle while work runs.
         """
         return bool(self._tasks)
+
+    async def _run_notify_validation(
+        self,
+        authorization: object,
+        *,
+        job_id: int,
+        expected_client: str,
+        chain_id: int,
+        verifying_contract: str,
+    ) -> JobContext:
+        await self._notify_validation_slots.acquire()
+        release_in_finally = True
+        worker: asyncio.Task[JobContext] | None = None
+        try:
+            worker = asyncio.create_task(
+                asyncio.to_thread(
+                    _verify_and_validate_notify_context,
+                    authorization,
+                    job_id=job_id,
+                    expected_client=expected_client,
+                    chain_id=chain_id,
+                    verifying_contract=verifying_contract,
+                )
+            )
+            try:
+                # ``wait`` observes the task without cancelling it with this
+                # caller and, unlike Python 3.14 ``shield``, does not log a
+                # late worker exception before our completion callback can
+                # retrieve it.
+                await asyncio.wait({worker})
+                return worker.result()
+            except asyncio.CancelledError:
+                release_in_finally = False
+
+                def release_when_finished(done: asyncio.Task[JobContext]) -> None:
+                    self._notify_validation_slots.release()
+                    try:
+                        done.exception()
+                    except asyncio.CancelledError:
+                        pass
+
+                worker.add_done_callback(release_when_finished)
+                raise
+        finally:
+            if release_in_finally:
+                self._notify_validation_slots.release()
 
     # -- skills ----------------------------------------------------------------
     async def negotiate(self, data: dict[str, Any]) -> dict[str, Any]:
@@ -239,22 +312,28 @@ class SellerCore:
             }
 
         try:
-            context = verify_notify_authorization(
-                authorization,
-                job_id=job_id,
-                expected_client=target.client,
-                chain_id=target.chain_id,
-                verifying_contract=target.verifying_contract,
+            context = await asyncio.wait_for(
+                self._run_notify_validation(
+                    authorization,
+                    job_id=job_id,
+                    expected_client=target.client,
+                    chain_id=target.chain_id,
+                    verifying_contract=target.verifying_contract,
+                ),
+                timeout=_PREVERIFY_TIMEOUT_SECONDS,
             )
-            if context.gateway_url is not None:
-                context = replace(
-                    context,
-                    gateway_url=validate_gateway_url(context.gateway_url),
-                )
         except NotifySecurityError as error:
             reason = "unsafe_gateway" if error.code == "invalid_gateway_url" else error.code
             logger.warning("job %s: notification rejected — %s", job_id, reason)
             return {"status": "rejected", "job_id": job_id, "reason": reason}
+        except Exception:  # noqa: BLE001 — timeout, scheduling, or worker failure
+            logger.warning("job %s: notification validation unavailable", job_id)
+            return {
+                "status": "rejected",
+                "job_id": job_id,
+                "reason": "verification_unavailable",
+                "retryable": True,
+            }
 
         # Atomic with the worker's context lookup/marker update: neither path
         # awaits between observing the marker/context and committing its state.

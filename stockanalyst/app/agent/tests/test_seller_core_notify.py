@@ -161,6 +161,7 @@ class NotifyFundedAuthorizationTests(unittest.IsolatedAsyncioTestCase):
         *,
         context: dict[str, object] | None = None,
         key: str = CLIENT_KEY,
+        job_id: int = JOB_ID,
     ) -> dict[str, object]:
         raw_context = json.dumps(
             context
@@ -172,7 +173,7 @@ class NotifyFundedAuthorizationTests(unittest.IsolatedAsyncioTestCase):
             separators=(",", ":"),
         )
         typed_data = build_notify_typed_data(
-            job_id=JOB_ID,
+            job_id=job_id,
             context=raw_context,
             expires_at=EXPIRES_AT,
             nonce=NONCE,
@@ -183,7 +184,7 @@ class NotifyFundedAuthorizationTests(unittest.IsolatedAsyncioTestCase):
             encode_typed_data(full_message=typed_data), key
         ).signature.hex()
         return {
-            "job_id": JOB_ID,
+            "job_id": job_id,
             "authorization": {
                 "context": raw_context,
                 "expires_at": EXPIRES_AT,
@@ -349,6 +350,225 @@ class NotifyFundedAuthorizationTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result["status"], "accepted")
         self.assertEqual(order, ["signer", "dns"])
+
+    async def test_slow_gateway_validation_does_not_block_event_loop(self) -> None:
+        started = threading.Event()
+        release = threading.Event()
+        loop_thread = threading.get_ident()
+        validator_threads: list[int] = []
+
+        def blocking_validate(url: str) -> str:
+            validator_threads.append(threading.get_ident())
+            started.set()
+            release.wait(timeout=2)
+            return url
+
+        with patch.object(
+            seller_core_module,
+            "validate_gateway_url",
+            side_effect=blocking_validate,
+        ):
+            notification = asyncio.create_task(
+                self.core.notify_funded(self._signed_request())
+            )
+            self.assertTrue(await asyncio.to_thread(started.wait, 1))
+            heartbeat = asyncio.create_task(asyncio.sleep(0))
+            await asyncio.wait_for(heartbeat, timeout=0.1)
+            self.assertFalse(notification.done())
+            release.set()
+            result = await notification
+
+        self.assertNotEqual(validator_threads, [loop_thread])
+        self.assertEqual(result["status"], "accepted")
+
+    async def test_signature_recovery_runs_off_event_loop(self) -> None:
+        loop_thread = threading.get_ident()
+        verifier_threads: list[int] = []
+        real_verify = seller_core_module.verify_notify_authorization
+
+        def record_verifier_thread(*args, **kwargs) -> JobContext:
+            verifier_threads.append(threading.get_ident())
+            return real_verify(*args, **kwargs)
+
+        with patch.object(
+            seller_core_module,
+            "verify_notify_authorization",
+            side_effect=record_verifier_thread,
+        ):
+            result = await self.core.notify_funded(self._signed_request())
+
+        self.assertEqual(result["status"], "accepted")
+        self.assertEqual(len(verifier_threads), 1)
+        self.assertNotEqual(verifier_threads[0], loop_thread)
+
+    async def test_validation_timeout_has_no_state_or_delivery_side_effect(self) -> None:
+        started = threading.Event()
+        release = threading.Event()
+
+        def blocking_validate(url: str) -> str:
+            started.set()
+            release.wait(timeout=2)
+            return url
+
+        try:
+            with (
+                patch.object(
+                    seller_core_module,
+                    "validate_gateway_url",
+                    side_effect=blocking_validate,
+                ),
+                patch.object(seller_core_module, "_PREVERIFY_TIMEOUT_SECONDS", 0.05),
+            ):
+                notification = asyncio.create_task(
+                    self.core.notify_funded(self._signed_request())
+                )
+                self.assertTrue(await asyncio.to_thread(started.wait, 1))
+                result = await notification
+
+            self.assertEqual(
+                result,
+                {
+                    "status": "rejected",
+                    "job_id": JOB_ID,
+                    "reason": "verification_unavailable",
+                    "retryable": True,
+                },
+            )
+            self.assertEqual(self.core._job_contexts, {})
+            self.assertEqual(self.core.spawned_jobs, [])
+            self.assertNotIn(JOB_ID, self.core._handled)
+            self.assertNotIn(JOB_ID, self.core._contextless_started)
+        finally:
+            release.set()
+
+    async def test_validation_worker_limit_covers_lingering_workers(self) -> None:
+        core = RecordingSellerCore()
+        requests = [
+            self._signed_request(job_id=JOB_ID + offset)
+            for offset in range(5)
+        ]
+        real_verify = seller_core_module.verify_notify_authorization
+        active = 0
+        maximum_active = 0
+        started_calls = 0
+        lock = threading.Lock()
+        four_started = threading.Event()
+        release = threading.Event()
+
+        def blocking_verify(*args, **kwargs) -> JobContext:
+            nonlocal active, maximum_active, started_calls
+            with lock:
+                active += 1
+                started_calls += 1
+                maximum_active = max(maximum_active, active)
+                if started_calls == 4:
+                    four_started.set()
+            try:
+                release.wait(timeout=2)
+                return real_verify(*args, **kwargs)
+            finally:
+                with lock:
+                    active -= 1
+
+        first_four: list[asyncio.Task[dict[str, object]]] = []
+        try:
+            with (
+                patch.object(
+                    seller_core_module,
+                    "verify_notify_authorization",
+                    side_effect=blocking_verify,
+                ),
+                patch.object(seller_core_module, "_PREVERIFY_TIMEOUT_SECONDS", 5),
+            ):
+                first_four = [
+                    asyncio.create_task(core.notify_funded(request))
+                    for request in requests[:4]
+                ]
+                self.assertTrue(await asyncio.to_thread(four_started.wait, 2))
+
+                with patch.object(
+                    seller_core_module,
+                    "_PREVERIFY_TIMEOUT_SECONDS",
+                    0.05,
+                ):
+                    fifth = await core.notify_funded(requests[4])
+
+                self.assertEqual(fifth["reason"], "verification_unavailable")
+                self.assertEqual(started_calls, 4)
+                self.assertEqual(maximum_active, 4)
+                await asyncio.sleep(0.1)
+                self.assertEqual(started_calls, 4)
+        finally:
+            release.set()
+            if first_four:
+                await asyncio.gather(*first_four, return_exceptions=True)
+
+        for _ in range(100):
+            if core._notify_validation_slots._value == 4:
+                break
+            await asyncio.sleep(0.01)
+        self.assertEqual(core._notify_validation_slots._value, 4)
+
+    async def test_unexpected_validation_failure_is_retryable_and_opaque(self) -> None:
+        with patch.object(
+            seller_core_module,
+            "verify_notify_authorization",
+            side_effect=RuntimeError("sensitive worker failure"),
+        ):
+            result = await self.core.notify_funded(self._signed_request())
+
+        self.assertEqual(
+            result,
+            {
+                "status": "rejected",
+                "job_id": JOB_ID,
+                "reason": "verification_unavailable",
+                "retryable": True,
+            },
+        )
+        self.assertNotIn("sensitive", repr(result))
+        self.assertEqual(self.core._job_contexts, {})
+        self.assertEqual(self.core.spawned_jobs, [])
+
+    async def test_late_validation_failure_is_retrieved_without_loop_warning(self) -> None:
+        started = threading.Event()
+        release = threading.Event()
+        loop = asyncio.get_running_loop()
+        previous_handler = loop.get_exception_handler()
+        loop_errors: list[dict[str, object]] = []
+
+        def blocking_failure(url: str) -> str:
+            started.set()
+            release.wait(timeout=2)
+            raise RuntimeError(f"sensitive late failure for {url}")
+
+        loop.set_exception_handler(lambda _loop, context: loop_errors.append(context))
+        try:
+            with (
+                patch.object(
+                    seller_core_module,
+                    "validate_gateway_url",
+                    side_effect=blocking_failure,
+                ),
+                patch.object(seller_core_module, "_PREVERIFY_TIMEOUT_SECONDS", 0.05),
+            ):
+                notification = asyncio.create_task(
+                    self.core.notify_funded(self._signed_request())
+                )
+                self.assertTrue(await asyncio.to_thread(started.wait, 1))
+                result = await notification
+
+            self.assertEqual(result["reason"], "verification_unavailable")
+            release.set()
+            for _ in range(100):
+                if self.core._notify_validation_slots._value == 4:
+                    break
+                await asyncio.sleep(0.01)
+            await asyncio.sleep(0)
+            self.assertEqual(loop_errors, [])
+        finally:
+            release.set()
+            loop.set_exception_handler(previous_handler)
 
     async def test_identical_signed_context_is_idempotent(self) -> None:
         request = self._signed_request()
