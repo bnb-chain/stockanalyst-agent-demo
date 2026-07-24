@@ -151,8 +151,8 @@ class SellerCore:
         # verification can never reinstall context after terminal cleanup.
         self._handled: set[int] = set()
         # Context-free sweep work records when it has irreversibly consumed the
-        # absence of notification context. Kept for terminal jobs alongside
-        # _handled; cleared for transient outcomes so a named retry can win.
+        # absence of notification context. It exists only while delivery is
+        # active and is cleared during either terminal or transient cleanup.
         self._contextless_started: set[int] = set()
         self._sweep_active = False
         # Immutable, authorization-bound off-chain context. This is installed
@@ -433,7 +433,8 @@ class SellerCore:
             # distinct handled marker. The _spawn_job gate then rejects a slower
             # concurrent sweep that still sees this job as FUNDED, while the
             # notify CAS gate rejects stale verified requests after context cleanup.
-            # Only transient failures clear all markers for a later retry.
+            # Transient failures release only live-work markers, retaining context
+            # and grace state for a later retry.
             terminal = bool(result.get("ok") or result.get("skip"))
             resume_verified = (
                 not verified
@@ -453,6 +454,9 @@ class SellerCore:
             if terminal:
                 self._handled.add(job_id)
                 self._job_contexts.pop(job_id, None)
+                self._context_deadlines.pop(job_id, None)
+                self._context_events.pop(job_id, None)
+                self._contextless_started.discard(job_id)
                 self._inflight.discard(job_id)
             else:
                 self._inflight.discard(job_id)
