@@ -1,0 +1,28 @@
+[
+  {
+    "name": "unicode-and-large-integers",
+    "manifest": "{\"chain_id\":97,\"contracts\":{\"commerce\":\"0xa206c0517b6371c6638cd9e4a42cc9f02a33b0de\",\"policy\":\"0x4f4678d4439fec812ac7674bb3efb4c8f5fb78a6\",\"router\":\"0xd7d36d66d2f1b608a0f943f722d27e3744f66f25\"},\"job_id\":1152921504606846983,\"metadata\":{\"large\":1606938044258990275541962092341162602522202993782792835301376,\"nested\":[{\"a\":1,\"z\":2}],\"\\ue000\":\"bmp\",\"\\ud800\\udc00\":\"astral\"},\"response\":{\"content\":\"# SDK vector: unicode-and-large-integers\",\"content_type\":\"text/plain\"},\"version\":1}",
+    "commitment": "0x998ff8009e9703ed5f85b37a111e17b89f2a994b64f94018a969a37bfcaacddb",
+    "job_id": "1152921504606846983",
+    "chain_id": "97",
+    "contracts": {
+      "commerce": "0xa206c0517b6371c6638cd9e4a42cc9f02a33b0de",
+      "router": "0xd7d36d66d2f1b608a0f943f722d27e3744f66f25",
+      "policy": "0x4f4678d4439fec812ac7674bb3efb4c8f5fb78a6"
+    },
+    "content": "# SDK vector: unicode-and-large-integers"
+  },
+  {
+    "name": "python-floats",
+    "manifest": "{\"chain_id\":97,\"contracts\":{\"commerce\":\"0xa206c0517b6371c6638cd9e4a42cc9f02a33b0de\",\"policy\":\"0x4f4678d4439fec812ac7674bb3efb4c8f5fb78a6\",\"router\":\"0xd7d36d66d2f1b608a0f943f722d27e3744f66f25\"},\"job_id\":42,\"metadata\":{\"large\":1e+20,\"negative_zero\":-0.0,\"not_a_number\":NaN,\"positive_infinity\":Infinity,\"small\":1e-07},\"response\":{\"content\":\"# SDK vector: python-floats\",\"content_type\":\"text/plain\"},\"version\":1}",
+    "commitment": "0xdaba993e039c3fb81b06962774fe8c8bba03243937c0d2e0a8310ed0418e82c8",
+    "job_id": "42",
+    "chain_id": "97",
+    "contracts": {
+      "commerce": "0xa206c0517b6371c6638cd9e4a42cc9f02a33b0de",
+      "router": "0xd7d36d66d2f1b608a0f943f722d27e3744f66f25",
+      "policy": "0x4f4678d4439fec812ac7674bb3efb4c8f5fb78a6"
+    },
+    "content": "# SDK vector: python-floats"
+  }
+]

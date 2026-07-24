@@ -182,79 +182,92 @@ function inlineToHtml(s: string): string {
 
 // ── Markdown → HTML ───────────────────────────────────────────────────────────
 function mdToHtml(md: string): string {
-  // Block-level element tag names — paragraph catch-all skips these
-  const BLOCK = /^<(h[1-6]|table|thead|tbody|tr|ul|ol|li|blockquote|hr|div|p)\b/;
-
-  return escapeHtml(md)
-    // Fenced code blocks (strip — reports shouldn't have code)
+  const lines = escapeHtml(md)
+    // Reports should not contain code blocks. This non-nested scan is linear.
     .replace(/```[\s\S]*?```/g, "")
-    // HR
-    .replace(/^---+$/gm, "<hr>")
-    // H1-H4 (run before blockquotes so "## heading" inside prose isn't swallowed)
-    .replace(/^#### (.+)$/gm, (_, t) => `<h4>${inlineToHtml(t)}</h4>`)
-    .replace(/^### (.+)$/gm,  (_, t) => `<h3>${inlineToHtml(t)}</h3>`)
-    .replace(/^## (.+)$/gm,   (_, t) => `<h2>${inlineToHtml(t)}</h2>`)
-    .replace(/^# (.+)$/gm,    (_, t) => `<h1>${inlineToHtml(t)}</h1>`)
-    // Blockquotes — process inline markup inside them
-    .replace(/^&gt; (.+)$/gm, (_, content) => {
-      // Strip any stray heading markers left inside a blockquote
-      const clean = content.replace(/^#{1,4}\s+/, "");
-      return `<blockquote><p>${inlineToHtml(clean)}</p></blockquote>`;
-    })
-    // Unordered lists
-    .replace(/^(\s*[-*] .+(\n\s*[-*] .+)*)/gm, (block) => {
-      const items = block
-        .trim()
-        .split(/\n\s*[-*] /)
-        .filter(Boolean)
-        .map((s) => `<li>${inlineToHtml(s.replace(/^[-*] /, "").trim())}</li>`)
-        .join("");
-      return `<ul>${items}</ul>`;
-    })
-    // Ordered lists
-    .replace(/^(\s*\d+\. .+(\n\s*\d+\. .+)*)/gm, (block) => {
-      const items = block
-        .trim()
-        .split(/\n\s*\d+\. /)
-        .filter(Boolean)
-        .map((s) => `<li>${inlineToHtml(s.replace(/^\d+\. /, "").trim())}</li>`)
-        .join("");
-      return `<ol>${items}</ol>`;
-    })
-    // Tables — apply inline markup inside cells
-    .replace(/^\|(.+)\|$/gm, (_, row) => {
-      const cells = row.split("|").map((c: string) => c.trim());
-      return `<tr-row>${cells.map((c: string) => `<cell>${inlineToHtml(c)}</cell>`).join("")}</tr-row>`;
-    })
-    // Table assembler
-    .replace(/(<tr-row>.*?<\/tr-row>\n?)+/gs, (block) => {
-      const rows = [...block.matchAll(/<tr-row>(.*?)<\/tr-row>/gs)];
-      if (rows.length === 0) return block;
+    .split("\n");
+  const html: string[] = [];
+
+  for (let index = 0; index < lines.length;) {
+    const line = lines[index]!;
+    if (!line.trim()) {
+      index += 1;
+      continue;
+    }
+
+    if (/^---+$/.test(line)) {
+      html.push("<hr>");
+      index += 1;
+      continue;
+    }
+
+    const heading = /^(#{1,4}) (.+)$/.exec(line);
+    if (heading) {
+      html.push(`<h${heading[1]!.length}>${inlineToHtml(heading[2]!)}</h${heading[1]!.length}>`);
+      index += 1;
+      continue;
+    }
+
+    const quote = /^&gt; (.+)$/.exec(line);
+    if (quote) {
+      const content = quote[1]!.replace(/^#{1,4}\s+/, "");
+      html.push(`<blockquote><p>${inlineToHtml(content)}</p></blockquote>`);
+      index += 1;
+      continue;
+    }
+
+    const unordered = /^[ \t]*[-*] (.+)$/.exec(line);
+    if (unordered) {
+      const items: string[] = [];
+      while (index < lines.length) {
+        const item = /^[ \t]*[-*] (.+)$/.exec(lines[index]!);
+        if (!item) break;
+        items.push(`<li>${inlineToHtml(item[1]!.trim())}</li>`);
+        index += 1;
+      }
+      html.push(`<ul>${items.join("")}</ul>`);
+      continue;
+    }
+
+    const ordered = /^[ \t]*\d+\. (.+)$/.exec(line);
+    if (ordered) {
+      const items: string[] = [];
+      while (index < lines.length) {
+        const item = /^[ \t]*\d+\. (.+)$/.exec(lines[index]!);
+        if (!item) break;
+        items.push(`<li>${inlineToHtml(item[1]!.trim())}</li>`);
+        index += 1;
+      }
+      html.push(`<ol>${items.join("")}</ol>`);
+      continue;
+    }
+
+    const tableRow = /^\|(.+)\|$/.exec(line);
+    if (tableRow) {
+      const rows: string[][] = [];
+      while (index < lines.length) {
+        const row = /^\|(.+)\|$/.exec(lines[index]!);
+        if (!row) break;
+        rows.push(row[1]!.split("|").map((cell) => inlineToHtml(cell.trim())));
+        index += 1;
+      }
       let table = "<table>";
-      rows.forEach((m, i) => {
-        const cells = [...(m[1] ?? "").matchAll(/<cell>(.*?)<\/cell>/gs)].map((c) => c[1]);
-        if (i === 0) {
-          table += "<thead><tr>" + cells.map((c) => `<th>${c}</th>`).join("") + "</tr></thead><tbody>";
-        } else if (i === 1 && cells.every((c) => /^[-|: ]+$/.test(c ?? ""))) {
-          // separator row — skip
-        } else {
-          table += "<tr>" + cells.map((c) => `<td>${c}</td>`).join("") + "</tr>";
+      rows.forEach((cells, rowIndex) => {
+        if (rowIndex === 0) {
+          table += `<thead><tr>${cells.map((cell) => `<th>${cell}</th>`).join("")}</tr></thead><tbody>`;
+        } else if (rowIndex !== 1 || !cells.every((cell) => /^[-|: ]+$/.test(cell))) {
+          table += `<tr>${cells.map((cell) => `<td>${cell}</td>`).join("")}</tr>`;
         }
       });
-      table += "</tbody></table>";
-      return table;
-    })
-    // Paragraphs — wrap any non-empty line that is not already a block element.
-    // Inline elements (<strong>, <em>, <code>) ARE wrapped; block elements are NOT.
-    .replace(/^.+$/gm, (line) => {
-      if (!line.trim()) return "";
-      if (BLOCK.test(line)) return line;
-      // Already wrapped by a previous rule (e.g. heading lines that were converted inline)
-      if (/^<(tr-row|cell)/.test(line)) return line;
-      return `<p>${inlineToHtml(line)}</p>`;
-    })
-    // Cleanup
-    .replace(/<p>\s*<\/p>/g, "");
+      html.push(`${table}</tbody></table>`);
+      continue;
+    }
+
+    html.push(`<p>${inlineToHtml(line)}</p>`);
+    index += 1;
+  }
+
+  return html.join("\n");
 }
 
 export function renderReportHtml(reportText: string, meta: ReportMeta): string {

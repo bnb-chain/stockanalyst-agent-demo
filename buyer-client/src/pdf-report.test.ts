@@ -9,6 +9,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { performance } from "node:perf_hooks";
 import test from "node:test";
 import { renderReportHtml, saveReportWithRenderer } from "./pdf-report.js";
 
@@ -137,6 +138,24 @@ test("contains no browser-side script while preserving report styling", () => {
   assert.match(html, /class="pos"/);
   assert.match(html, /class="neg"/);
   assert.match(html, /<table>/);
+});
+
+test("renders newline-heavy untrusted reports in linear time", () => {
+  const report = `${"\n".repeat(40_000)}end`;
+  const startedAt = performance.now();
+
+  const html = renderReportHtml(report, {
+    jobId: "7",
+    date: "23 July 2026",
+    symbols: "AAPL",
+  });
+
+  const elapsedMs = performance.now() - startedAt;
+  assert.match(html, /<p>end<\/p>/);
+  assert.ok(
+    elapsedMs < 1_000,
+    `newline-heavy report took ${elapsedMs.toFixed(1)}ms`,
+  );
 });
 
 test("removes a partial PDF while keeping an inert HTML fallback when rendering fails", async () => {

@@ -1,6 +1,41 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { ERC8183Buyer } from "./erc8183.js";
+import { ERC8183Buyer, resolveRpcUrls } from "./erc8183.js";
+
+test("requires an explicit archive RPC URL", () => {
+  assert.throws(
+    () => resolveRpcUrls({}),
+    /BSC_LOG_RPC_URL is required/,
+  );
+});
+
+test("rejects invalid RPC URLs without echoing credentials", () => {
+  const secret = "must-not-appear";
+  assert.throws(
+    () => resolveRpcUrls({
+      BSC_LOG_RPC_URL: `not-a-url-${secret}`,
+    }),
+    (error: unknown) => {
+      assert.ok(error instanceof Error);
+      assert.match(error.message, /BSC_LOG_RPC_URL must be a valid HTTP\(S\) URL/);
+      assert.doesNotMatch(error.message, new RegExp(secret));
+      return true;
+    },
+  );
+});
+
+test("resolves an explicit archive RPC and optional transaction RPC", () => {
+  assert.deepEqual(
+    resolveRpcUrls({
+      BSC_RPC_URL: "https://rpc.example",
+      BSC_LOG_RPC_URL: "https://logs.example/v1/private-key",
+    }),
+    {
+      rpcUrl: "https://rpc.example/",
+      logRpcUrl: "https://logs.example/v1/private-key",
+    },
+  );
+});
 
 function buyerWithDeliverableUrl(value: unknown): ERC8183Buyer {
   const optParams = `0x${Buffer.from(JSON.stringify({ deliverable_url: value })).toString("hex")}`;

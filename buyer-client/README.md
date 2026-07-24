@@ -47,7 +47,6 @@ The free tier proves wallet identity via a 0-U EIP-712 signature and is rate-lim
 
 ---
 
-<<<<<<< HEAD
 ## Prerequisites
 
 - **Node.js 18+** (for native `fetch` + `ReadableStream`)
@@ -57,17 +56,6 @@ The free tier proves wallet identity via a 0-U EIP-712 signature and is rate-lim
 - **Agent** running locally on port 9000 (for x402) or deployed on platform (for ERC-8183)
 
 ---
-=======
-| Step | What happens |
-|---|---|
-| 1 | Load UOMP user context — portfolio (AAPL, NVDA) + risk profile from Guard |
-| 2 | A2A negotiate — fetch OAuth2 token, send signed quote request to cloud seller |
-| 3 | On-chain — `createJob → registerJob → setBudget → approve → fund` (5 txs) |
-| 4 | `notify_funded` — EIP-712-authorize the exact delivery context with the job-client wallet |
-| 5 | Poll on-chain until job status reaches `SUBMITTED` |
-| 6 | Fetch the authenticated deliverable via its on-chain tunnel locator → display report |
-| 7 | Settle — release escrow to seller (available after 24h dispute window) |
->>>>>>> 7ba1935 (docs: describe authenticated delivery protocol)
 
 ## Authenticated `notify_funded`
 

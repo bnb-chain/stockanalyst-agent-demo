@@ -21,6 +21,8 @@ domain needs it, but keep these ops OUT of the LLM tool list.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import time
+from typing import Any
 
 from bnbagent.erc8183 import NegotiationHandler
 
@@ -147,18 +149,83 @@ def sign_quote(request: dict, clamped_price_wei: int) -> dict:
     return result.to_dict()
 
 
+@dataclass(frozen=True)
+class VerifiedJobSnapshot:
+    """One verified chain read shared by authorization and delivery setup."""
+
+    client: str
+    chain_id: int
+    verifying_contract: str
+    spec: Any
+
+
+def verify_signed_job_snapshot(
+    job_id: int,
+) -> tuple[VerifiedJobSnapshot | None, str, bool]:
+    """Verify one fetched job and return its immutable authorization/work fields."""
+    from bnbagent.erc8183.types import JobStatus
+    from bnbagent_studio_core.erc8183.verify import (
+        JobDescription,
+        recover_quote_signer,
+    )
+
+    client = get_8183_client()
+    try:
+        job = client.get_job(job_id)
+    except Exception as exc:  # noqa: BLE001 — RPC/chain failure is retryable
+        return None, f"chain read failed: {exc}", False
+
+    if job.status != JobStatus.FUNDED:
+        return None, f"job status {job.status.name}, expected FUNDED", False
+
+    expected_signer = str(get_wallet().address)
+    if str(job.provider).lower() != expected_signer.lower():
+        return None, "job is not assigned to this provider", True
+
+    if job.expired_at and job.expired_at <= int(time.time()):
+        return None, "job has expired", True
+
+    spec = JobDescription.from_str(job.description)
+    if spec is None:
+        return None, "no signed quote anchored in job description", True
+
+    signer = recover_quote_signer(job.description)
+    if signer is None or signer.lower() != expected_signer.lower():
+        return (
+            None,
+            "quote signature does not match this provider (or terms were tampered)",
+            True,
+        )
+
+    try:
+        if int(job.budget) < int(spec.price):
+            return (
+                None,
+                f"funded budget {job.budget} is below the agreed price {spec.price}",
+                True,
+            )
+    except (TypeError, ValueError):
+        return None, f"unparseable agreed price {spec.price!r}", True
+
+    return (
+        VerifiedJobSnapshot(
+            client=str(job.client),
+            chain_id=int(client.network.chain_id),
+            verifying_contract=str(client.commerce.address),
+            spec=spec,
+        ),
+        "",
+        False,
+    )
+
+
 def verify_signed_job(job_id: int) -> tuple[bool, str, bool]:
     """Verify funded ``job_id`` carries the quote THIS agent signed.
 
-    Thin wrapper over :func:`bnbagent_studio_core.erc8183.verify.verify_signed_job` with
-    ``expected_signer`` = our own wallet address. Returns ``(ok, reason,
-    permanent)``: ``ok`` → safe to work; otherwise ``permanent`` distinguishes a
-    job to skip-forever (record + tell the client) from a transient retry.
+    Compatibility wrapper over :func:`verify_signed_job_snapshot`.
     """
-    from bnbagent_studio_core.erc8183.verify import verify_signed_job as _verify
-
-    v = _verify(job_id, expected_signer=get_wallet().address)
-    return v.ok, v.reason, v.permanent
+    snapshot, reason, permanent = verify_signed_job_snapshot(job_id)
+    return snapshot is not None, reason, permanent
 
 
 @dataclass(frozen=True)

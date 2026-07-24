@@ -13,8 +13,13 @@ type JsonValue =
   | boolean
   | string
   | LosslessNumber
+  | PythonNonFinite
   | JsonValue[]
   | { [key: string]: JsonValue };
+
+class PythonNonFinite {
+  constructor(readonly value: "NaN" | "Infinity" | "-Infinity") {}
+}
 
 export interface DeliverableExpectation {
   jobId: bigint;
@@ -47,6 +52,10 @@ class JsonNestingDepthError extends Error {
 
 function isNumberNode(value: unknown): value is LosslessNumber {
   return value instanceof LosslessNumber;
+}
+
+function isPythonNonFinite(value: unknown): value is PythonNonFinite {
+  return value instanceof PythonNonFinite;
 }
 
 function scanJsonStrings(rawText: string): JsonStringToken[] {
@@ -140,20 +149,81 @@ function protectPrototypeKeys(
   return { protectedText, sentinel };
 }
 
+function protectPythonNonFinite(
+  rawText: string,
+  tokens: readonly JsonStringToken[],
+): {
+  protectedText: string;
+  sentinels: ReadonlyMap<string, PythonNonFinite>;
+} {
+  const strings = new Set(tokens.map(({ value }) => value));
+  const sentinels = new Map<string, PythonNonFinite>();
+  for (const value of ["NaN", "Infinity", "-Infinity"] as const) {
+    let sentinel = `\u0000python-non-finite:${value}`;
+    while (strings.has(sentinel)) sentinel += "\u0000";
+    strings.add(sentinel);
+    sentinels.set(sentinel, new PythonNonFinite(value));
+  }
+
+  let protectedText = "";
+  let index = 0;
+  let tokenIndex = 0;
+  while (index < rawText.length) {
+    const token = tokens[tokenIndex];
+    if (token?.start === index) {
+      protectedText += rawText.slice(token.start, token.end);
+      index = token.end;
+      tokenIndex += 1;
+      continue;
+    }
+
+    let matched: "NaN" | "Infinity" | "-Infinity" | undefined;
+    for (const candidate of ["-Infinity", "Infinity", "NaN"] as const) {
+      if (rawText.startsWith(candidate, index)) {
+        matched = candidate;
+        break;
+      }
+    }
+    if (matched) {
+      const before = index === 0 ? "" : rawText[index - 1]!;
+      const after = rawText[index + matched.length] ?? "";
+      const validBefore = index === 0 || /[\s\[{: ,]/.test(before);
+      const validAfter = index + matched.length === rawText.length || /[\s,\]}]/.test(after);
+      if (validBefore && validAfter) {
+        const sentinel = [...sentinels.entries()]
+          .find(([, marker]) => marker.value === matched)![0];
+        protectedText += JSON.stringify(sentinel);
+        index += matched.length;
+        continue;
+      }
+    }
+    protectedText += rawText[index];
+    index += 1;
+  }
+  return { protectedText, sentinels };
+}
+
 function nullPrototypeRecords(
   value: unknown,
   prototypeKeySentinel: string,
+  nonFiniteSentinels: ReadonlyMap<string, PythonNonFinite>,
 ): JsonValue {
+  if (typeof value === "string") {
+    return nonFiniteSentinels.get(value) ?? value;
+  }
   if (
     value === null
     || typeof value === "boolean"
-    || typeof value === "string"
     || isNumberNode(value)
   ) {
     return value;
   }
   if (Array.isArray(value)) {
-    return value.map((item) => nullPrototypeRecords(item, prototypeKeySentinel));
+    return value.map((item) => nullPrototypeRecords(
+      item,
+      prototypeKeySentinel,
+      nonFiniteSentinels,
+    ));
   }
   if (typeof value !== "object") {
     throw new Error("unsupported JSON value");
@@ -165,6 +235,7 @@ function nullPrototypeRecords(
     record[ownKey] = nullPrototypeRecords(
       (value as Record<string, unknown>)[key],
       prototypeKeySentinel,
+      nonFiniteSentinels,
     );
   }
   return record;
@@ -174,7 +245,13 @@ function parseJson(rawText: string): JsonValue {
   const stringTokens = scanJsonStrings(rawText);
   rejectDuplicateObjectKeys(rawText, stringTokens);
   const { protectedText, sentinel } = protectPrototypeKeys(rawText, stringTokens);
-  return nullPrototypeRecords(parse(protectedText), sentinel);
+  const protectedTokens = scanJsonStrings(protectedText);
+  const nonFinite = protectPythonNonFinite(protectedText, protectedTokens);
+  return nullPrototypeRecords(
+    parse(nonFinite.protectedText),
+    sentinel,
+    nonFinite.sentinels,
+  );
 }
 
 function jsonString(value: string): string {
@@ -253,6 +330,7 @@ function canonicalJson(value: JsonValue): string {
   if (value === null || typeof value === "boolean") return String(value);
   if (typeof value === "string") return jsonString(value);
   if (isNumberNode(value)) return canonicalNumber(value);
+  if (isPythonNonFinite(value)) return value.value;
   if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
   const objectValue = value as { [key: string]: JsonValue };
   return `{${Object.keys(objectValue).sort(compareUnicodeCodePoints).map(
@@ -261,7 +339,13 @@ function canonicalJson(value: JsonValue): string {
 }
 
 function object(value: JsonValue, field: string): Record<string, JsonValue> {
-  if (value === null || Array.isArray(value) || typeof value !== "object" || isNumberNode(value)) {
+  if (
+    value === null
+    || Array.isArray(value)
+    || typeof value !== "object"
+    || isNumberNode(value)
+    || isPythonNonFinite(value)
+  ) {
     throw new Error(`DeliverableManifest.${field} must be an object`);
   }
   return value;

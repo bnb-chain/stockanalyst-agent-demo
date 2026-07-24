@@ -167,6 +167,9 @@ class SellerCore:
         # Immutable, authorization-bound off-chain context. This is installed
         # only after all on-chain and wallet checks succeed.
         self._job_contexts: dict[int, JobContext] = {}
+        # Immutable, provider-signed on-chain spec captured by the same verified
+        # chain read as the job client used for notification authorization.
+        self._job_specs: dict[int, object] = {}
         self._context_deadlines: dict[int, float] = {}
         self._context_events: dict[int, asyncio.Event] = {}
         self._notify_validation_slots = asyncio.Semaphore(
@@ -295,8 +298,8 @@ class SellerCore:
             return {"status": "rejected", "job_id": job_id, "reason": error.code}
 
         try:
-            ok, reason, permanent = await asyncio.wait_for(
-                asyncio.to_thread(signing.verify_signed_job, job_id),
+            snapshot, reason, permanent = await asyncio.wait_for(
+                asyncio.to_thread(signing.verify_signed_job_snapshot, job_id),
                 timeout=_PREVERIFY_TIMEOUT_SECONDS,
             )
         except Exception:  # noqa: BLE001 — includes RPC and timeout failures
@@ -307,7 +310,7 @@ class SellerCore:
                 "reason": "verification_unavailable",
                 "retryable": True,
             }
-        if not ok:
+        if snapshot is None:
             if permanent:
                 logger.warning("job %s: verify rejected permanently — %s", job_id, reason)
                 return {"status": "rejected", "job_id": job_id, "reason": reason}
@@ -320,27 +323,13 @@ class SellerCore:
             }
 
         try:
-            target = await asyncio.wait_for(
-                asyncio.to_thread(signing.job_authorization_target, job_id),
-                timeout=_PREVERIFY_TIMEOUT_SECONDS,
-            )
-        except Exception:  # noqa: BLE001 — includes RPC and timeout failures
-            logger.warning("job %s: authorization target unavailable", job_id)
-            return {
-                "status": "rejected",
-                "job_id": job_id,
-                "reason": "verification_unavailable",
-                "retryable": True,
-            }
-
-        try:
             context = await asyncio.wait_for(
                 self._run_notify_validation(
                     authorization,
                     job_id=job_id,
-                    expected_client=target.client,
-                    chain_id=target.chain_id,
-                    verifying_contract=target.verifying_contract,
+                    expected_client=snapshot.client,
+                    chain_id=snapshot.chain_id,
+                    verifying_contract=snapshot.verifying_contract,
                 ),
                 timeout=_PREVERIFY_TIMEOUT_SECONDS,
             )
@@ -376,6 +365,8 @@ class SellerCore:
         elif existing_context.digest != context.digest:
             logger.warning("job %s: notification rejected — context_conflict", job_id)
             return {"status": "rejected", "job_id": job_id, "reason": "context_conflict"}
+        if snapshot.spec is not None:
+            self._job_specs[job_id] = snapshot.spec
         context_event = self._context_events.get(job_id)
         if context_event is not None:
             context_event.set()
@@ -437,8 +428,17 @@ class SellerCore:
             # is_busy() True — which would pin the microVM to its 8h max-lifetime.
             # A timeout is TRANSIENT: terminal stays False, the slot is freed, and
             # the funded job is re-delivered idempotently by a later sweep.
+            if verified:
+                spec = self._job_specs.get(job_id, _JOB_SPEC_UNSET)
+                delivery = (
+                    self._do_work_and_submit(job_id)
+                    if spec is _JOB_SPEC_UNSET
+                    else self._do_work_and_submit(job_id, spec=spec)
+                )
+            else:
+                delivery = self._fulfill_job(job_id)
             result = await asyncio.wait_for(
-                self._do_work_and_submit(job_id) if verified else self._fulfill_job(job_id),
+                delivery,
                 timeout=_JOB_DELIVERY_TIMEOUT_SECONDS,
             )
             logger.info(
@@ -470,6 +470,7 @@ class SellerCore:
                 self._late_submit_successes.discard(job_id)
                 self._pending_verified_handoffs.discard(job_id)
                 self._job_contexts.pop(job_id, None)
+                self._job_specs.pop(job_id, None)
                 self._context_deadlines.pop(job_id, None)
                 self._context_events.pop(job_id, None)
                 self._contextless_started.discard(job_id)
@@ -522,11 +523,11 @@ class SellerCore:
         (not our signature, tampered terms, underfunded, expired) returns
         ``skip: True``; a transient one returns ``ok: False`` to retry.
         """
-        ok, reason, permanent = await asyncio.to_thread(
-            signing.verify_signed_job,
+        snapshot, reason, permanent = await asyncio.to_thread(
+            signing.verify_signed_job_snapshot,
             job_id,
         )
-        if not ok:
+        if snapshot is None:
             return {
                 "ok": False,
                 "job_id": job_id,
@@ -534,7 +535,8 @@ class SellerCore:
                 "reason": reason,
             }
 
-        spec = await asyncio.to_thread(signing.job_spec, job_id)
+        spec = snapshot.spec
+        self._job_specs[job_id] = spec
         ready = await self._await_sweep_context(
             job_id,
             required=_requires_notify_context(spec),

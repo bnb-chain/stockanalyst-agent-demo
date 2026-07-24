@@ -35,8 +35,28 @@ signing_stub.sign_quote = lambda request, price: {}
 signing_stub.verify_signed_job = lambda job_id: (True, "", False)
 signing_stub.job_authorization_target = lambda job_id: None
 signing_stub.job_spec = lambda job_id: None
+
+
+def _verified_job_snapshot_stub(job_id: int):
+    ok, reason, permanent = signing_stub.verify_signed_job(job_id)
+    if not ok:
+        return None, reason, permanent
+    target = signing_stub.job_authorization_target(job_id)
+    return (
+        SimpleNamespace(
+            client=target.client,
+            chain_id=target.chain_id,
+            verifying_contract=target.verifying_contract,
+            spec=signing_stub.job_spec(job_id),
+        ),
+        "",
+        False,
+    )
+
+
+signing_stub.verify_signed_job_snapshot = _verified_job_snapshot_stub
 signing_stub.submit_result = lambda *args, **kwargs: None
-sys.modules.setdefault("signing", signing_stub)
+sys.modules["signing"] = signing_stub
 
 studio_core_stub = ModuleType("bnbagent_studio_core")
 erc8183_stub = ModuleType("bnbagent_studio_core.erc8183")
@@ -66,9 +86,9 @@ errors_stub.SubmitPermanentlyUnsupportedError = SubmitPermanentlyUnsupportedErro
 errors_stub.SdkCallFailedError = SdkCallFailedError
 studio_core_stub.erc8183 = erc8183_stub
 erc8183_stub.errors = errors_stub
-sys.modules.setdefault("bnbagent_studio_core", studio_core_stub)
-sys.modules.setdefault("bnbagent_studio_core.erc8183", erc8183_stub)
-sys.modules.setdefault("bnbagent_studio_core.erc8183.errors", errors_stub)
+sys.modules["bnbagent_studio_core"] = studio_core_stub
+sys.modules["bnbagent_studio_core.erc8183"] = erc8183_stub
+sys.modules["bnbagent_studio_core.erc8183.errors"] = errors_stub
 
 from stockanalyst.app.agent import seller_core as seller_core_module  # noqa: E402
 from stockanalyst.app.agent.seller_core import SellerCore  # noqa: E402
@@ -723,6 +743,80 @@ class NotifyFundedAuthorizationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(submit.call_args.kwargs["gateway_url"], context.gateway_url)
         self.assertEqual(submit.call_args.kwargs["gateway_token"], context.gateway_token)
         self.assertIs(result["ok"], True)
+
+    async def test_named_notification_uses_one_verified_job_snapshot(self) -> None:
+        snapshot = SimpleNamespace(
+            client=self.client.address,
+            chain_id=CHAIN_ID,
+            verifying_contract=COMMERCE,
+            spec=_job_spec(required=True),
+        )
+        with (
+            patch.object(
+                seller_core_module.signing,
+                "verify_signed_job_snapshot",
+                return_value=(snapshot, "", False),
+                create=True,
+            ) as verify_snapshot,
+            patch.object(
+                seller_core_module.signing,
+                "verify_signed_job",
+                side_effect=AssertionError("legacy verification read"),
+            ),
+            patch.object(
+                seller_core_module.signing,
+                "job_authorization_target",
+                side_effect=AssertionError("second authorization read"),
+            ),
+        ):
+            result = await self.core.notify_funded(self._signed_request())
+
+        self.assertEqual(result["status"], "accepted")
+        verify_snapshot.assert_called_once_with(JOB_ID)
+
+    async def test_sweep_reuses_spec_from_one_verified_job_snapshot(self) -> None:
+        run_work = AsyncMock(return_value="report")
+        core = SellerCore(run_work=run_work, generator="test")
+        context = self._context_from_request(self._signed_request())
+        core._job_contexts[JOB_ID] = context
+        snapshot = SimpleNamespace(
+            client=self.client.address,
+            chain_id=CHAIN_ID,
+            verifying_contract=COMMERCE,
+            spec=_job_spec(required=True),
+        )
+        submitted = SimpleNamespace(
+            submit_tx="0xtx",
+            deliverable_url="https://result",
+        )
+        with (
+            patch.object(
+                seller_core_module.signing,
+                "verify_signed_job_snapshot",
+                return_value=(snapshot, "", False),
+                create=True,
+            ) as verify_snapshot,
+            patch.object(
+                seller_core_module.signing,
+                "verify_signed_job",
+                side_effect=AssertionError("legacy verification read"),
+            ),
+            patch.object(
+                seller_core_module.signing,
+                "job_spec",
+                side_effect=AssertionError("second spec read"),
+            ),
+            patch.object(
+                seller_core_module.signing,
+                "submit_result",
+                return_value=submitted,
+            ),
+        ):
+            result = await core._fulfill_job(JOB_ID)
+
+        self.assertIs(result["ok"], True)
+        verify_snapshot.assert_called_once_with(JOB_ID)
+        run_work.assert_awaited_once()
 
     async def test_transient_delivery_keeps_context_for_retry(self) -> None:
         context = self._context_from_request(self._signed_request())
@@ -1414,11 +1508,16 @@ class NotifyFundedAuthorizationTests(unittest.IsolatedAsyncioTestCase):
         core._sweep = AsyncMock(return_value=None)
         job_spec_started = threading.Event()
         release_job_spec = threading.Event()
+        job_spec_calls = 0
 
         def failing_job_spec(_job_id: int):
-            job_spec_started.set()
-            release_job_spec.wait(timeout=5)
-            raise RuntimeError("job spec unavailable")
+            nonlocal job_spec_calls
+            job_spec_calls += 1
+            if job_spec_calls == 1:
+                job_spec_started.set()
+                release_job_spec.wait(timeout=5)
+                raise RuntimeError("job spec unavailable")
+            return _job_spec(required=True)
 
         core._do_work_and_submit = AsyncMock(
             return_value={"ok": True, "job_id": JOB_ID, "tx_hash": "0xtx"}
@@ -1437,7 +1536,10 @@ class NotifyFundedAuthorizationTests(unittest.IsolatedAsyncioTestCase):
             await self._drain_tasks(core)
 
         self.assertEqual(response["status"], "accepted")
-        core._do_work_and_submit.assert_awaited_once_with(JOB_ID)
+        core._do_work_and_submit.assert_awaited_once_with(
+            JOB_ID,
+            spec=_job_spec(required=True),
+        )
         self.assertIn(JOB_ID, core._handled)
         self.assertNotIn(JOB_ID, core._inflight)
         self.assertNotIn(JOB_ID, core._job_contexts)
