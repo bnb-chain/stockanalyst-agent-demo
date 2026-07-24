@@ -923,6 +923,55 @@ class NotifyFundedAuthorizationTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(JOB_ID, core._inflight)
         self.assertNotIn(JOB_ID, core._handled)
 
+    async def test_required_sweep_cleanup_recovers_context_committed_while_inflight(
+        self,
+    ) -> None:
+        core = SellerCore(run_work=AsyncMock(return_value="report"), generator="test")
+        context = self._context_from_request(self._signed_request())
+        core._fulfill_job = AsyncMock(
+            return_value={
+                "ok": False,
+                "job_id": JOB_ID,
+                "skip": False,
+                "reason": "notify_context_required",
+            }
+        )
+        core._do_work_and_submit = AsyncMock(
+            return_value={"ok": True, "job_id": JOB_ID, "tx_hash": "0xtx"}
+        )
+        core._inflight.add(JOB_ID)
+        named_spawn_task_counts: list[tuple[int, int]] = []
+        context_installed = False
+
+        def install_context_before_cleanup(*_args) -> None:
+            nonlocal context_installed
+            if context_installed:
+                return
+            context_installed = True
+            self.assertIn(JOB_ID, core._inflight)
+            core._job_contexts[JOB_ID] = context
+            before = len(core._tasks)
+            core._spawn_job(JOB_ID, verified=True)
+            named_spawn_task_counts.append((before, len(core._tasks)))
+
+        with (
+            patch.object(
+                seller_core_module.logger,
+                "info",
+                side_effect=install_context_before_cleanup,
+            ),
+            patch.object(core, "_spawn_job", wraps=core._spawn_job) as spawn_job,
+        ):
+            await core._run_job(JOB_ID, verified=False)
+            await self._drain_tasks(core)
+
+        self.assertEqual(named_spawn_task_counts, [(0, 0)])
+        self.assertEqual(spawn_job.call_count, 2)
+        core._do_work_and_submit.assert_awaited_once_with(JOB_ID)
+        self.assertIn(JOB_ID, core._handled)
+        self.assertNotIn(JOB_ID, core._inflight)
+        self.assertNotIn(JOB_ID, core._job_contexts)
+
     def test_only_exact_signed_marker_requires_context(self) -> None:
         required = SimpleNamespace(
             terms={"success_criteria": "uomp_notify_context_required_v1"}

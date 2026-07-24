@@ -413,6 +413,7 @@ class SellerCore:
         work; unverified ones (the sweep) run the full verify gate first.
         """
         terminal = False
+        resume_verified = False
         try:
             # Hard ceiling so a hung delivery (e.g. unresponsive RPC) cannot keep
             # is_busy() True — which would pin the microVM to its 8h max-lifetime.
@@ -434,6 +435,11 @@ class SellerCore:
             # notify CAS gate rejects stale verified requests after context cleanup.
             # Only transient failures clear all markers for a later retry.
             terminal = bool(result.get("ok") or result.get("skip"))
+            resume_verified = (
+                not verified
+                and not terminal
+                and result.get("reason") == "notify_context_required"
+            )
         except (asyncio.TimeoutError, TimeoutError):
             # Transient by design — leave terminal False so a later sweep retries.
             logger.warning(
@@ -451,6 +457,8 @@ class SellerCore:
             else:
                 self._inflight.discard(job_id)
                 self._contextless_started.discard(job_id)
+                if resume_verified and job_id in self._job_contexts:
+                    self._spawn_job(job_id, verified=True)
 
     # -- internals -------------------------------------------------------------
     async def _await_sweep_context(self, job_id: int, *, required: bool) -> bool:
