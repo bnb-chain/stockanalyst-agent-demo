@@ -378,7 +378,10 @@ class NotifyFundedAuthorizationTests(unittest.IsolatedAsyncioTestCase):
             release.set()
             result = await notification
 
-        self.assertNotEqual(validator_threads, [loop_thread])
+        self.assertEqual(len(validator_threads), 1)
+        self.assertTrue(
+            all(thread_id != loop_thread for thread_id in validator_threads)
+        )
         self.assertEqual(result["status"], "accepted")
 
     async def test_signature_recovery_runs_off_event_loop(self) -> None:
@@ -418,6 +421,7 @@ class NotifyFundedAuthorizationTests(unittest.IsolatedAsyncioTestCase):
                     side_effect=blocking_validate,
                 ),
                 patch.object(seller_core_module, "_PREVERIFY_TIMEOUT_SECONDS", 0.05),
+                patch.object(self.core, "_spawn_sweep") as spawn_sweep,
             ):
                 notification = asyncio.create_task(
                     self.core.notify_funded(self._signed_request())
@@ -438,6 +442,7 @@ class NotifyFundedAuthorizationTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(self.core.spawned_jobs, [])
             self.assertNotIn(JOB_ID, self.core._handled)
             self.assertNotIn(JOB_ID, self.core._contextless_started)
+            spawn_sweep.assert_not_called()
         finally:
             release.set()
 
