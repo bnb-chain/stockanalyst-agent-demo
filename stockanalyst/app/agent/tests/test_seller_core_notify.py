@@ -222,6 +222,64 @@ class NotifyFundedAuthorizationTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.gather(*tuple(core._tasks), return_exceptions=True)
             await asyncio.sleep(0)
 
+    def assert_optional_contextless_transition_is_atomic(
+        self,
+        source: str,
+    ) -> None:
+        function = ast.parse(textwrap.dedent(source)).body[0]
+        self.assertIsInstance(function, ast.AsyncFunctionDef)
+        assert isinstance(function, ast.AsyncFunctionDef)
+
+        marker_indices = [
+            index
+            for index, statement in enumerate(function.body)
+            if any(
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "add"
+                and isinstance(node.func.value, ast.Attribute)
+                and node.func.value.attr == "_contextless_started"
+                for node in ast.walk(statement)
+            )
+        ]
+        self.assertEqual(len(marker_indices), 1)
+        marker_index = marker_indices[0]
+        context_lookup_indices = [
+            index
+            for index, statement in enumerate(function.body[:marker_index])
+            if isinstance(statement, ast.If)
+            and any(
+                isinstance(node, ast.Attribute)
+                and node.attr == "_job_contexts"
+                for node in ast.walk(statement.test)
+            )
+        ]
+        self.assertGreaterEqual(len(context_lookup_indices), 2)
+        final_lookup_index = context_lookup_indices[-1]
+        final_lookup = function.body[final_lookup_index]
+        assert isinstance(final_lookup, ast.If)
+        self.assertEqual(
+            final_lookup.orelse,
+            [],
+            "final context decision must not have an else branch",
+        )
+
+        guarded_statements = function.body[
+            final_lookup_index : marker_index + 1
+        ]
+        suspension_types = (ast.Await, ast.AsyncWith, ast.AsyncFor)
+        suspensions = [
+            type(node).__name__
+            for statement in guarded_statements
+            for node in ast.walk(statement)
+            if isinstance(node, suspension_types)
+        ]
+        self.assertEqual(
+            suspensions,
+            [],
+            "optional contextless marker transition must not suspend",
+        )
+
     async def test_unsigned_named_notification_is_rejected_without_state(self) -> None:
         result = await self.core.notify_funded({"job_id": JOB_ID})
 
@@ -993,54 +1051,67 @@ class NotifyFundedAuthorizationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(core._context_deadlines[JOB_ID], original_deadline)
 
     def test_optional_contextless_transition_has_no_await_gap(self) -> None:
-        source = textwrap.dedent(
+        self.assert_optional_contextless_transition_is_atomic(
             inspect.getsource(SellerCore._await_sweep_context)
         )
-        function = ast.parse(source).body[0]
-        self.assertIsInstance(function, ast.AsyncFunctionDef)
-        assert isinstance(function, ast.AsyncFunctionDef)
 
-        marker_indices = [
-            index
-            for index, statement in enumerate(function.body)
-            if any(
-                isinstance(node, ast.Call)
-                and isinstance(node.func, ast.Attribute)
-                and node.func.attr == "add"
-                and isinstance(node.func.value, ast.Attribute)
-                and node.func.value.attr == "_contextless_started"
-                for node in ast.walk(statement)
-            )
-        ]
-        self.assertEqual(len(marker_indices), 1)
-        marker_index = marker_indices[0]
-        context_lookup_indices = [
-            index
-            for index, statement in enumerate(function.body[:marker_index])
-            if isinstance(statement, ast.If)
-            and any(
-                isinstance(node, ast.Attribute)
-                and node.attr == "_job_contexts"
-                for node in ast.walk(statement.test)
-            )
-        ]
-        self.assertGreaterEqual(len(context_lookup_indices), 2)
-        final_lookup_index = context_lookup_indices[-1]
+    def test_optional_transition_ast_guard_rejects_all_suspensions(self) -> None:
+        mutants = {
+            "else-await": """
+                async def sample(self, job_id, required):
+                    if job_id in self._job_contexts:
+                        return True
+                    if job_id in self._job_contexts:
+                        return True
+                    else:
+                        await asyncio.sleep(0)
+                    if required:
+                        return False
+                    self._contextless_started.add(job_id)
+                    return True
+            """,
+            "async-with": """
+                async def sample(self, job_id, required):
+                    if job_id in self._job_contexts:
+                        return True
+                    if job_id in self._job_contexts:
+                        return True
+                    async with context_manager:
+                        pass
+                    if required:
+                        return False
+                    self._contextless_started.add(job_id)
+                    return True
+            """,
+            "async-for": """
+                async def sample(self, job_id, required):
+                    if job_id in self._job_contexts:
+                        return True
+                    if job_id in self._job_contexts:
+                        return True
+                    async for item in async_items:
+                        consume(item)
+                    if required:
+                        return False
+                    self._contextless_started.add(job_id)
+                    return True
+            """,
+        }
+        expected_messages = {
+            "else-await": "final context decision must not have an else branch",
+            "async-with": "optional contextless marker transition must not suspend",
+            "async-for": "optional contextless marker transition must not suspend",
+        }
 
-        guarded_statements = function.body[
-            final_lookup_index + 1 : marker_index + 1
-        ]
-        awaits = [
-            node
-            for statement in guarded_statements
-            for node in ast.walk(statement)
-            if isinstance(node, ast.Await)
-        ]
-        self.assertEqual(
-            awaits,
-            [],
-            "optional contextless marker transition must remain await-free",
-        )
+        for name, source in mutants.items():
+            with (
+                self.subTest(mutant=name),
+                self.assertRaisesRegex(
+                    AssertionError,
+                    expected_messages[name],
+                ),
+            ):
+                self.assert_optional_contextless_transition_is_atomic(source)
 
     async def test_repeated_sweep_discovery_keeps_one_grace_worker(self) -> None:
         core = SellerCore(run_work=AsyncMock(), generator="test")
