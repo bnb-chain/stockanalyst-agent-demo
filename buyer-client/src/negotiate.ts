@@ -15,14 +15,27 @@ import {
 
 export type { NotifyOptions } from "./notify-auth.js";
 
+export const NOTIFY_CONTEXT_REQUIRED = "uomp_notify_context_required_v1";
+
 export interface NegotiationEnvelope {
   request: {
     task_description: string;
-    terms: { deliverables: string; quality_standards: string };
+    terms: {
+      deliverables: string;
+      quality_standards: string;
+      success_criteria?: string;
+    };
   };
   response: {
     accepted: boolean;
-    terms: { price: string; currency: string; deliverables?: string; quality_standards?: string; [key: string]: unknown };
+    terms: {
+      price: string;
+      currency: string;
+      deliverables?: string;
+      quality_standards?: string;
+      success_criteria?: string;
+      [key: string]: unknown;
+    };
     negotiated_at?: number;
     quote_expires_at?: number;
     estimated_completion_seconds?: number;
@@ -116,7 +129,11 @@ export async function negotiate(
             data: {
               skill: "negotiate",
               task_description: task,
-              terms: { deliverables, quality_standards: quality },
+              terms: {
+                deliverables,
+                quality_standards: quality,
+                success_criteria: NOTIFY_CONTEXT_REQUIRED,
+              },
             },
           },
         ],
@@ -173,6 +190,9 @@ export function buildJobDescription(envelope: NegotiationEnvelope): string {
     deliverables: sanitize(responseTerms.deliverables ?? ""),
     quality_standards: sanitize(responseTerms.quality_standards ?? ""),
   };
+  if (responseTerms.success_criteria != null) {
+    terms["success_criteria"] = sanitize(responseTerms.success_criteria);
+  }
 
   const content: Record<string, unknown> = {
     version: 1,

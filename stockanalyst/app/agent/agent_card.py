@@ -34,9 +34,11 @@ _NEGOTIATE = AgentSkill(
     name="Negotiate an ERC-8183 job",
     description=(
         'Send a data part {"skill": "negotiate", "task_description": "...", '
-        '"terms": {"deliverables": "...", "quality_standards": "..."}} (both '
-        "terms keys are REQUIRED) and receive a "
-        "wallet-signed price quote (price, currency, negotiation_hash, provider_sig). "
+        '"terms": {"deliverables": "...", "quality_standards": "...", '
+        '"success_criteria": "uomp_notify_context_required_v1"}} (all three terms '
+        "keys are REQUIRED) and receive a wallet-signed price quote. The exact "
+        "success_criteria value must be copied from the signed response into the "
+        "on-chain job description before funding. "
         "Anchor the returned envelope on-chain via createJob + fund, then use the "
         "buyer client's notifyFunded helper with the job-creation wallet. It sends "
         "the job_id with an EIP-712 authorization for the exact delivery context."

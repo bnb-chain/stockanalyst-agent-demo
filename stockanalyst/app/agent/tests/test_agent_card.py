@@ -61,6 +61,7 @@ class NotifyFundedCardTests(unittest.TestCase):
         self.assertIn("notifyFunded", description)
         self.assertIn("EIP-712", description)
         self.assertIn("authorization", description.lower())
+        self.assertIn("uomp_notify_context_required_v1", description)
         self.assertNotIn("`notify_funded` skill with the job_id", description)
 
     def test_card_requires_eip712_job_client_authorization(self) -> None:
