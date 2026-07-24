@@ -1367,6 +1367,401 @@ class NotifyFundedAuthorizationTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(JOB_ID, core._inflight)
         self.assertNotIn(JOB_ID, core._job_contexts)
 
+    async def test_named_context_handoffs_after_transient_sweep_verification(
+        self,
+    ) -> None:
+        core = SellerCore(run_work=AsyncMock(return_value="report"), generator="test")
+        core._sweep = AsyncMock(return_value=None)
+        sweep_verify_started = threading.Event()
+        release_sweep_verify = threading.Event()
+        verify_calls = 0
+        verify_lock = threading.Lock()
+
+        def ordered_verify(_job_id: int) -> tuple[bool, str, bool]:
+            nonlocal verify_calls
+            with verify_lock:
+                verify_calls += 1
+                call_number = verify_calls
+            if call_number == 1:
+                sweep_verify_started.set()
+                release_sweep_verify.wait(timeout=5)
+                return False, "rpc_unavailable", False
+            return True, "", False
+
+        core._do_work_and_submit = AsyncMock(
+            return_value={"ok": True, "job_id": JOB_ID, "tx_hash": "0xtx"}
+        )
+        self.verify_signed_job.side_effect = ordered_verify
+
+        core._spawn_job(JOB_ID, verified=False)
+        self.assertTrue(await asyncio.to_thread(sweep_verify_started.wait, 2))
+        try:
+            response = await core.notify_funded(self._signed_request())
+        finally:
+            release_sweep_verify.set()
+        await self._drain_tasks(core)
+
+        self.assertEqual(response["status"], "accepted")
+        core._do_work_and_submit.assert_awaited_once_with(JOB_ID)
+        self.assertIn(JOB_ID, core._handled)
+        self.assertNotIn(JOB_ID, core._inflight)
+        self.assertNotIn(JOB_ID, core._job_contexts)
+
+    async def test_named_context_handoffs_after_transient_sweep_job_spec_failure(
+        self,
+    ) -> None:
+        core = SellerCore(run_work=AsyncMock(return_value="report"), generator="test")
+        core._sweep = AsyncMock(return_value=None)
+        job_spec_started = threading.Event()
+        release_job_spec = threading.Event()
+
+        def failing_job_spec(_job_id: int):
+            job_spec_started.set()
+            release_job_spec.wait(timeout=5)
+            raise RuntimeError("job spec unavailable")
+
+        core._do_work_and_submit = AsyncMock(
+            return_value={"ok": True, "job_id": JOB_ID, "tx_hash": "0xtx"}
+        )
+        with patch.object(
+            seller_core_module.signing,
+            "job_spec",
+            side_effect=failing_job_spec,
+        ):
+            core._spawn_job(JOB_ID, verified=False)
+            self.assertTrue(await asyncio.to_thread(job_spec_started.wait, 2))
+            try:
+                response = await core.notify_funded(self._signed_request())
+            finally:
+                release_job_spec.set()
+            await self._drain_tasks(core)
+
+        self.assertEqual(response["status"], "accepted")
+        core._do_work_and_submit.assert_awaited_once_with(JOB_ID)
+        self.assertIn(JOB_ID, core._handled)
+        self.assertNotIn(JOB_ID, core._inflight)
+        self.assertNotIn(JOB_ID, core._job_contexts)
+
+    async def test_submit_thread_retains_contextless_ownership_after_timeout(
+        self,
+    ) -> None:
+        run_work = AsyncMock(return_value="report")
+        core = SellerCore(run_work=run_work, generator="test")
+        core._sweep = AsyncMock(return_value=None)
+        core._context_deadlines[JOB_ID] = asyncio.get_running_loop().time() - 1.0
+        submit_started = threading.Event()
+        release_submit = threading.Event()
+        timeout_fired = asyncio.Event()
+        delivery_timeout = 0.01
+        real_wait_for = asyncio.wait_for
+
+        def blocking_submit(*_args, **_kwargs):
+            submit_started.set()
+            release_submit.wait(timeout=5)
+            raise RuntimeError("late submit failure")
+
+        async def controlled_wait_for(awaitable, *, timeout: float):
+            coroutine_code = getattr(awaitable, "cr_code", None)
+            coroutine_name = getattr(coroutine_code, "co_name", "")
+            if (
+                timeout == delivery_timeout
+                and coroutine_name in {"_fulfill_job", "_do_work_and_submit"}
+            ):
+                worker = asyncio.create_task(awaitable)
+                if not await asyncio.to_thread(submit_started.wait, 2):
+                    raise AssertionError("submit_result did not start")
+                worker.cancel()
+                timeout_fired.set()
+                try:
+                    await worker
+                except asyncio.CancelledError as cancelled:
+                    raise asyncio.TimeoutError from cancelled
+                raise AssertionError("delivery ignored timeout cancellation")
+            return await real_wait_for(awaitable, timeout=timeout)
+
+        loop = asyncio.get_running_loop()
+        loop_errors: list[dict[str, object]] = []
+        previous_handler = loop.get_exception_handler()
+        loop.set_exception_handler(
+            lambda _loop, context: loop_errors.append(context)
+        )
+        try:
+            with (
+                patch.object(
+                    seller_core_module,
+                    "_JOB_DELIVERY_TIMEOUT_SECONDS",
+                    delivery_timeout,
+                ),
+                patch.object(
+                    seller_core_module.asyncio,
+                    "wait_for",
+                    new=controlled_wait_for,
+                ),
+                patch.object(
+                    seller_core_module.signing,
+                    "job_spec",
+                    return_value=_job_spec(required=False),
+                ),
+                patch.object(
+                    seller_core_module.signing,
+                    "submit_result",
+                    side_effect=blocking_submit,
+                ) as submit,
+            ):
+                core._spawn_job(JOB_ID, verified=False)
+                await real_wait_for(timeout_fired.wait(), timeout=2)
+
+                self.assertTrue(core.is_busy())
+                self.assertIn(JOB_ID, core._inflight)
+                self.assertIn(JOB_ID, core._contextless_started)
+
+                response = await core.notify_funded(self._signed_request())
+
+                self.assertEqual(response["status"], "rejected")
+                self.assertEqual(response["reason"], "delivery_already_started")
+                run_work.assert_awaited_once()
+                self.assertEqual(submit.call_count, 1)
+        finally:
+            release_submit.set()
+            await self._drain_tasks(core)
+            await asyncio.sleep(0)
+            loop.set_exception_handler(previous_handler)
+
+        self.assertFalse(core.is_busy())
+        self.assertNotIn(JOB_ID, core._inflight)
+        self.assertNotIn(JOB_ID, core._contextless_started)
+        self.assertEqual(loop_errors, [])
+
+    async def test_late_success_satisfies_pending_named_handoff_without_redelivery(
+        self,
+    ) -> None:
+        run_work = AsyncMock(return_value="report")
+        core = SellerCore(run_work=run_work, generator="test")
+        core._sweep = AsyncMock(return_value=None)
+        job_spec_started = threading.Event()
+        release_job_spec = threading.Event()
+        submit_started = threading.Event()
+        release_submit = threading.Event()
+        timeout_fired = asyncio.Event()
+        delivery_timeout = 0.01
+        real_wait_for = asyncio.wait_for
+        timeout_applied = False
+        spec_calls = 0
+        submit_calls = 0
+        call_lock = threading.Lock()
+        submitted = SimpleNamespace(
+            submit_tx="0xtx",
+            deliverable_url="https://result",
+        )
+
+        def ordered_job_spec(_job_id: int):
+            nonlocal spec_calls
+            with call_lock:
+                spec_calls += 1
+                call_number = spec_calls
+            if call_number == 1:
+                job_spec_started.set()
+                release_job_spec.wait(timeout=5)
+            return _job_spec(required=True)
+
+        def ordered_submit(*_args, **_kwargs):
+            nonlocal submit_calls
+            with call_lock:
+                submit_calls += 1
+                call_number = submit_calls
+            if call_number == 1:
+                submit_started.set()
+                release_submit.wait(timeout=5)
+            return submitted
+
+        async def controlled_wait_for(awaitable, *, timeout: float):
+            nonlocal timeout_applied
+            coroutine_code = getattr(awaitable, "cr_code", None)
+            coroutine_name = getattr(coroutine_code, "co_name", "")
+            if (
+                not timeout_applied
+                and timeout == delivery_timeout
+                and coroutine_name in {"_fulfill_job", "_do_work_and_submit"}
+            ):
+                timeout_applied = True
+                worker = asyncio.create_task(awaitable)
+                if not await asyncio.to_thread(submit_started.wait, 2):
+                    raise AssertionError("submit_result did not start")
+                worker.cancel()
+                timeout_fired.set()
+                try:
+                    await worker
+                except asyncio.CancelledError as cancelled:
+                    raise asyncio.TimeoutError from cancelled
+                raise AssertionError("delivery ignored timeout cancellation")
+            return await real_wait_for(awaitable, timeout=timeout)
+
+        with (
+            patch.object(
+                seller_core_module,
+                "_JOB_DELIVERY_TIMEOUT_SECONDS",
+                delivery_timeout,
+            ),
+            patch.object(
+                seller_core_module.asyncio,
+                "wait_for",
+                new=controlled_wait_for,
+            ),
+            patch.object(
+                seller_core_module.signing,
+                "job_spec",
+                side_effect=ordered_job_spec,
+            ),
+            patch.object(
+                seller_core_module.signing,
+                "submit_result",
+                side_effect=ordered_submit,
+            ) as submit,
+        ):
+            core._spawn_job(JOB_ID, verified=False)
+            self.assertTrue(await asyncio.to_thread(job_spec_started.wait, 2))
+            try:
+                response = await core.notify_funded(self._signed_request())
+            finally:
+                release_job_spec.set()
+
+            await real_wait_for(timeout_fired.wait(), timeout=2)
+            self.assertTrue(core.is_busy())
+            self.assertIn(JOB_ID, core._inflight)
+            release_submit.set()
+            await self._drain_tasks(core)
+
+        self.assertEqual(response["status"], "accepted")
+        run_work.assert_awaited_once()
+        self.assertEqual(submit.call_count, 1)
+        self.assertIsNotNone(submit.call_args.kwargs["gateway_url"])
+        self.assertNotIn(JOB_ID, core._handled)
+        self.assertIn(JOB_ID, core._job_contexts)
+        self.assertNotIn(JOB_ID, core._inflight)
+        self.assertNotIn(JOB_ID, core._pending_verified_handoffs)
+        self.assertIn(JOB_ID, core._late_submit_successes)
+
+    async def test_stale_named_validation_cannot_cross_late_success_cleanup(
+        self,
+    ) -> None:
+        run_work = AsyncMock(return_value="report")
+        core = SellerCore(run_work=run_work, generator="test")
+        core._sweep = AsyncMock(return_value=None)
+        core._context_deadlines[JOB_ID] = asyncio.get_running_loop().time() - 1.0
+        submit_started = threading.Event()
+        release_submit = threading.Event()
+        validation_started = threading.Event()
+        release_validation = threading.Event()
+        timeout_fired = asyncio.Event()
+        delivery_timeout = 0.01
+        real_wait_for = asyncio.wait_for
+        timeout_applied = False
+        submit_calls = 0
+        submit_lock = threading.Lock()
+        submitted = SimpleNamespace(
+            submit_tx="0xtx",
+            deliverable_url="https://result",
+        )
+
+        def ordered_submit(*_args, **_kwargs):
+            nonlocal submit_calls
+            with submit_lock:
+                submit_calls += 1
+                call_number = submit_calls
+            if call_number == 1:
+                submit_started.set()
+                release_submit.wait(timeout=5)
+            return submitted
+
+        def blocking_gateway_validation(url: str) -> str:
+            validation_started.set()
+            release_validation.wait(timeout=5)
+            return url
+
+        async def controlled_wait_for(awaitable, *, timeout: float):
+            nonlocal timeout_applied
+            coroutine_code = getattr(awaitable, "cr_code", None)
+            coroutine_name = getattr(coroutine_code, "co_name", "")
+            if (
+                not timeout_applied
+                and timeout == delivery_timeout
+                and coroutine_name in {"_fulfill_job", "_do_work_and_submit"}
+            ):
+                timeout_applied = True
+                worker = asyncio.create_task(awaitable)
+                if not await asyncio.to_thread(submit_started.wait, 2):
+                    raise AssertionError("submit_result did not start")
+                worker.cancel()
+                timeout_fired.set()
+                try:
+                    await worker
+                except asyncio.CancelledError as cancelled:
+                    raise asyncio.TimeoutError from cancelled
+                raise AssertionError("delivery ignored timeout cancellation")
+            return await real_wait_for(awaitable, timeout=timeout)
+
+        notification: asyncio.Task[dict[str, object]] | None = None
+        try:
+            with (
+                patch.object(
+                    seller_core_module,
+                    "_JOB_DELIVERY_TIMEOUT_SECONDS",
+                    delivery_timeout,
+                ),
+                patch.object(
+                    seller_core_module.asyncio,
+                    "wait_for",
+                    new=controlled_wait_for,
+                ),
+                patch.object(
+                    seller_core_module.signing,
+                    "job_spec",
+                    return_value=_job_spec(required=False),
+                ),
+                patch.object(
+                    seller_core_module.signing,
+                    "submit_result",
+                    side_effect=ordered_submit,
+                ) as submit,
+                patch.object(
+                    seller_core_module,
+                    "validate_gateway_url",
+                    side_effect=blocking_gateway_validation,
+                ),
+            ):
+                core._spawn_job(JOB_ID, verified=False)
+                await real_wait_for(timeout_fired.wait(), timeout=2)
+                notification = asyncio.create_task(
+                    core.notify_funded(self._signed_request())
+                )
+                self.assertTrue(
+                    await asyncio.to_thread(validation_started.wait, 2)
+                )
+
+                release_submit.set()
+                await self._drain_tasks(core)
+                self.assertNotIn(JOB_ID, core._inflight)
+                self.assertNotIn(JOB_ID, core._contextless_started)
+
+                release_validation.set()
+                response = await real_wait_for(notification, timeout=2)
+                await self._drain_tasks(core)
+        finally:
+            release_submit.set()
+            release_validation.set()
+            if notification is not None and not notification.done():
+                notification.cancel()
+                await asyncio.gather(notification, return_exceptions=True)
+
+        self.assertEqual(response["status"], "rejected")
+        self.assertEqual(response["reason"], "delivery_already_started")
+        run_work.assert_awaited_once()
+        self.assertEqual(submit.call_count, 1)
+        self.assertIsNone(submit.call_args.kwargs["gateway_url"])
+        self.assertIn(JOB_ID, core._late_submit_successes)
+        self.assertNotIn(JOB_ID, core._handled)
+        self.assertNotIn(JOB_ID, core._job_contexts)
+
     def test_only_exact_signed_marker_requires_context(self) -> None:
         required = SimpleNamespace(
             terms={"success_criteria": "uomp_notify_context_required_v1"}

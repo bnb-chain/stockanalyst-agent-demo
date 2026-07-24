@@ -16,6 +16,8 @@ import {
 export type { NotifyOptions } from "./notify-auth.js";
 
 export const NOTIFY_CONTEXT_REQUIRED = "uomp_notify_context_required_v1";
+const INVALID_NOTIFY_CONTEXT_MARKER =
+  "Invalid negotiation: required notify-context marker missing or altered";
 
 export interface NegotiationEnvelope {
   request: {
@@ -161,8 +163,17 @@ export async function negotiate(
   if (!envelope.response?.accepted) {
     throw new Error(`Negotiate rejected: ${envelope.response?.reason ?? "unknown"}`);
   }
+  requireNotifyContextMarker(envelope);
 
   return envelope;
+}
+
+function requireNotifyContextMarker(envelope: NegotiationEnvelope): string {
+  const marker = envelope.response?.terms?.success_criteria;
+  if (marker !== NOTIFY_CONTEXT_REQUIRED) {
+    throw new Error(INVALID_NOTIFY_CONTEXT_MARKER);
+  }
+  return marker;
 }
 
 /** Sanitize strings for UMA claim embedding (mirrors Python _sanitize_for_claim). */
@@ -185,14 +196,13 @@ function sortKeys(v: unknown): unknown {
 export function buildJobDescription(envelope: NegotiationEnvelope): string {
   const response = envelope.response;
   const responseTerms = response.terms;
+  const successCriteria = requireNotifyContextMarker(envelope);
 
   const terms: Record<string, unknown> = {
     deliverables: sanitize(responseTerms.deliverables ?? ""),
     quality_standards: sanitize(responseTerms.quality_standards ?? ""),
+    success_criteria: sanitize(successCriteria),
   };
-  if (responseTerms.success_criteria != null) {
-    terms["success_criteria"] = sanitize(responseTerms.success_criteria);
-  }
 
   const content: Record<string, unknown> = {
     version: 1,

@@ -62,6 +62,97 @@ test("requests the exact notify-context requirement", async () => {
   );
 });
 
+test("rejects an accepted negotiation response missing the notify-context marker", async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => new Response(JSON.stringify({
+    result: {
+      parts: [{
+        data: {
+          request: {
+            task_description: "analyse portfolio",
+            terms: {
+              deliverables: "report",
+              quality_standards: "cited",
+              success_criteria: NOTIFY_CONTEXT_REQUIRED,
+            },
+          },
+          response: {
+            accepted: true,
+            terms: {
+              price: "1",
+              currency: "USDT",
+              deliverables: "report",
+              quality_standards: "cited",
+            },
+            provider_sig: "0xsigned",
+            negotiation_hash: "0xhash",
+          },
+        },
+      }],
+    },
+  }));
+
+  try {
+    await assert.rejects(
+      negotiate(
+        "https://seller.example/a2a",
+        "analyse portfolio",
+        "report",
+        "cited",
+      ),
+      new Error("Invalid negotiation: required notify-context marker missing or altered"),
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("rejects an accepted negotiation response with an altered notify-context marker", async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => new Response(JSON.stringify({
+    result: {
+      parts: [{
+        data: {
+          request: {
+            task_description: "analyse portfolio",
+            terms: {
+              deliverables: "report",
+              quality_standards: "cited",
+              success_criteria: NOTIFY_CONTEXT_REQUIRED,
+            },
+          },
+          response: {
+            accepted: true,
+            terms: {
+              price: "1",
+              currency: "USDT",
+              deliverables: "report",
+              quality_standards: "cited",
+              success_criteria: "legacy_optional_delivery",
+            },
+            provider_sig: "0xsigned",
+            negotiation_hash: "0xhash",
+          },
+        },
+      }],
+    },
+  }));
+
+  try {
+    await assert.rejects(
+      negotiate(
+        "https://seller.example/a2a",
+        "analyse portfolio",
+        "report",
+        "cited",
+      ),
+      new Error("Invalid negotiation: required notify-context marker missing or altered"),
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("copies the seller-signed requirement into the on-chain description", () => {
   const envelope = {
     request: {
@@ -91,6 +182,98 @@ test("copies the seller-signed requirement into the on-chain description", () =>
   assert.equal(description.terms.success_criteria, NOTIFY_CONTEXT_REQUIRED);
   assert.equal(description.negotiation_hash, "0xhash");
   assert.equal(description.provider_sig, "0xsigned");
+});
+
+test("rejects a job description whose response is missing the notify-context marker", () => {
+  const envelope = {
+    request: {
+      task_description: "analyse portfolio",
+      terms: {
+        deliverables: "report",
+        quality_standards: "cited",
+        success_criteria: NOTIFY_CONTEXT_REQUIRED,
+      },
+    },
+    response: {
+      accepted: true,
+      terms: {
+        price: "1",
+        currency: "USDT",
+        deliverables: "report",
+        quality_standards: "cited",
+      },
+      negotiated_at: 1,
+      negotiation_hash: "0xhash",
+      provider_sig: "0xsigned",
+    },
+  } satisfies NegotiationEnvelope;
+
+  assert.throws(
+    () => buildJobDescription(envelope),
+    new Error("Invalid negotiation: required notify-context marker missing or altered"),
+  );
+});
+
+test("rejects a job description whose response has an altered notify-context marker", () => {
+  const envelope = {
+    request: {
+      task_description: "analyse portfolio",
+      terms: {
+        deliverables: "report",
+        quality_standards: "cited",
+        success_criteria: NOTIFY_CONTEXT_REQUIRED,
+      },
+    },
+    response: {
+      accepted: true,
+      terms: {
+        price: "1",
+        currency: "USDT",
+        deliverables: "report",
+        quality_standards: "cited",
+        success_criteria: "legacy_optional_delivery",
+      },
+      negotiated_at: 1,
+      negotiation_hash: "0xhash",
+      provider_sig: "0xsigned",
+    },
+  } satisfies NegotiationEnvelope;
+
+  assert.throws(
+    () => buildJobDescription(envelope),
+    new Error("Invalid negotiation: required notify-context marker missing or altered"),
+  );
+});
+
+test("rejects a job description whose response has a non-string notify-context marker", () => {
+  const envelope = {
+    request: {
+      task_description: "analyse portfolio",
+      terms: {
+        deliverables: "report",
+        quality_standards: "cited",
+        success_criteria: NOTIFY_CONTEXT_REQUIRED,
+      },
+    },
+    response: {
+      accepted: true,
+      terms: {
+        price: "1",
+        currency: "USDT",
+        deliverables: "report",
+        quality_standards: "cited",
+        success_criteria: 42,
+      },
+      negotiated_at: 1,
+      negotiation_hash: "0xhash",
+      provider_sig: "0xsigned",
+    },
+  } as unknown as NegotiationEnvelope;
+
+  assert.throws(
+    () => buildJobDescription(envelope),
+    new Error("Invalid negotiation: required notify-context marker missing or altered"),
+  );
 });
 
 function canonicalize(value: unknown): unknown {

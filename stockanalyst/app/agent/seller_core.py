@@ -146,6 +146,16 @@ class SellerCore:
         #                 stale notify/sweep cannot reinstall context or redeliver.
         self._tasks: set[asyncio.Task] = set()
         self._inflight: set[int] = set()
+        # Records the mode of the worker that owns each inflight slot. A named
+        # verified delivery deduped behind an unverified sweep is remembered
+        # explicitly so every transient sweep exit can transfer ownership.
+        self._inflight_verified: dict[int, bool] = {}
+        self._pending_verified_handoffs: set[int] = set()
+        # A timed-out submit may still land before its uncancellable thread exits.
+        # Cleanup remains transient, but this process-lifetime marker blocks both
+        # a pending handoff and stale preverification from starting a second
+        # delivery after the first one landed.
+        self._late_submit_successes: set[int] = set()
         # Terminal jobs are distinct from live work. This marker is checked in
         # the same no-await section as context compare-and-set, so a stale
         # verification can never reinstall context after terminal cleanup.
@@ -350,7 +360,11 @@ class SellerCore:
 
         # Atomic with the worker's context lookup/marker update: neither path
         # awaits between observing the marker/context and committing its state.
-        if job_id in self._handled or job_id in self._contextless_started:
+        if (
+            job_id in self._handled
+            or job_id in self._late_submit_successes
+            or job_id in self._contextless_started
+        ):
             logger.warning("job %s: notification rejected — delivery_already_started", job_id)
             return {
                 "status": "rejected",
@@ -401,9 +415,14 @@ class SellerCore:
         ``_inflight`` is updated SYNCHRONOUSLY here (before scheduling) so a
         concurrent notify + sweep can never double-deliver the same job.
         """
-        if job_id in self._inflight or job_id in self._handled:
+        if job_id in self._handled or job_id in self._late_submit_successes:
+            return
+        if job_id in self._inflight:
+            if verified and self._inflight_verified.get(job_id) is False:
+                self._pending_verified_handoffs.add(job_id)
             return
         self._inflight.add(job_id)
+        self._inflight_verified[job_id] = verified
         self._spawn(self._run_job(job_id, verified=verified))
 
     async def _run_job(self, job_id: int, *, verified: bool) -> None:
@@ -413,7 +432,7 @@ class SellerCore:
         work; unverified ones (the sweep) run the full verify gate first.
         """
         terminal = False
-        resume_verified = False
+        self._inflight_verified.setdefault(job_id, verified)
         try:
             # Hard ceiling so a hung delivery (e.g. unresponsive RPC) cannot keep
             # is_busy() True — which would pin the microVM to its 8h max-lifetime.
@@ -436,11 +455,6 @@ class SellerCore:
             # Transient failures release only live-work markers, retaining context
             # and grace state for a later retry.
             terminal = bool(result.get("ok") or result.get("skip"))
-            resume_verified = (
-                not verified
-                and not terminal
-                and result.get("reason") == "notify_context_required"
-            )
         except (asyncio.TimeoutError, TimeoutError):
             # Transient by design — leave terminal False so a later sweep retries.
             logger.warning(
@@ -451,17 +465,29 @@ class SellerCore:
         except Exception:  # noqa: BLE001 — a background job must never crash the loop
             logger.exception("background delivery of job %s failed", job_id)
         finally:
+            late_submit_succeeded = job_id in self._late_submit_successes
             if terminal:
                 self._handled.add(job_id)
+                self._late_submit_successes.discard(job_id)
+                self._pending_verified_handoffs.discard(job_id)
                 self._job_contexts.pop(job_id, None)
                 self._context_deadlines.pop(job_id, None)
                 self._context_events.pop(job_id, None)
                 self._contextless_started.discard(job_id)
+                self._inflight_verified.pop(job_id, None)
                 self._inflight.discard(job_id)
             else:
                 self._inflight.discard(job_id)
+                self._inflight_verified.pop(job_id, None)
                 self._contextless_started.discard(job_id)
-                if resume_verified and job_id in self._job_contexts:
+                handoff_verified = (
+                    not verified
+                    and not late_submit_succeeded
+                    and job_id in self._pending_verified_handoffs
+                    and job_id in self._job_contexts
+                )
+                self._pending_verified_handoffs.discard(job_id)
+                if handoff_verified:
                     self._spawn_job(job_id, verified=True)
 
     # -- internals -------------------------------------------------------------
@@ -559,8 +585,8 @@ class SellerCore:
         )
         work = await self._run_work(prompt, session_id=str(job_id), symbols=symbols)
 
-        try:
-            res = await asyncio.to_thread(
+        submit_task = asyncio.create_task(
+            asyncio.to_thread(
                 signing.submit_result,
                 job_id,
                 response_content=work,
@@ -572,6 +598,14 @@ class SellerCore:
                 gateway_url=gateway_url,
                 gateway_token=gateway_token,
             )
+        )
+        try:
+            res = await self._await_submit_task(submit_task)
+        except asyncio.CancelledError:
+            if submit_task.done() and not submit_task.cancelled():
+                if submit_task.exception() is None:
+                    self._late_submit_successes.add(job_id)
+            raise
         except SubmitPermanentlyUnsupportedError as e:
             # Deterministic for this wallet kind: submit can NEVER succeed →
             # permanent skip (a transient error would burn one LLM call / retry).
@@ -598,6 +632,35 @@ class SellerCore:
             "tx_hash": res.submit_tx,
             "deliverable_url": res.deliverable_url,
         }
+
+    @staticmethod
+    async def _await_submit_task(submit_task: asyncio.Task[Any]) -> Any:
+        """Retain submit ownership until its uncancellable worker thread exits."""
+        shielded_submit = asyncio.shield(submit_task)
+        try:
+            # Observe the shield through ``wait`` so cancellation of this caller
+            # does not cancel the shield Future itself. Python 3.14 installs an
+            # eager exception logger when a directly-awaited shield is cancelled;
+            # retaining the shield lets us retrieve the late result ourselves.
+            await asyncio.wait({shielded_submit})
+            return shielded_submit.result()
+        except asyncio.CancelledError as cancelled:
+            # Cancelling ``to_thread`` only cancels its asyncio waiter; the Python
+            # thread keeps uploading/submitting. Keep this coroutine (and therefore
+            # the job's inflight/contextless ownership) alive until the irreversible
+            # operation really exits. Repeated caller cancellation cannot release
+            # ownership early.
+            while not shielded_submit.done():
+                try:
+                    await asyncio.wait({shielded_submit})
+                except asyncio.CancelledError:
+                    continue
+            if shielded_submit.done():
+                try:
+                    shielded_submit.exception()
+                except asyncio.CancelledError:
+                    pass
+            raise cancelled
 
     async def _sweep(self) -> None:
         """Best-effort background fallback: deliver any FUNDED jobs for this provider.
