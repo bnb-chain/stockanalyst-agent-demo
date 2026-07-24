@@ -118,6 +118,56 @@ test("sends a signed notification envelope without duplicate context fields", as
   assert.equal("delivery_gateway_token" in data, false);
 });
 
+test("throws when the seller rejects the notification instead of continuing", async () => {
+  const wallet = Wallet.createRandom();
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () =>
+    new Response(
+      JSON.stringify({
+        result: {
+          parts: [{ data: { status: "rejected", reason: "unsafe_gateway", job_id: "7" } }],
+        },
+      }),
+    );
+
+  try {
+    await assert.rejects(
+      notifyFunded("https://seller.example/a2a", wallet, 7n, {
+        gatewayUrl: "https://buyer.trycloudflare.com",
+        gatewayToken: "relay-token",
+      }),
+      /notify_funded not accepted: status=rejected \(unsafe_gateway\)/,
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("surfaces the retryable flag when verification is unavailable", async () => {
+  const wallet = Wallet.createRandom();
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () =>
+    new Response(
+      JSON.stringify({
+        result: {
+          parts: [{ data: { status: "rejected", reason: "verification_unavailable", retryable: true } }],
+        },
+      }),
+    );
+
+  try {
+    await assert.rejects(
+      notifyFunded("https://seller.example/a2a", wallet, 7n, {
+        gatewayUrl: "https://buyer.trycloudflare.com",
+        gatewayToken: "relay-token",
+      }),
+      /status=rejected \(verification_unavailable\) \[retryable\]/,
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("serializes every required risk-profile field into the signed context", () => {
   const context = JSON.parse(buildNotifyContext({
     riskProfile: {

@@ -296,8 +296,21 @@ export async function notifyFunded(
   });
 
   if (!res.ok) throw new Error(`notify_funded HTTP error: ${res.status} ${await res.text()}`);
-  const body = await res.json() as { result?: { parts?: Array<{ data?: { status?: string; note?: string } }> } };
+  const body = await res.json() as {
+    result?: {
+      parts?: Array<{ data?: { status?: string; reason?: string; retryable?: boolean; note?: string } }>;
+    };
+  };
   const parts = body.result?.parts ?? [];
   const ack = parts[0]?.data ?? {};
-  return ack.status ?? "unknown";
+  const status = ack.status ?? "unknown";
+  // A rejected/unknown ACK means the seller did NOT start delivery (bad/missing
+  // authorization, unsafe gateway, verification unavailable, …). Fail loudly so
+  // the caller does not fund-then-poll to a fruitless timeout.
+  if (status !== "accepted") {
+    const reason = ack.reason ? ` (${ack.reason})` : "";
+    const retryable = ack.retryable ? " [retryable]" : "";
+    throw new Error(`notify_funded not accepted: status=${status}${reason}${retryable}`);
+  }
+  return status;
 }
