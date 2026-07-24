@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import ast
 import asyncio
+import inspect
 import json
 import socket
 import sys
+import textwrap
 import threading
 import time
 from types import ModuleType, SimpleNamespace
@@ -700,20 +703,33 @@ class NotifyFundedAuthorizationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(JOB_ID, self.core._handled)
 
     async def test_permanent_sweep_skip_clears_grace_state(self) -> None:
-        core = SellerCore(run_work=AsyncMock(), generator="test")
+        run_work = AsyncMock()
+        core = SellerCore(run_work=run_work, generator="test")
+        core._job_contexts[JOB_ID] = self._context_from_request(
+            self._signed_request()
+        )
         core._inflight.add(JOB_ID)
         core._context_events[JOB_ID] = asyncio.Event()
         core._context_deadlines[JOB_ID] = 123.0
-        with patch.object(
-            seller_core_module.signing,
-            "verify_signed_job",
-            return_value=(False, "invalid_provider_signature", True),
+        core._contextless_started.add(JOB_ID)
+        with (
+            patch.object(
+                seller_core_module.signing,
+                "verify_signed_job",
+                return_value=(False, "invalid_provider_signature", True),
+            ),
+            patch.object(seller_core_module.signing, "submit_result") as submit,
         ):
             await core._run_job(JOB_ID, verified=False)
 
         self.assertIn(JOB_ID, core._handled)
+        self.assertNotIn(JOB_ID, core._job_contexts)
         self.assertNotIn(JOB_ID, core._context_events)
         self.assertNotIn(JOB_ID, core._context_deadlines)
+        self.assertNotIn(JOB_ID, core._contextless_started)
+        self.assertNotIn(JOB_ID, core._inflight)
+        run_work.assert_not_awaited()
+        submit.assert_not_called()
 
     async def test_terminal_delivery_log_does_not_include_gateway_result_url(self) -> None:
         self.core._inflight.add(JOB_ID)
@@ -936,25 +952,95 @@ class NotifyFundedAuthorizationTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_repeated_waits_do_not_reset_or_shorten_deadline(self) -> None:
         core = SellerCore(run_work=AsyncMock(), generator="test")
-        with patch.object(
-            seller_core_module,
-            "_SWEEP_CONTEXT_GRACE_SECONDS",
-            0.02,
+        loop_times = iter((100.0, 100.0, 100.25, 100.25))
+        fake_loop = SimpleNamespace(time=lambda: next(loop_times))
+        observed_timeouts: list[float] = []
+
+        async def capture_timeout(awaitable, *, timeout: float):
+            observed_timeouts.append(timeout)
+            awaitable.close()
+            raise asyncio.TimeoutError
+
+        with (
+            patch.object(
+                seller_core_module,
+                "_SWEEP_CONTEXT_GRACE_SECONDS",
+                60.0,
+            ),
+            patch.object(
+                seller_core_module.asyncio,
+                "get_running_loop",
+                return_value=fake_loop,
+            ),
+            patch.object(
+                seller_core_module.asyncio,
+                "wait_for",
+                side_effect=capture_timeout,
+            ),
         ):
-            first = asyncio.create_task(
-                core._await_sweep_context(JOB_ID, required=True)
+            self.assertIs(
+                await core._await_sweep_context(JOB_ID, required=True),
+                False,
             )
-            while JOB_ID not in core._context_deadlines:
-                await asyncio.sleep(0)
             original_deadline = core._context_deadlines[JOB_ID]
-            await asyncio.sleep(0.005)
-            second = asyncio.create_task(
-                core._await_sweep_context(JOB_ID, required=True)
+            self.assertIs(
+                await core._await_sweep_context(JOB_ID, required=True),
+                False,
             )
-            self.assertEqual(core._context_deadlines[JOB_ID], original_deadline)
-            self.assertEqual(await first, False)
-            self.assertEqual(await second, False)
+
+        self.assertEqual(observed_timeouts, [60.0, 59.75])
+        self.assertEqual(original_deadline, 160.0)
         self.assertEqual(core._context_deadlines[JOB_ID], original_deadline)
+
+    def test_optional_contextless_transition_has_no_await_gap(self) -> None:
+        source = textwrap.dedent(
+            inspect.getsource(SellerCore._await_sweep_context)
+        )
+        function = ast.parse(source).body[0]
+        self.assertIsInstance(function, ast.AsyncFunctionDef)
+        assert isinstance(function, ast.AsyncFunctionDef)
+
+        marker_indices = [
+            index
+            for index, statement in enumerate(function.body)
+            if any(
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "add"
+                and isinstance(node.func.value, ast.Attribute)
+                and node.func.value.attr == "_contextless_started"
+                for node in ast.walk(statement)
+            )
+        ]
+        self.assertEqual(len(marker_indices), 1)
+        marker_index = marker_indices[0]
+        context_lookup_indices = [
+            index
+            for index, statement in enumerate(function.body[:marker_index])
+            if isinstance(statement, ast.If)
+            and any(
+                isinstance(node, ast.Attribute)
+                and node.attr == "_job_contexts"
+                for node in ast.walk(statement.test)
+            )
+        ]
+        self.assertGreaterEqual(len(context_lookup_indices), 2)
+        final_lookup_index = context_lookup_indices[-1]
+
+        guarded_statements = function.body[
+            final_lookup_index + 1 : marker_index + 1
+        ]
+        awaits = [
+            node
+            for statement in guarded_statements
+            for node in ast.walk(statement)
+            if isinstance(node, ast.Await)
+        ]
+        self.assertEqual(
+            awaits,
+            [],
+            "optional contextless marker transition must remain await-free",
+        )
 
     async def test_repeated_sweep_discovery_keeps_one_grace_worker(self) -> None:
         core = SellerCore(run_work=AsyncMock(), generator="test")
@@ -1074,6 +1160,64 @@ class NotifyFundedAuthorizationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["status"], "rejected")
         self.assertEqual(result["reason"], "delivery_already_started")
         self.assertIsNone(submit.call_args.kwargs["gateway_url"])
+
+    async def test_contextless_transient_accepts_later_named_notification(
+        self,
+    ) -> None:
+        original_event = asyncio.Event()
+        original_deadline = asyncio.get_running_loop().time() - 1.0
+
+        async def fail_contextless_work(*_args, **_kwargs) -> str:
+            self.assertIn(JOB_ID, core._contextless_started)
+            self.assertNotIn(JOB_ID, core._job_contexts)
+            raise RuntimeError("transient work failure")
+
+        first_run_work = AsyncMock(side_effect=fail_contextless_work)
+        core = SellerCore(run_work=first_run_work, generator="test")
+        core._sweep = AsyncMock(return_value=None)
+        core._inflight.add(JOB_ID)
+        core._context_events[JOB_ID] = original_event
+        core._context_deadlines[JOB_ID] = original_deadline
+        submitted = SimpleNamespace(
+            submit_tx="0xtx",
+            deliverable_url="https://result",
+        )
+
+        with (
+            patch.object(
+                seller_core_module.signing,
+                "job_spec",
+                return_value=_job_spec(required=False),
+            ),
+            patch.object(
+                seller_core_module.signing,
+                "submit_result",
+                return_value=submitted,
+            ) as submit,
+        ):
+            await core._run_job(JOB_ID, verified=False)
+
+            first_run_work.assert_awaited_once()
+            submit.assert_not_called()
+            self.assertNotIn(JOB_ID, core._contextless_started)
+            self.assertIs(core._context_events[JOB_ID], original_event)
+            self.assertEqual(
+                core._context_deadlines[JOB_ID],
+                original_deadline,
+            )
+            self.assertNotIn(JOB_ID, core._inflight)
+            self.assertNotIn(JOB_ID, core._handled)
+
+            second_run_work = AsyncMock(return_value="report")
+            core._run_work = second_run_work
+            result = await core.notify_funded(self._signed_request())
+            await self._drain_tasks(core)
+
+        self.assertEqual(result["status"], "accepted")
+        second_run_work.assert_awaited_once()
+        submit.assert_called_once()
+        self.assertIsNotNone(submit.call_args.kwargs["gateway_url"])
+        self.assertIn(JOB_ID, core._handled)
 
     async def test_marked_sweep_without_context_never_starts_work(self) -> None:
         run_work = AsyncMock(return_value="must not run")
