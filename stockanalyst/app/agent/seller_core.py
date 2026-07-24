@@ -86,6 +86,17 @@ _SWEEP_TIMEOUT_SECONDS = _env_seconds("NOTIFY_SWEEP_TIMEOUT_SECONDS", 60)
 _PREVERIFY_TIMEOUT_SECONDS = _env_seconds("NOTIFY_PREVERIFY_TIMEOUT_SECONDS", 30)
 _MAX_NOTIFY_VALIDATION_WORKERS = 4
 _MAX_JOB_ID = 2**256 - 1
+_CONTEXT_REQUIRED_CRITERION = "uomp_notify_context_required_v1"
+_SWEEP_CONTEXT_GRACE_SECONDS = 60.0
+_JOB_SPEC_UNSET = object()
+
+
+def _requires_notify_context(spec: object) -> bool:
+    terms = getattr(spec, "terms", None)
+    return (
+        isinstance(terms, dict)
+        and terms.get("success_criteria") == _CONTEXT_REQUIRED_CRITERION
+    )
 
 
 def _verify_and_validate_notify_context(
@@ -147,6 +158,8 @@ class SellerCore:
         # Immutable, authorization-bound off-chain context. This is installed
         # only after all on-chain and wallet checks succeed.
         self._job_contexts: dict[int, JobContext] = {}
+        self._context_deadlines: dict[int, float] = {}
+        self._context_events: dict[int, asyncio.Event] = {}
         self._notify_validation_slots = asyncio.Semaphore(
             _MAX_NOTIFY_VALIDATION_WORKERS
         )
@@ -350,6 +363,9 @@ class SellerCore:
         elif existing_context.digest != context.digest:
             logger.warning("job %s: notification rejected — context_conflict", job_id)
             return {"status": "rejected", "job_id": job_id, "reason": "context_conflict"}
+        context_event = self._context_events.get(job_id)
+        if context_event is not None:
+            context_event.set()
         self._spawn_job(job_id, verified=True)
         self._spawn_sweep()  # straggler fallback alongside the named job
         return {
@@ -437,6 +453,30 @@ class SellerCore:
                 self._contextless_started.discard(job_id)
 
     # -- internals -------------------------------------------------------------
+    async def _await_sweep_context(self, job_id: int, *, required: bool) -> bool:
+        if job_id in self._job_contexts:
+            return True
+
+        loop = asyncio.get_running_loop()
+        deadline = self._context_deadlines.setdefault(
+            job_id,
+            loop.time() + _SWEEP_CONTEXT_GRACE_SECONDS,
+        )
+        event = self._context_events.setdefault(job_id, asyncio.Event())
+        remaining = max(0.0, deadline - loop.time())
+        if remaining > 0 and not event.is_set():
+            try:
+                await asyncio.wait_for(event.wait(), timeout=remaining)
+            except asyncio.TimeoutError:
+                pass
+
+        if job_id in self._job_contexts:
+            return True
+        if required:
+            return False
+        self._contextless_started.add(job_id)
+        return True
+
     async def _fulfill_job(self, job_id: int) -> dict[str, Any]:
         """Verify the signed deal on-chain, then deliver (the sweep's per-job worker).
 
@@ -445,12 +485,38 @@ class SellerCore:
         (not our signature, tampered terms, underfunded, expired) returns
         ``skip: True``; a transient one returns ``ok: False`` to retry.
         """
-        ok, reason, permanent = await asyncio.to_thread(signing.verify_signed_job, job_id)
+        ok, reason, permanent = await asyncio.to_thread(
+            signing.verify_signed_job,
+            job_id,
+        )
         if not ok:
-            return {"ok": False, "job_id": job_id, "skip": permanent, "reason": reason}
-        return await self._do_work_and_submit(job_id)
+            return {
+                "ok": False,
+                "job_id": job_id,
+                "skip": permanent,
+                "reason": reason,
+            }
 
-    async def _do_work_and_submit(self, job_id: int) -> dict[str, Any]:
+        spec = await asyncio.to_thread(signing.job_spec, job_id)
+        ready = await self._await_sweep_context(
+            job_id,
+            required=_requires_notify_context(spec),
+        )
+        if not ready:
+            return {
+                "ok": False,
+                "job_id": job_id,
+                "skip": False,
+                "reason": "notify_context_required",
+            }
+        return await self._do_work_and_submit(job_id, spec=spec)
+
+    async def _do_work_and_submit(
+        self,
+        job_id: int,
+        *,
+        spec: object = _JOB_SPEC_UNSET,
+    ) -> dict[str, Any]:
         """LLM work → sign + submit. Assumes ``job_id`` is already verified.
 
         DEVELOPER HOOK: the LLM block produces the deliverable text — specialise
@@ -468,7 +534,8 @@ class SellerCore:
         portfolio = context.portfolio_for_prompt() if context is not None else []
         risk_profile = context.risk_profile_for_prompt() if context is not None else None
 
-        spec = await asyncio.to_thread(signing.job_spec, job_id)
+        if spec is _JOB_SPEC_UNSET:
+            spec = await asyncio.to_thread(signing.job_spec, job_id)
         if spec is not None:
             task = json.dumps({"task": spec.task, "terms": spec.terms}, ensure_ascii=False)
         else:

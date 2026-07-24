@@ -96,6 +96,18 @@ def _gateway_resolver(address: str):
     return resolve
 
 
+def _job_spec(*, required: bool):
+    criteria = (
+        "uomp_notify_context_required_v1"
+        if required
+        else "legacy_optional_delivery"
+    )
+    return SimpleNamespace(
+        task="analyse portfolio",
+        terms={"success_criteria": criteria},
+    )
+
+
 class RecordingSellerCore(SellerCore):
     """Seller core whose background scheduling is observable and inert."""
 
@@ -851,21 +863,19 @@ class NotifyFundedAuthorizationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(submit.call_args.kwargs["gateway_token"], expected_context.gateway_token)
         self.assertNotIn(JOB_ID, core._job_contexts)
 
-    async def test_named_context_is_rejected_after_context_free_work_starts(self) -> None:
+    async def test_named_notify_during_grace_wakes_same_sweep_worker(self) -> None:
         run_work = AsyncMock(return_value="report")
         core = SellerCore(run_work=run_work, generator="test")
         core._sweep = AsyncMock(return_value=None)
-        job_spec_started = threading.Event()
-        allow_job_spec = threading.Event()
-
-        def blocking_job_spec(_job_id: int):
-            job_spec_started.set()
-            allow_job_spec.wait(timeout=5)
-            return None
-
         submitted = SimpleNamespace(submit_tx="0xtx", deliverable_url="https://result")
+
         with (
-            patch.object(seller_core_module.signing, "job_spec", side_effect=blocking_job_spec),
+            patch.object(seller_core_module, "_SWEEP_CONTEXT_GRACE_SECONDS", 1.0),
+            patch.object(
+                seller_core_module.signing,
+                "job_spec",
+                return_value=_job_spec(required=True),
+            ),
             patch.object(
                 seller_core_module.signing,
                 "submit_result",
@@ -873,19 +883,59 @@ class NotifyFundedAuthorizationTests(unittest.IsolatedAsyncioTestCase):
             ) as submit,
         ):
             core._spawn_job(JOB_ID, verified=False)
-            started = await asyncio.to_thread(job_spec_started.wait, 2)
-            self.assertIs(started, True)
-            try:
-                result = await core.notify_funded(self._signed_request())
-            finally:
-                allow_job_spec.set()
+            while JOB_ID not in core._context_events:
+                await asyncio.sleep(0)
+            original_task_count = len(core._tasks)
+            result = await core.notify_funded(self._signed_request())
             await self._drain_tasks(core)
 
-        self.assertEqual(result["status"], "rejected")
-        self.assertEqual(result["reason"], "delivery_already_started")
-        self.assertNotIn(JOB_ID, core._job_contexts)
-        self.assertIsNone(submit.call_args.kwargs["gateway_url"])
-        self.assertIsNone(submit.call_args.kwargs["gateway_token"])
+        self.assertEqual(result["status"], "accepted")
+        self.assertEqual(original_task_count, 1)
+        run_work.assert_awaited_once()
+        submit.assert_called_once()
+        self.assertIsNotNone(submit.call_args.kwargs["gateway_url"])
+
+    async def test_marked_sweep_without_context_never_starts_work(self) -> None:
+        run_work = AsyncMock(return_value="must not run")
+        core = SellerCore(run_work=run_work, generator="test")
+
+        async def sweep_victim() -> None:
+            core._spawn_job(JOB_ID, verified=False)
+
+        core._sweep = AsyncMock(side_effect=sweep_victim)
+
+        with (
+            patch.object(seller_core_module, "_SWEEP_CONTEXT_GRACE_SECONDS", 0.001),
+            patch.object(
+                seller_core_module.signing,
+                "job_spec",
+                return_value=_job_spec(required=True),
+            ),
+            patch.object(seller_core_module.signing, "submit_result") as submit,
+        ):
+            response = await core.notify_funded({})
+            await self._drain_tasks(core)
+
+        self.assertEqual(response["status"], "accepted")
+        run_work.assert_not_awaited()
+        submit.assert_not_called()
+        self.assertNotIn(JOB_ID, core._contextless_started)
+        self.assertNotIn(JOB_ID, core._inflight)
+        self.assertNotIn(JOB_ID, core._handled)
+
+    def test_only_exact_signed_marker_requires_context(self) -> None:
+        required = SimpleNamespace(
+            terms={"success_criteria": "uomp_notify_context_required_v1"}
+        )
+        wrong = SimpleNamespace(
+            terms={"success_criteria": "UOMP_NOTIFY_CONTEXT_REQUIRED_V1"}
+        )
+        malformed = SimpleNamespace(terms="not-a-dict")
+
+        self.assertIs(seller_core_module._requires_notify_context(required), True)
+        self.assertIs(seller_core_module._requires_notify_context(wrong), False)
+        self.assertIs(seller_core_module._requires_notify_context(malformed), False)
+        self.assertIs(seller_core_module._requires_notify_context(None), False)
 
     async def test_identical_retries_share_one_active_sweep(self) -> None:
         core = SellerCore(run_work=AsyncMock(return_value="report"), generator="test")
