@@ -98,13 +98,51 @@ kind = "local"
 expected_recipient = ""
 allowed_hosts = ["llm.pieverse.io"]
 
+[payments.x402.seller]
+# x402 / Binance Pay seller channel — alternative to ERC-8183 for lower-friction
+# payments. Exposes /x402/analyze as an SSE endpoint; buyers pay with a signed
+# EIP-191 authorization (produced by Binance Pay facilitator or any web3 wallet).
+# Payment verification is FIXED CODE in x402_verify.py — never LLM-callable.
+enabled = true
+price_wei = "1000000000000000000"      # 1.0 U (same as [payments.erc8183].price)
+min_price_wei = "500000000000000000"   # 0.5 U floor (same as [payments.erc8183].min_price)
+endpoint = "/x402/analyze"
+# Price info:  GET /x402/price
+# Challenge:   GET /x402/analyze?symbols=AAPL
+# Delivery:    POST /x402/analyze  (X-Payment: <base64 proof>)  → SSE stream
+
+# ── Dual-port deployment (platform-side) ──────────────────────────────────────
+# When `bag deploy` reads port + public = true, it:
+#   1. Sets X402_PORT=<port> in the container env → agent starts a second
+#      uvicorn listener on this port serving ONLY x402 routes (no A2A, no Cognito)
+#   2. Exposes that port as a separate public endpoint (no AgentCore auth gateway)
+#   3. Returns x402_url in `bag deploy info` output
+# This lets the x402 channel (X-Payment auth) coexist with the A2A channel
+# (Cognito Bearer auth) without routing conflicts inside AgentCore.
+port = 9001
+public = true
+
+# Binance Pay x402 facilitator — executes on-chain transferWithAuthorization
+# after the agent verifies the EIP-712 signature locally.
+# Set to the Binance Pay facilitator endpoint once available:
+#   bag env set X402_FACILITATOR_URL https://pay.binance.com/x402/v1
+#
+# LOCAL TESTING ONLY — explicit demo mode opt-in (no on-chain transfer):
+#   bag env set X402_DEMO_MODE 1
+# NEVER set X402_DEMO_MODE in production — signatures are verified but no tokens
+# are transferred, so any wallet can receive paid analysis without paying.
+#
+# U token EIP-712 domain (default "U" / "1" — set only if contract differs):
+#   bag env set U_TOKEN_DOMAIN_NAME U
+#   bag env set U_TOKEN_DOMAIN_VERSION 1
+
 [deploy.platform]
 terms_accepted_at = "2026-07-16T15:01:53Z"
 slug = "stockanalyst"
-deployment_id = "01KXRC54P4KBPTSEA1CG2B8SPG"
+deployment_id = "01KXRHBEHZM8P69VT350TN274P"
 agent_id = "01KXNQ7T88G307WMG5C1DVSR00"
 invoke_url = "https://bnbagent-api.bnbchain.world/v1/rt/01KXNQ7T88G307WMG5C1DVSR00/.well-known/agent-card.json"
-last_deploy_at = "2026-07-17T15:48:22Z"
+last_deploy_at = "2026-07-17T17:19:15Z"
 
 [identity]
 endpoint = "https://bnbagent-api.bnbchain.world/v1/rt/01KXNQ7T88G307WMG5C1DVSR00/.well-known/agent-card.json"

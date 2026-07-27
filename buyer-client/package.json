@@ -7,7 +7,9 @@
   "scripts": {
     "build": "tsc",
     "start": "node --env-file=.env dist/index.js",
-    "dev": "npx tsx --env-file=.env src/index.ts"
+    "dev": "npx tsx --env-file=.env src/index.ts",
+    "x402": "npx tsx --env-file=.env src/x402.ts",
+    "x402:free": "npx tsx --env-file=.env src/x402free.ts"
   },
   "dependencies": {
     "ethers": "^6.13.0",

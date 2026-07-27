@@ -36,11 +36,13 @@ mandates inbound auth (see agent_card.py + ``bag deploy provision-cognito``).
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
 import re
 import sys
+from typing import AsyncGenerator
 
 from google.adk.agents import Agent
 from google.adk.runners import InMemoryRunner
@@ -276,6 +278,16 @@ async def _call_runner(prompt: str, session_id: str) -> str:
     return "\n".join(parts).strip()
 
 
+def _try_parse_report(text: str) -> StockReport | None:
+    """Extract + parse + validate the StockReport JSON from LLM text. Returns None on failure."""
+    try:
+        json_str = _extract_json(text)
+        return StockReport.model_validate_json(json_str)
+    except Exception as exc:
+        _log.warning("report parse/validation failed: %s", exc)
+        return None
+
+
 async def _run_llm(
     prompt: str,
     *,
@@ -296,15 +308,7 @@ async def _run_llm(
     """
     raw = await _call_runner(prompt, session_id)
 
-    def _try_parse(text: str) -> StockReport | None:
-        try:
-            json_str = _extract_json(text)
-            return StockReport.model_validate_json(json_str)
-        except Exception as exc:
-            _log.warning("report parse/validation failed: %s", exc)
-            return None
-
-    report = _try_parse(raw)
+    report = _try_parse_report(raw)
 
     if report is None:
         # Retry: ask the model to fix its output in the same session
@@ -315,7 +319,7 @@ async def _run_llm(
             "Ensure the analyses array has one entry per symbol and all required fields are present."
         )
         raw2 = await _call_runner(correction, session_id)
-        report = _try_parse(raw2)
+        report = _try_parse_report(raw2)
 
     if report is None:
         _log.error("structured output failed after retry (session %s); delivering raw text", session_id)
@@ -330,6 +334,187 @@ async def _run_llm(
             # Deliver what we have — partial is better than nothing
 
     return render_report(report)
+
+
+async def _stream_runner(
+    prompt: str,
+    session_id: str,
+    symbols: list[str] | None = None,
+) -> AsyncGenerator[tuple[str, dict], None]:
+    """Async generator for SSE streaming: yields (event_name, data) tuples.
+
+    Used by the x402 channel (X402Handler) to push live progress events and
+    the final rendered report over a single HTTP connection. Not used by the
+    ERC-8183 A2A path (which delivers async via submit_result on-chain).
+
+    Yields:
+      ("progress", {"stage": "collecting", "tool": <name>, "message": ...})
+      ("progress", {"stage": "thinking",   "message": "..."})   ← heartbeat
+      ("progress", {"stage": "generating", "message": "Rendering report..."})
+      ("report",   {"content": <markdown>, "format": "markdown"})
+      ("done",     {})
+
+    The ADK runner is executed in a background task feeding an asyncio.Queue.
+    Every HEARTBEAT_S seconds of silence we yield a "thinking" progress event
+    so the SSE connection stays alive during the long final-generation phase
+    (Kimi K2.6 can take 3–10 min to emit the full structured JSON).
+    Without this, Node.js undici's bodyTimeout kills the stream with "terminated".
+    """
+    HEARTBEAT_S = 15
+
+    session_service = runner.session_service
+    existing = await session_service.get_session(
+        app_name=runner.app_name, user_id="service", session_id=session_id
+    )
+    if existing is None:
+        await session_service.create_session(
+            app_name=runner.app_name, user_id="service", session_id=session_id
+        )
+
+    user_msg = gtypes.Content(role="user", parts=[gtypes.Part(text=prompt)])
+    parts: list[str] = []
+
+    queue: asyncio.Queue[tuple[str, object]] = asyncio.Queue()
+
+    async def _run():
+        try:
+            async for event in runner.run_async(
+                user_id="service", session_id=session_id, new_message=user_msg
+            ):
+                await queue.put(("event", event))
+        except Exception as exc:  # noqa: BLE001
+            await queue.put(("exc", exc))
+        finally:
+            await queue.put(("done", None))
+
+    task = asyncio.create_task(_run())
+    try:
+        while True:
+            try:
+                kind, payload = await asyncio.wait_for(queue.get(), timeout=HEARTBEAT_S)
+            except asyncio.TimeoutError:
+                yield "progress", {"stage": "thinking", "message": "Generating analysis..."}
+                continue
+
+            if kind == "done":
+                break
+            if kind == "exc":
+                raise payload  # type: ignore[misc]
+
+            # kind == "event"
+            event = payload
+            if event.content:
+                for part in event.content.parts:
+                    fn_call = getattr(part, "function_call", None)
+                    if fn_call:
+                        tool_name = getattr(fn_call, "name", str(fn_call))
+                        yield "progress", {
+                            "stage": "collecting",
+                            "tool": tool_name,
+                            "message": f"Running {tool_name}...",
+                        }
+            if event.is_final_response() and event.content:
+                for p in event.content.parts:
+                    if p.text and not getattr(p, "thought", False):
+                        parts.append(p.text)
+    finally:
+        task.cancel()
+        try:
+            await task
+        except (asyncio.CancelledError, Exception):
+            pass
+
+    raw = "\n".join(parts).strip()
+
+    yield "progress", {"stage": "generating", "message": "Rendering report..."}
+
+    report = _try_parse_report(raw)
+    if report is None:
+        # Fallback: deliver raw text (buyer still gets something)
+        _log.warning("x402 stream: structured parse failed; delivering raw text (session %s)", session_id)
+        yield "report", {"content": raw, "format": "text"}
+    else:
+        if symbols:
+            returned = {a.symbol.upper() for a in report.analyses}
+            missing = [s for s in symbols if s.upper() not in returned]
+            if missing:
+                _log.warning("x402 stream: missing analyses for %s (session %s)", missing, session_id)
+        yield "report", {"content": render_report(report), "format": "markdown"}
+
+    yield "done", {}
+
+
+# --- Free-tier quick-quote (no LLM, no ADK) -----------------------------------
+
+def _format_free_report(symbol: str, quote: dict) -> str:
+    """Format a simple markdown table from a fetch_quote result dict."""
+    import datetime
+    today = datetime.date.today().isoformat()
+    name  = quote.get("name", symbol)
+    cur   = quote.get("currency", "USD")
+
+    def fp(v):   return f"{cur} {v:,.2f}" if v is not None else "N/A"
+    def fpct(v): return f"{v:+.2f}%" if v is not None else "N/A"
+    def fx(v):   return f"{v:.1f}x" if v is not None else "N/A"
+    def fcap(v):
+        if v is None: return "N/A"
+        if v >= 1e12: return f"{v / 1e12:.2f}T {cur}"
+        if v >= 1e9:  return f"{v / 1e9:.2f}B {cur}"
+        return f"{v / 1e6:.2f}M {cur}"
+
+    target  = quote.get("analyst_target")
+    price   = quote.get("price")
+    upside  = (
+        f" ({(target - price) / price * 100:+.1f}% upside)"
+        if target and price else ""
+    )
+
+    rows = [
+        ("Price",           fp(price)),
+        ("Change",          fpct(quote.get("change_pct"))),
+        ("Market Cap",      fcap(quote.get("market_cap"))),
+        ("PE (TTM)",        fx(quote.get("pe_ratio"))),
+        ("Forward PE",      fx(quote.get("forward_pe"))),
+        ("Analyst Target",  fp(target) + upside),
+        ("Consensus",       (quote.get("recommendation") or "N/A").title()),
+        ("Beta",            f"{quote['beta']:.2f}" if quote.get("beta") is not None else "N/A"),
+        ("52W Range",       f"{fp(quote.get('52w_low'))} – {fp(quote.get('52w_high'))}"),
+    ]
+
+    lines = [
+        f"## {symbol} — {name}  |  Quick Quote  {today}",
+        "",
+        "| Metric | Value |",
+        "|--------|-------|",
+        *[f"| {k} | {v} |" for k, v in rows],
+        "",
+        "> **Full analysis** (RSI / MACD / Bollinger Bands, options sentiment, insider activity, portfolio rebalancing) "
+        "→ **Paid tier (1.0 U)** via `POST /x402/analyze`",
+    ]
+    return "\n".join(lines)
+
+
+async def _stream_free(symbol: str) -> AsyncGenerator[tuple[str, dict], None]:
+    """Free-tier generator: fetch_quote only, format as simple markdown table.
+
+    No LLM, no ADK — completes in ~1 s (one yfinance call).
+    """
+    from analysis import fetch_quote
+
+    yield "progress", {
+        "stage": "collecting",
+        "tool": "get_stock_quote",
+        "message": f"Fetching market data for {symbol}...",
+    }
+    try:
+        loop  = asyncio.get_event_loop()
+        quote = await loop.run_in_executor(None, fetch_quote, symbol)
+    except Exception as exc:
+        yield "error", {"message": f"Failed to fetch {symbol}: {exc}"}
+        return
+
+    yield "report", {"content": _format_free_report(symbol, quote), "format": "markdown"}
+    yield "done", {}
 
 
 def _default_network() -> str:
@@ -446,16 +631,17 @@ if __name__ == "__main__":
     import uvicorn
     from bedrock_agentcore.runtime import build_a2a_app
 
+    from x402_handler import X402Handler
+
     app = build_a2a_app(executor, agent_card, ping_handler=_ping_status)
     app = _strip_error_input(app)
 
     # Serve local-storage deliverables at /erc8183/job/{id}/response so that
     # ERC8183_AGENT_URL=http://localhost:9000/erc8183 works in local dev.
-    # The LocalStorageProvider writes job-{id}.json into STORAGE_LOCAL_PATH.
     _inner = app
     _storage_dir = Path(os.environ.get("STORAGE_LOCAL_PATH") or ".agent-data")
 
-    async def _app(scope, receive, send):
+    async def _a2a_app(scope, receive, send):
         if scope["type"] == "http":
             path = scope.get("path", "")
             m = re.match(r"^/erc8183/job/(\d+)/response$", path)
@@ -473,9 +659,54 @@ if __name__ == "__main__":
                 return
         await _inner(scope, receive, send)
 
-    uvicorn.run(
-        _app,
-        host=os.environ.get("AGENT_BIND_HOST") or "0.0.0.0",
-        port=int(os.environ.get("AGENT_PORT") or "9000"),
-        log_level="info",
-    )
+    bind_host = os.environ.get("AGENT_BIND_HOST") or "0.0.0.0"
+    a2a_port  = int(os.environ.get("AGENT_PORT")  or "9000")
+    x402_port = int(os.environ.get("X402_PORT")   or "0")
+
+    if x402_port:
+        # --- Dual-port mode (platform deployment with [payments.x402.seller].public = true) ---
+        #
+        # bag deploy reads studio.toml [payments.x402.seller] port + public, then:
+        #   • sets X402_PORT=<port> in the container env        ← triggers this branch
+        #   • exposes that port as a separate public endpoint   ← no AgentCore Cognito gateway
+        #   • returns x402_url in `bag deploy info` output
+        #
+        # Port layout:
+        #   a2a_port  (9000) → A2A only — behind AgentCore Cognito gateway (ERC-8183 flow)
+        #   x402_port (9001) → x402 only — public, X-Payment auth, no Cognito (x402 flow)
+        #
+        # In local dev X402_PORT is NOT set; the combined single-port mode below is used instead.
+
+        async def _x402_404(scope, receive, send):
+            await send({"type": "http.response.start", "status": 404,
+                        "headers": [(b"content-type", b"application/json")]})
+            await send({"type": "http.response.body", "body": b'{"error":"not found"}'})
+
+        _x402_standalone = X402Handler(
+            _x402_404,
+            stream_work=_stream_runner,
+            generator=GENERATOR,
+            free_stream_work=_stream_free,
+        )
+
+        async def _serve_both():
+            a2a_cfg  = uvicorn.Config(_a2a_app,         host=bind_host, port=a2a_port,  log_level="info")
+            x402_cfg = uvicorn.Config(_x402_standalone, host=bind_host, port=x402_port, log_level="info")
+            await asyncio.gather(
+                uvicorn.Server(a2a_cfg).serve(),
+                uvicorn.Server(x402_cfg).serve(),
+            )
+
+        asyncio.run(_serve_both())
+
+    else:
+        # --- Single-port mode (local dev / bag dev) ---
+        # x402 routes and A2A routes share port 9000 via ASGI middleware layering.
+        # AgentCore is not present locally, so x402 is reachable at localhost:9000/x402/*.
+        _combined = X402Handler(
+            _a2a_app,
+            stream_work=_stream_runner,
+            generator=GENERATOR,
+            free_stream_work=_stream_free,
+        )
+        uvicorn.run(_combined, host=bind_host, port=a2a_port, log_level="info")
