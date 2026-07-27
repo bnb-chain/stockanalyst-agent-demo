@@ -127,17 +127,17 @@ def _build_stock_analysis_prompt(
         else "  Set client_position to null for all symbols (no holdings provided)."
     )
 
-    json_schema = f'''{{
+    json_schema = '''{
   "executive_summary": "(string, 3-5 sentences: macro backdrop + one-line verdict per stock + top action)",
-  "macro_snapshot": {{
+  "macro_snapshot": {
     "vix": "(string)", "vix_signal": "(string)",
     "fed_rate": "(string)", "fed_rate_signal": "(string)",
     "treasury_10y": "(string)", "treasury_10y_signal": "(string)",
     "cpi_yoy": "(string or '—')", "unemployment": "(string or '—')",
     "macro_posture": "(string, 1-2 sentences)"
-  }},
+  },
   "analyses": [
-    {{
+    {
       "symbol": "(string, e.g. 'AAPL')",
       "company_name": "(string)",
       "rating": "Buy|Hold|Sell",
@@ -170,46 +170,46 @@ def _build_stock_analysis_prompt(
       "news_sentiment_score": (number|null, -1.0 to +1.0),
       "top_headline": "(string|null)",
       "sentiment_summary": "(string, 2-3 sentences synthesising all sentiment signals)",
-      "client_position": {{
+      "client_position": {
         "shares": (number), "avg_cost": (number), "unrealised_pnl_pct": (number),
         "stop_loss": (number), "stop_loss_basis": "(string, e.g. 'MA-200 at $175.80')",
         "action_summary": "(string, one sentence recommendation for this position)"
-      }} or null
-    }}
+      } or null
+    }
   ],
   "portfolio_actions": [
-    {{
+    {
       "priority": (integer, 1=highest), "action": "Trim|Add|New Buy|Hold",
       "symbol": "(string)", "quantity": "(string, e.g. '20 shares' or 'Reduce by 15%')",
       "price_level": "(string, e.g. 'Current ~$185' or 'On pullback to $170')",
       "capital_impact": "(string, e.g. 'Free ~$3,600')", "rationale": "(string, one sentence)"
-    }}
+    }
   ],
   "stop_losses": [
-    {{
+    {
       "symbol": "(string)", "avg_cost": (number), "stop_loss_level": (number),
       "risk_per_share": (number), "position_size": "(string)",
       "max_loss_at_stop": "(string, e.g. '$1,000 (10.8%)')",
       "technical_basis": "(string, e.g. 'MA-200 at $175.80')"
-    }}
+    }
   ],
   "watchlist": [
-    {{
+    {
       "ticker": "(string)", "company": "(string)",
       "strategic_rationale": "(string, one sentence)",
       "key_catalyst": "(string)", "entry_zone": "(string)", "risk": "(string, brief)",
       "thesis": "(string, exactly 2 sentences)"
-    }}
+    }
   ],
   "risk_factors": [
-    {{
+    {
       "factor": "(string, e.g. 'Sector Concentration')",
       "assessment": "Low|Moderate|High",
       "supporting_observation": "(string, specific data point)",
       "threshold_to_act": "(string, trigger level or event)"
-    }}
+    }
   ]
-}}'''
+}'''
 
     prompt = f'''You are a senior equity analyst at a top-tier investment bank. A client has paid for a professional, actionable research report.
 

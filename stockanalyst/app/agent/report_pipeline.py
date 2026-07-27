@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable, Iterator
 import json
 import logging
 import re
+from collections.abc import Awaitable, Callable, Iterator
 
 from pydantic import ValidationError
 
@@ -81,9 +81,7 @@ def _sanitized_validation_issues(
     for issue in error.errors(include_input=False, include_url=False):
         location: list[int | str] = []
         for part in issue.get("loc", ()):
-            if isinstance(part, int):
-                location.append(part)
-            elif (
+            if isinstance(part, int) or (
                 isinstance(part, str)
                 and len(part) <= 64
                 and _SAFE_LOCATION_PART.fullmatch(part) is not None

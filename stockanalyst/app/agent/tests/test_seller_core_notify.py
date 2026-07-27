@@ -11,19 +11,17 @@ import sys
 import textwrap
 import threading
 import time
-from types import ModuleType, SimpleNamespace
 import unittest
+from types import ModuleType, SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 from eth_account import Account
 from eth_account.messages import encode_typed_data
-
 from stockanalyst.app.agent.notify_security import (
     JobContext,
     build_notify_typed_data,
     parse_signed_context,
 )
-
 
 # SellerCore's real behavior is under test; only its optional deployment and
 # on-chain imports are stubbed so this unit suite does not install the full
@@ -90,9 +88,8 @@ sys.modules["bnbagent_studio_core"] = studio_core_stub
 sys.modules["bnbagent_studio_core.erc8183"] = erc8183_stub
 sys.modules["bnbagent_studio_core.erc8183.errors"] = errors_stub
 
-from stockanalyst.app.agent import seller_core as seller_core_module  # noqa: E402
-from stockanalyst.app.agent.seller_core import SellerCore  # noqa: E402
-
+from stockanalyst.app.agent import seller_core as seller_core_module
+from stockanalyst.app.agent.seller_core import SellerCore
 
 JOB_ID = 42
 CHAIN_ID = 97
@@ -1111,7 +1108,7 @@ class NotifyFundedAuthorizationTests(unittest.IsolatedAsyncioTestCase):
         async def capture_timeout(awaitable, *, timeout: float):
             observed_timeouts.append(timeout)
             awaitable.close()
-            raise asyncio.TimeoutError
+            raise TimeoutError
 
         with (
             patch.object(
@@ -1577,7 +1574,7 @@ class NotifyFundedAuthorizationTests(unittest.IsolatedAsyncioTestCase):
                 try:
                     await worker
                 except asyncio.CancelledError as cancelled:
-                    raise asyncio.TimeoutError from cancelled
+                    raise TimeoutError from cancelled
                 raise AssertionError("delivery ignored timeout cancellation")
             return await real_wait_for(awaitable, timeout=timeout)
 
@@ -1698,7 +1695,7 @@ class NotifyFundedAuthorizationTests(unittest.IsolatedAsyncioTestCase):
                 try:
                     await worker
                 except asyncio.CancelledError as cancelled:
-                    raise asyncio.TimeoutError from cancelled
+                    raise TimeoutError from cancelled
                 raise AssertionError("delivery ignored timeout cancellation")
             return await real_wait_for(awaitable, timeout=timeout)
 
@@ -1811,7 +1808,7 @@ class NotifyFundedAuthorizationTests(unittest.IsolatedAsyncioTestCase):
                 try:
                     await worker
                 except asyncio.CancelledError as cancelled:
-                    raise asyncio.TimeoutError from cancelled
+                    raise TimeoutError from cancelled
                 raise AssertionError("delivery ignored timeout cancellation")
             return await real_wait_for(awaitable, timeout=timeout)
 

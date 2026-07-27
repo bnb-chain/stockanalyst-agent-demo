@@ -78,7 +78,7 @@ def _agent_name() -> str:
         from bnbagent_studio_core import config
 
         name = str(((config.load_studio_toml() or {}).get("project") or {}).get("name") or "")
-    except Exception:  # noqa: BLE001 — a card label must never break boot
+    except Exception:
         name = ""
     return name or "bnbagent-seller"
 

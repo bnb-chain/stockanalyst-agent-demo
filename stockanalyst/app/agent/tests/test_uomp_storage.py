@@ -2,16 +2,15 @@
 
 from __future__ import annotations
 
-from email.message import Message
 import socket
 import ssl
 import sys
-from types import ModuleType
 import unittest
 import urllib.error
 import urllib.request
+from email.message import Message
+from types import ModuleType
 from unittest.mock import Mock, patch
-
 
 # Exercise the real provider while stubbing only its optional SDK base class.
 bnbagent_stub = ModuleType("bnbagent")
@@ -27,8 +26,8 @@ bnbagent_stub.storage = storage_stub
 sys.modules.setdefault("bnbagent", bnbagent_stub)
 sys.modules.setdefault("bnbagent.storage", storage_stub)
 
-from stockanalyst.app.agent import uomp_storage as storage_module  # noqa: E402
-from stockanalyst.app.agent.uomp_storage import (  # noqa: E402
+from stockanalyst.app.agent import uomp_storage as storage_module
+from stockanalyst.app.agent.uomp_storage import (
     UOMPGatewayStorageProvider,
 )
 

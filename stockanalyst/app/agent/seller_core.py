@@ -37,17 +37,18 @@ the LLM tool list.
 from __future__ import annotations
 
 import asyncio
-from dataclasses import replace
 import json
 import logging
 import os
+from dataclasses import replace
 from typing import Any
 
-import signing
 from bnbagent_studio_core.erc8183.errors import (
     SdkCallFailedError,
     SubmitPermanentlyUnsupportedError,
 )
+
+import signing
 from notify_security import (
     JobContext,
     NotifySecurityError,
@@ -368,7 +369,7 @@ class SellerCore:
                 ),
                 timeout=_PREVERIFY_TIMEOUT_SECONDS,
             )
-        except Exception:  # noqa: BLE001 — includes RPC and timeout failures
+        except Exception:
             logger.warning("job %s: verification unavailable", job_id)
             return {
                 "status": "rejected",
@@ -403,7 +404,7 @@ class SellerCore:
             reason = "unsafe_gateway" if error.code == "invalid_gateway_url" else error.code
             logger.warning("job %s: notification rejected — %s", job_id, reason)
             return {"status": "rejected", "job_id": job_id, "reason": reason}
-        except Exception:  # noqa: BLE001 — timeout, scheduling, or worker failure
+        except Exception:
             logger.warning("job %s: notification validation unavailable", job_id)
             return {
                 "status": "rejected",
@@ -521,14 +522,14 @@ class SellerCore:
             # Transient failures release only live-work markers, retaining context
             # and grace state for a later retry.
             terminal = bool(result.get("ok") or result.get("skip"))
-        except (asyncio.TimeoutError, TimeoutError):
+        except TimeoutError:
             # Transient by design — leave terminal False so a later sweep retries.
             logger.warning(
                 "background delivery of job %s timed out after %ss; will retry",
                 job_id,
                 _JOB_DELIVERY_TIMEOUT_SECONDS,
             )
-        except Exception:  # noqa: BLE001 — a background job must never crash the loop
+        except Exception:
             logger.exception("background delivery of job %s failed", job_id)
         finally:
             late_submit_succeeded = job_id in self._late_submit_successes
@@ -573,7 +574,7 @@ class SellerCore:
         if remaining > 0 and not event.is_set():
             try:
                 await asyncio.wait_for(event.wait(), timeout=remaining)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 pass
 
         if job_id in self._job_contexts:
@@ -671,9 +672,12 @@ class SellerCore:
         try:
             res = await self._await_submit_task(submit_task)
         except asyncio.CancelledError:
-            if submit_task.done() and not submit_task.cancelled():
-                if submit_task.exception() is None:
-                    self._late_submit_successes.add(job_id)
+            if (
+                submit_task.done()
+                and not submit_task.cancelled()
+                and submit_task.exception() is None
+            ):
+                self._late_submit_successes.add(job_id)
             raise
         except SubmitPermanentlyUnsupportedError as e:
             # Deterministic for this wallet kind: submit can NEVER succeed →
@@ -713,7 +717,7 @@ class SellerCore:
             # retaining the shield lets us retrieve the late result ourselves.
             await asyncio.wait({shielded_submit})
             return shielded_submit.result()
-        except asyncio.CancelledError as cancelled:
+        except asyncio.CancelledError:
             # Cancelling ``to_thread`` only cancels its asyncio waiter; the Python
             # thread keeps uploading/submitting. Keep this coroutine (and therefore
             # the job's inflight/contextless ownership) alive until the irreversible
@@ -729,7 +733,7 @@ class SellerCore:
                     shielded_submit.exception()
                 except asyncio.CancelledError:
                     pass
-            raise cancelled
+            raise
 
     async def _sweep(self) -> None:
         """Best-effort background fallback: deliver any FUNDED jobs for this provider.
@@ -742,14 +746,13 @@ class SellerCore:
         """
         try:
             from bnbagent.erc8183 import ERC8183JobOps
-
             from bnbagent_studio_core.wallet import get_wallet
 
             ops = ERC8183JobOps(wallet_provider=get_wallet(), network=self._network)
             # Time-bounded: a hung scan would otherwise keep is_busy() True (it runs
             # on every notify) and pin the microVM to its 8h max-lifetime.
             pending = await asyncio.wait_for(ops.get_pending_jobs(), timeout=_SWEEP_TIMEOUT_SECONDS)
-        except Exception as e:  # noqa: BLE001 — the sweep is best-effort (incl. TimeoutError)
+        except Exception as e:
             logger.warning("funded-job sweep failed: %s", e)
             return
         for job in (pending or {}).get("jobs", []):

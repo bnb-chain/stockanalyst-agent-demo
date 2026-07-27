@@ -11,7 +11,6 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
-
 _MAX_MODEL_STRING_CHARS = 8_192
 
 

@@ -20,12 +20,11 @@ domain needs it, but keep these ops OUT of the LLM tool list.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
 import time
+from dataclasses import dataclass
 from typing import Any
 
 from bnbagent.erc8183 import NegotiationHandler
-
 from bnbagent_studio_core import config
 from bnbagent_studio_core.erc8183 import submit_workflow
 from bnbagent_studio_core.erc8183.client import get_8183_client
@@ -172,7 +171,7 @@ def verify_signed_job_snapshot(
     client = get_8183_client()
     try:
         job = client.get_job(job_id)
-    except Exception as exc:  # noqa: BLE001 — RPC/chain failure is retryable
+    except Exception as exc:
         return None, f"chain read failed: {exc}", False
 
     if job.status != JobStatus.FUNDED:
@@ -292,6 +291,7 @@ def submit_result(
     with submit_lock:
         if gateway_url and gateway_token:
             import bnbagent_studio_core.storage as _storage_mod
+
             from uomp_storage import UOMPGatewayStorageProvider
 
             _orig = _storage_mod.storage_provider_from_config

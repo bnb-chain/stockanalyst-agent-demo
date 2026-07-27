@@ -80,17 +80,18 @@ _log = logging.getLogger("seller-agent.x402.verify")
 # Startup assertion — fail hard if eth_account is present but broken.
 # The module-level import above already fails closed if eth_account is missing
 # entirely; this catches a partially-working install (e.g. bad C extension).
-try:
-    _smoke = Account._recover_hash(b"\x00" * 32, signature=b"\x00" * 65)
-except Exception:
-    pass  # expected — bad sig; what matters is that the function is callable
-try:
-    Account._recover_hash  # type: ignore[attr-defined]
-except AttributeError as _e:
+_recover_hash = getattr(Account, "_recover_hash", None)
+if not callable(_recover_hash):
     raise RuntimeError(
         "eth_account._recover_hash unavailable — signature verification is broken. "
         "Run: pip install 'eth-account>=0.8' 'eth-abi>=4' 'eth-utils>=2'"
-    ) from _e
+    )
+try:
+    # Bad signature is expected; we only need the callable to run without
+    # ImportError / AttributeError from a broken eth_account install.
+    _recover_hash(b"\x00" * 32, signature=b"\x00" * 65)
+except Exception:
+    _log.debug("eth_account smoke recover failed as expected", exc_info=True)
 
 SELLER_WALLET       = "0x1FF095E1C5Cf4bC72a3DC54be17B6cf85043Fb67"
 U_TOKEN_BSC_TESTNET = "0xc70B8741B8B07A6d61E54fd4B20f22Fa648E5565"

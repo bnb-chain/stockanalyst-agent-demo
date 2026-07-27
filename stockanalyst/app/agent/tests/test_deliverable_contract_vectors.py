@@ -3,12 +3,11 @@
 from __future__ import annotations
 
 import json
-from pathlib import Path
 import unittest
+from pathlib import Path
 
 from bnbagent.erc8183.schema import DeliverableManifest
 from web3 import Web3
-
 
 FIXTURE = Path(__file__).with_name("fixtures") / "deliverable_manifest_vectors.json"
 CONTRACTS = {

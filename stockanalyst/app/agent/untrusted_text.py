@@ -4,7 +4,6 @@ from __future__ import annotations
 import re
 import unicodedata
 
-
 _WHITESPACE = re.compile(r"\s+")
 
 

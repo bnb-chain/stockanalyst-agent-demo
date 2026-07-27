@@ -24,17 +24,16 @@ effect. It is commented out below.)
 """
 from __future__ import annotations
 
+from bnbagent_studio_core.tools import chain_readonly as cr
 from google.adk.tools import FunctionTool
 
-from bnbagent_studio_core.tools import chain_readonly as cr
-from analysis import fetch_quote, fetch_technical_signals, fetch_options_sentiment
+from analysis import fetch_options_sentiment, fetch_quote, fetch_technical_signals
 from data_sources import (
-    fetch_macro_context,
-    fetch_insider_trades,
     fetch_alpha_vantage_sentiment,
     fetch_gnews_headlines,
+    fetch_insider_trades,
+    fetch_macro_context,
 )
-
 
 # ── Stock market data tools ───────────────────────────────────────────────────
 

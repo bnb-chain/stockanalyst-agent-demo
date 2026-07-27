@@ -7,19 +7,21 @@ from __future__ import annotations
 
 import http.client
 import io
-from ipaddress import ip_address
 import json
 import re
-import ssl
 import socket
+import ssl
 import threading
 import time
-from typing import Any, Callable
 import urllib.request
+from collections.abc import Callable
+from ipaddress import ip_address
+from typing import Any
 from urllib.parse import urlsplit
 
 from bnbagent.storage import StorageProvider
-from notify_security import _ValidatedGatewayOrigin, _validate_gateway_origin
+
+from notify_security import _validate_gateway_origin, _ValidatedGatewayOrigin
 
 _TIMEOUT_UPLOAD = 30
 _TIMEOUT_DOWNLOAD = 30
@@ -39,7 +41,6 @@ class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         del req, fp, code, msg, headers, newurl
-        return None
 
 
 class _DeadlineSocketIO(io.RawIOBase):

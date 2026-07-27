@@ -4,17 +4,16 @@ from __future__ import annotations
 
 import dataclasses
 import hashlib
-from ipaddress import ip_address
 import json
 import os
-from pathlib import Path
 import socket
 import unittest
+from ipaddress import ip_address
+from pathlib import Path
 from unittest.mock import patch
 
 from eth_account import Account
 from eth_account.messages import encode_typed_data
-
 from stockanalyst.app.agent.notify_security import (
     NotifySecurityError,
     _is_public_gateway_address,

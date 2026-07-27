@@ -83,7 +83,7 @@ class SellerAgentExecutor(SellerCore, AgentExecutor):
                         'send the skill envelope as an A2A data part: '
                         'parts:[{"kind":"data","data":{"skill":"negotiate",...}}]'
                     )
-        except Exception as e:  # noqa: BLE001 — an unexpected fault → JSON-RPC -32603
+        except Exception as e:
             # A genuine internal fault is surfaced as a JSON-RPC error, NOT masked
             # as a successful result. A *plain* exception would hang/500 the caller
             # (a2a-sdk's jsonrpc handler catches only ServerError; a bare exception

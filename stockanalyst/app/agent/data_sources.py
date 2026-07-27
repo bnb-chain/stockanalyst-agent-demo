@@ -17,6 +17,7 @@ import json
 import logging
 import math
 import os
+from datetime import UTC
 from typing import Any
 
 import requests
@@ -280,8 +281,9 @@ def fetch_insider_trades(symbol: str, days: int = 90) -> dict[str, Any]:
         forms = recent.get("form", [])
         dates = recent.get("filingDate", [])
 
-        from datetime import date, timedelta
-        cutoff = (date.today() - timedelta(days=days)).isoformat()
+        from datetime import datetime, timedelta
+
+        cutoff = (datetime.now(tz=UTC).date() - timedelta(days=days)).isoformat()
         form4s = [
             dates[i]
             for i, f in enumerate(forms)

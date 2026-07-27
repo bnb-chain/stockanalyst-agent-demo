@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 import importlib.util
-from pathlib import Path
 import sys
 import threading
-from types import ModuleType, SimpleNamespace
 import unittest
+from pathlib import Path
+from types import ModuleType, SimpleNamespace
 from unittest.mock import patch
 
 
@@ -19,7 +19,7 @@ def _load_signing_with_stubs(submit_workflow, storage_module, uomp_module):
 
     studio = ModuleType("bnbagent_studio_core")
     config = ModuleType("bnbagent_studio_core.config")
-    config.load_studio_toml = lambda: {}
+    config.load_studio_toml = dict
     studio.config = config
     studio_erc8183 = ModuleType("bnbagent_studio_core.erc8183")
     studio_erc8183.submit_workflow = submit_workflow

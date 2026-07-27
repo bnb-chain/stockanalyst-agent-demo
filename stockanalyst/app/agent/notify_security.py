@@ -2,9 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import hashlib
-from ipaddress import ip_address, ip_network
 import json
 import math
 import os
@@ -12,13 +10,15 @@ import re
 import socket
 import threading
 import time
-from typing import Any, Callable
+from collections.abc import Callable
+from dataclasses import dataclass
+from ipaddress import ip_address, ip_network
+from typing import Any
 from urllib.parse import urlsplit
 
 from eth_account import Account
 from eth_account.messages import encode_typed_data
 from eth_utils import to_checksum_address
-
 
 _MAX_CONTEXT_BYTES = 65_536
 _MAX_GATEWAY_URL_LENGTH = 2_048
@@ -209,7 +209,7 @@ def _resolve_addresses(
             outcome["answers"] = socket.getaddrinfo(
                 hostname, port, type=socket.SOCK_STREAM
             )
-        except BaseException as exc:  # noqa: BLE001 — reraised on the caller thread
+        except BaseException as exc:
             outcome["error"] = exc
 
     worker = threading.Thread(target=_run, daemon=True)

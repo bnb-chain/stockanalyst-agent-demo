@@ -41,28 +41,28 @@ import json
 import logging
 import os
 import sys
-from typing import AsyncGenerator
+from collections.abc import AsyncGenerator
 
-from google.adk.agents import Agent
-from google.adk.runners import InMemoryRunner
-from google.genai import types as gtypes
-
-from managed_model import build_model
 from bnbagent_studio_core.wallet import (
     ensure_keystore_materialized,
     ensure_twak_materialized,
 )
+from google.adk.agents import Agent
+from google.adk.runners import InMemoryRunner
+from google.genai import types as gtypes
 
 from agent_card import build_agent_card
+from executor import SellerAgentExecutor
+from managed_model import build_model
+from report_pipeline import generate_validated_report
+from report_renderer import render_report
+from report_schema import StockReport
+from tools import LLM_READ_TOOLS
+
 try:
     from .agent_instruction import SYSTEM_INSTRUCTION
-except ImportError:
+except ImportError:  # pragma: no cover — flat import when run as script
     from agent_instruction import SYSTEM_INSTRUCTION
-from executor import SellerAgentExecutor
-from report_pipeline import generate_validated_report
-from tools import LLM_READ_TOOLS
-from report_schema import StockReport
-from report_renderer import render_report
 
 APP_NAME = "agent"
 
@@ -98,7 +98,7 @@ def _generator_tag() -> str:
         from bnbagent_studio_core import config
 
         name = str(((config.load_studio_toml() or {}).get("project") or {}).get("name") or "")
-    except Exception:  # noqa: BLE001 — a metadata label must never break fulfill
+    except Exception:
         return APP_NAME
     return name[: -len("-agent")] if name.endswith("-agent") else (name or APP_NAME)
 
@@ -132,6 +132,8 @@ _load_runtime_secrets()
 # (which imported resolve_network at module level), then clear the LRU cache so
 # get_8183_client() rebuilds with use_paymaster=False.
 import dataclasses as _dc
+from datetime import UTC
+
 import bnbagent.config as _bnbagent_cfg
 import bnbagent.erc8183.client as _bnb_erc8183_client
 
@@ -148,9 +150,12 @@ _bnb_erc8183_client.resolve_network = _resolve_no_paymaster
 
 try:
     from bnbagent_studio_core.erc8183.client import _reset_cache as _reset_8183_cache
+
     _reset_8183_cache()
 except Exception:
-    pass
+    logging.getLogger("seller-agent").debug(
+        "8183 client cache reset skipped", exc_info=True
+    )
 
 # --- Wallet bootstrap -----------------------------------------------------------
 # Wallet material is NEVER bundled into the deploy artifact. `bag deploy`
@@ -327,7 +332,7 @@ async def _stream_runner(
                 user_id="service", session_id=session_id, new_message=user_msg
             ):
                 await queue.put(("event", event))
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             await queue.put(("exc", exc))
         finally:
             await queue.put(("done", None))
@@ -337,7 +342,7 @@ async def _stream_runner(
         while True:
             try:
                 kind, payload = await asyncio.wait_for(queue.get(), timeout=HEARTBEAT_S)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 yield "progress", {"stage": "thinking", "message": "Generating analysis..."}
                 continue
 
@@ -366,8 +371,10 @@ async def _stream_runner(
         task.cancel()
         try:
             await task
-        except (asyncio.CancelledError, Exception):
+        except asyncio.CancelledError:
             pass
+        except Exception:
+            _log.debug("progress task teardown ignored", exc_info=True)
 
     raw = "\n".join(parts).strip()
 
@@ -393,10 +400,11 @@ async def _stream_runner(
 
 def _format_free_report(symbol: str, quote: dict) -> str:
     """Format a simple markdown table from a fetch_quote result dict."""
-    import datetime
-    today = datetime.date.today().isoformat()
-    name  = quote.get("name", symbol)
-    cur   = quote.get("currency", "USD")
+    from datetime import datetime
+
+    today = datetime.now(tz=UTC).date().isoformat()
+    name = quote.get("name", symbol)
+    cur = quote.get("currency", "USD")
 
     def fp(v):   return f"{cur} {v:,.2f}" if v is not None else "N/A"
     def fpct(v): return f"{v:+.2f}%" if v is not None else "N/A"
@@ -433,8 +441,11 @@ def _format_free_report(symbol: str, quote: dict) -> str:
         "|--------|-------|",
         *[f"| {k} | {v} |" for k, v in rows],
         "",
-        "> **Full analysis** (RSI / MACD / Bollinger Bands, options sentiment, insider activity, portfolio rebalancing) "
-        "→ **Paid tier (1.0 U)** via `POST /x402/analyze`",
+        (
+            "> **Full analysis** (RSI / MACD / Bollinger Bands, options sentiment, "
+            "insider activity, portfolio rebalancing) "
+            "→ **Paid tier (1.0 U)** via `POST /x402/analyze`"
+        ),
     ]
     return "\n".join(lines)
 
@@ -452,7 +463,7 @@ async def _stream_free(symbol: str) -> AsyncGenerator[tuple[str, dict], None]:
         "message": f"Fetching market data for {symbol}...",
     }
     try:
-        loop  = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         quote = await loop.run_in_executor(None, fetch_quote, symbol)
     except Exception as exc:
         yield "error", {"message": f"Failed to fetch {symbol}: {exc}"}
@@ -468,7 +479,7 @@ def _default_network() -> str:
         from bnbagent_studio_core import config
 
         return str(((config.load_studio_toml() or {}).get("network") or {}).get("default") or "bsc-testnet")
-    except Exception:  # noqa: BLE001
+    except Exception:
         return "bsc-testnet"
 
 
@@ -554,7 +565,7 @@ async def _emit(send, start_message, body: bytes):
                 if isinstance(e, dict):
                     e.pop("input", None)
             new_body = json.dumps(payload).encode("utf-8")
-    except Exception:  # noqa: BLE001 — never let hardening break a response
+    except Exception:
         new_body = body
 
     if start_message is not None:

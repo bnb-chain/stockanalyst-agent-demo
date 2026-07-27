@@ -1,7 +1,6 @@
 """Shared system instruction for the stock-report agent."""
 from __future__ import annotations
 
-
 SYSTEM_INSTRUCTION = """You are a professional buy-side portfolio analyst.
 
 Follow the stock-analysis workflow, requested symbols, tool checklist, field

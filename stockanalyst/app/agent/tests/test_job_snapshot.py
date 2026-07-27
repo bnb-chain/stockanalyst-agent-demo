@@ -2,14 +2,12 @@
 
 from __future__ import annotations
 
-from types import SimpleNamespace
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from bnbagent.erc8183.types import JobStatus
-
 from stockanalyst.app.agent import signing
-
 
 PROVIDER = "0x1111111111111111111111111111111111111111"
 CLIENT = "0x2222222222222222222222222222222222222222"

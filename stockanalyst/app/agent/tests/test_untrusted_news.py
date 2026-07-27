@@ -4,13 +4,12 @@ import ast
 import json
 import math
 import os
-from pathlib import Path
 import traceback
 import unittest
+from pathlib import Path
 from unittest.mock import Mock, patch
 
 import requests
-
 from stockanalyst.app.agent.data_sources import (
     _ProviderResponseError,
     _read_provider_json,
@@ -234,7 +233,7 @@ class NewsProviderTests(unittest.TestCase):
             "fetch_alpha_vantage_sentiment": fetch_alpha_vantage_sentiment,
             "fetch_gnews_headlines": lambda symbol: {"headlines": []},
         }
-        exec(
+        exec(  # noqa: S102 — isolate get_news_sentiment without importing tools module
             compile(
                 ast.fix_missing_locations(
                     ast.Module(body=[function], type_ignores=[]),

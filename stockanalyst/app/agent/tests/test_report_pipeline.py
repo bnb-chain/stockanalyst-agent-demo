@@ -6,7 +6,6 @@ import unittest
 from unittest.mock import patch
 
 from pydantic import ValidationError
-
 from stockanalyst.app.agent.report_pipeline import (
     SAFE_FAILURE_REPORT,
     generate_validated_report,
@@ -292,12 +291,17 @@ class ReportPipelineTests(unittest.IsolatedAsyncioTestCase):
         for output, code in cases:
             calls = 0
 
-            async def call_runner(prompt: str, session_id: str):
+            async def call_runner(
+                prompt: str,
+                session_id: str,
+                *,
+                _output: object = output,
+            ):
                 nonlocal calls
                 del prompt
                 self.assertEqual(session_id, "42")
                 calls += 1
-                return output
+                return _output
 
             with (
                 self.subTest(code=code),
@@ -379,8 +383,8 @@ class ReportPipelineTests(unittest.IsolatedAsyncioTestCase):
         remaining = limit - len(valid.encode("utf-8"))
         exact = (
             valid
-            + ("界" * (remaining // len("界".encode("utf-8"))))
-            + ("x" * (remaining % len("界".encode("utf-8"))))
+            + ("界" * (remaining // len("界".encode())))
+            + ("x" * (remaining % len("界".encode())))
         )
         self.assertEqual(len(exact.encode("utf-8")), limit)
 

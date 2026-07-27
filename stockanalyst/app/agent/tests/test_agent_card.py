@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 import importlib.util
-from pathlib import Path
 import sys
-from types import ModuleType
 import unittest
+from pathlib import Path
+from types import ModuleType
 
 
 class _A2AType:
