@@ -41,13 +41,15 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import hmac
 import json
 import logging
 import os
 import time
-import urllib.parse
+import uuid
 from collections.abc import AsyncGenerator, Callable
 from typing import Any
+from urllib.parse import parse_qs
 
 import httpx
 
@@ -66,70 +68,139 @@ from x402_verify import (
 
 logger = logging.getLogger("seller-agent.x402")
 
-# Binance Pay x402 facilitator endpoint.
-# When set, the agent POSTs the signed proof here after local verification;
-# the facilitator executes the on-chain transferWithAuthorization and returns
-# a transaction hash.
+# ── Settlement configuration (priority: B402 > generic facilitator > demo) ─────
+
+# Binance Pay B402 authenticated facilitator (preferred).
+# Apply for credentials at https://forms.gle/aUQvxUETfGMzyTky5
+# After approval: bag env set B402_CLIENT_ID <clientId>
+#                 bag env set B402_SECRET <secret>
+B402_CLIENT_ID = os.environ.get("B402_CLIENT_ID", "").strip()
+B402_SECRET    = os.environ.get("B402_SECRET", "").strip()
+B402_BASE_URL  = os.environ.get("B402_BASE_URL", "https://bpay.binance.com").rstrip("/")
+
+# Generic x402 facilitator (fallback — no HMAC auth).
 FACILITATOR_URL = os.environ.get("X402_FACILITATOR_URL", "").rstrip("/")
 
 # Demo / local-dev mode — explicit opt-in required.
-# Set X402_DEMO_MODE=1 ONLY for local testing when no facilitator is available.
-# In demo mode the EIP-712 signature is verified but NO token is transferred.
-# NEVER set this in production — any user could receive paid analysis for free.
+# NEVER set this in production — signatures verified but NO token transferred.
 X402_DEMO_MODE = os.environ.get("X402_DEMO_MODE", "").strip().lower() in ("1", "true", "yes")
 
-if not FACILITATOR_URL and not X402_DEMO_MODE:
-    logger.warning(
-        "x402: SECURITY — neither X402_FACILITATOR_URL nor X402_DEMO_MODE is set. "
-        "The paid /x402/analyze endpoint will REJECT all requests until one is configured. "
-        "For local testing: export X402_DEMO_MODE=1. "
-        "For production:    export X402_FACILITATOR_URL=https://pay.binance.com/x402/v1"
+if B402_CLIENT_ID and B402_SECRET:
+    logger.info(
+        "x402: B402 HMAC-SHA512 facilitator active — client_id=%s base_url=%s",
+        B402_CLIENT_ID, B402_BASE_URL,
     )
+elif FACILITATOR_URL:
+    logger.info("x402: generic facilitator active — %s", FACILITATOR_URL)
 elif X402_DEMO_MODE:
     logger.warning(
         "x402: DEMO MODE active (X402_DEMO_MODE=1) — EIP-712 signatures are verified "
         "but NO on-chain token transfer is executed. Never use this in production."
     )
+else:
+    logger.warning(
+        "x402: SECURITY — no settlement backend configured. "
+        "The paid /x402/analyze endpoint will REJECT all requests until one is set. "
+        "For production:    export B402_CLIENT_ID=<id> B402_SECRET=<secret>. "
+        "For local testing: export X402_DEMO_MODE=1."
+    )
+
+
+def _b402_headers(payload_dict: dict) -> dict[str, str]:
+    """Build Binance Pay HMAC-SHA512 authentication headers for B402 settle."""
+    timestamp = int(time.time() * 1000)
+    nonce = uuid.uuid4().hex[:32]
+    payload_to_sign = f"{timestamp}\n{nonce}\n{json.dumps(payload_dict)}\n"
+    signature = hmac.new(
+        B402_SECRET.encode("utf-8"),
+        payload_to_sign.encode("utf-8"),
+        hashlib.sha512,
+    ).hexdigest().upper()
+    return {
+        "BinancePay-Timestamp": str(timestamp),
+        "BinancePay-Nonce": nonce,
+        "BinancePay-Certificate-SN": B402_CLIENT_ID,
+        "BinancePay-Signature": signature,
+        "Content-Type": "application/json",
+    }
 
 
 async def _settle_via_facilitator(proof_b64: str) -> tuple[bool, str]:
-    """Call Binance Pay x402 facilitator to execute on-chain settlement.
+    """Execute on-chain settlement via configured backend.
+
+    Priority: B402 (HMAC-SHA512) → generic facilitator → demo mode → fail closed.
 
     Returns (True, txHash) on success, (False, error_reason) on failure.
-
-    Security: when FACILITATOR_URL is unset and X402_DEMO_MODE is not explicitly
-    enabled, we FAIL CLOSED rather than silently skip settlement — preventing
-    unpaid access to analysis in misconfigured or partially-deployed environments.
     """
-    if not FACILITATOR_URL:
-        if X402_DEMO_MODE:
-            logger.warning(
-                "x402: demo mode — EIP-712 sig OK but no on-chain transfer (X402_DEMO_MODE=1)"
-            )
-            return True, "demo"
-        return False, (
-            "payment not settled: X402_FACILITATOR_URL is not configured. "
-            "For local testing set X402_DEMO_MODE=1; for production set X402_FACILITATOR_URL."
-        )
-
+    # Decode proof (shared by all settlement paths)
     try:
         raw   = base64.b64decode(proof_b64.strip())
         proof = json.loads(raw)
     except Exception as exc:
-        return False, f"could not decode proof for facilitator: {exc}"
+        return False, f"could not decode proof: {exc}"
 
     payload = {
         "x402Version": 2,
         "paymentPayload": proof,
         "paymentRequirements": {
-            "scheme":             "exact",
-            "network":            f"eip155:{CHAIN_ID}",
-            "maxAmountRequired":  str(PRICE_WEI),
-            "asset":              U_TOKEN_BSC_TESTNET,
-            "payTo":              SELLER_WALLET.lower(),
-            "maxTimeoutSeconds":  60,
+            "scheme":            "exact",
+            "network":           f"eip155:{CHAIN_ID}",
+            "maxAmountRequired": str(PRICE_WEI),
+            "asset":             U_TOKEN_BSC_TESTNET,
+            "payTo":             SELLER_WALLET.lower(),
+            "maxTimeoutSeconds": 60,
         },
     }
+
+    # ── 1. Binance Pay B402 (HMAC-SHA512) ──────────────────────────────────────
+    if B402_CLIENT_ID and B402_SECRET:
+        return await _settle_b402(payload)
+
+    # ── 2. Generic x402 facilitator (unauthenticated POST) ─────────────────────
+    if FACILITATOR_URL:
+        return await _settle_generic(payload)
+
+    # ── 3. Demo mode (local testing only) ──────────────────────────────────────
+    if X402_DEMO_MODE:
+        logger.warning(
+            "x402: demo mode — EIP-712 sig OK but no on-chain transfer (X402_DEMO_MODE=1)"
+        )
+        return True, "demo"
+
+    # ── 4. Fail closed ─────────────────────────────────────────────────────────
+    return False, (
+        "payment not settled: no settlement backend configured. "
+        "Set B402_CLIENT_ID + B402_SECRET for production, or X402_DEMO_MODE=1 for local testing."
+    )
+
+
+async def _settle_b402(payload: dict) -> tuple[bool, str]:
+    """POST to Binance Pay B402 /papi/v2/b402/settle with HMAC-SHA512 auth."""
+    url = f"{B402_BASE_URL}/papi/v2/b402/settle"
+    try:
+        headers = _b402_headers(payload)
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.post(url, json=payload, headers=headers)
+            data = resp.json()
+        if data.get("status") == "SUCCESS" and data.get("code") == "000000":
+            txhash = str((data.get("data") or {}).get("transactionHash") or "")
+            logger.info("x402 B402 settled: txHash=%s", txhash)
+            return True, txhash
+        reason = str(
+            (data.get("data") or {}).get("errorMessage")
+            or data.get("errorMessage")
+            or data.get("msg")
+            or f"B402 rejected (code={data.get('code')})"
+        )
+        logger.warning("x402 B402 rejected: %s | response=%s", reason, data)
+        return False, reason
+    except Exception as exc:
+        logger.exception("x402 B402 call failed")
+        return False, str(exc)
+
+
+async def _settle_generic(payload: dict) -> tuple[bool, str]:
+    """POST to a generic x402 facilitator (no HMAC auth)."""
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
             resp = await client.post(
@@ -228,7 +299,7 @@ class X402Handler:
 
     async def _handle_challenge(self, scope, send) -> None:
         """GET /x402/analyze?symbols=... — return 402 payment challenge."""
-        qs = urllib.parse.parse_qs((scope.get("query_string") or b"").decode())
+        qs = parse_qs((scope.get("query_string") or b"").decode())
         symbols_raw = (qs.get("symbols") or [""])[0]
         symbols = _parse_symbols(symbols_raw)
         host = _host(scope)
@@ -387,7 +458,7 @@ class X402Handler:
 
     async def _handle_free_challenge(self, scope, send) -> None:
         """GET /x402/free?symbol=AAPL — return 402 free tier challenge (0 U)."""
-        qs = urllib.parse.parse_qs((scope.get("query_string") or b"").decode())
+        qs = parse_qs((scope.get("query_string") or b"").decode())
         symbol = ((qs.get("symbol") or qs.get("symbols") or [""])[0]).strip().upper()
         host = _host(scope)
         challenge = build_free_payment_challenge(symbol, host)

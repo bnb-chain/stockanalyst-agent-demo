@@ -122,18 +122,24 @@ endpoint = "/x402/analyze"
 port = 9001
 public = true
 
-# Binance Pay x402 facilitator — executes on-chain transferWithAuthorization
-# after the agent verifies the EIP-712 signature locally.
-# Set to the Binance Pay facilitator endpoint once available:
-#   bag env set X402_FACILITATOR_URL https://pay.binance.com/x402/v1
+# ── Binance Pay B402 facilitator (preferred) ────────────────────────────────
+# Apply for B402 credentials at https://forms.gle/aUQvxUETfGMzyTky5
+# After approval, IP-whitelist your agent's egress IP in the Binance console,
+# then set both vars (HMAC-SHA512 auth, BSC testnet supported):
+#   bag env set B402_CLIENT_ID <your-clientId>
+#   bag env set B402_SECRET    <your-secret>
+#   bag env set B402_BASE_URL  https://bpay.binance.com   # default, sandbox same
 #
-# LOCAL TESTING ONLY — explicit demo mode opt-in (no on-chain transfer):
+# ── Generic x402 facilitator (fallback, unauthenticated) ───────────────────
+#   bag env set X402_FACILITATOR_URL https://x402.org/facilitate
+#
+# ── LOCAL TESTING ONLY — demo mode (no on-chain transfer) ──────────────────
 #   bag env set X402_DEMO_MODE 1
-# NEVER set X402_DEMO_MODE in production — signatures are verified but no tokens
-# are transferred, so any wallet can receive paid analysis without paying.
+# NEVER set X402_DEMO_MODE in production — signatures are verified but no
+# tokens are transferred, so any wallet can receive paid analysis without paying.
 #
-# U token EIP-712 domain (default "U" / "1" — set only if contract differs):
-#   bag env set U_TOKEN_DOMAIN_NAME U
+# ── U token EIP-712 domain (default "U" / "1") ─────────────────────────────
+#   bag env set U_TOKEN_DOMAIN_NAME    U
 #   bag env set U_TOKEN_DOMAIN_VERSION 1
 
 [deploy.platform]
