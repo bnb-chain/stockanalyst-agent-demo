@@ -218,10 +218,7 @@ def verify_signed_job_snapshot(
 ) -> tuple[VerifiedJobSnapshot | None, str, bool]:
     """Verify one fetched job and return its immutable authorization/work fields."""
     from bnbagent.erc8183.types import JobStatus
-    from bnbagent_studio_core.erc8183.verify import (
-        JobDescription,
-        recover_quote_signer,
-    )
+    from bnbagent_studio_core.erc8183.verify import JobDescription
 
     client = get_8183_client()
     try:
@@ -243,7 +240,7 @@ def verify_signed_job_snapshot(
     if spec is None:
         return None, "no signed quote anchored in job description", True
 
-    signer = recover_quote_signer(job.description)
+    signer = recover_quote_signer_compat(job.description)
     if signer is None or signer.lower() != expected_signer.lower():
         return (
             None,

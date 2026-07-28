@@ -50,13 +50,15 @@ class VerifiedJobSnapshotTests(unittest.TestCase):
                 "bnbagent_studio_core.erc8183.verify.JobDescription.from_str",
                 return_value=spec,
             ),
-            patch(
-                "bnbagent_studio_core.erc8183.verify.recover_quote_signer",
+            patch.object(
+                signing,
+                "recover_quote_signer_compat",
                 return_value=PROVIDER,
-            ),
+            ) as recover,
         ):
             snapshot, reason, permanent = signing.verify_signed_job_snapshot(42)
 
+        recover.assert_called_once_with("signed-description")
         self.assertEqual(reads, [42])
         self.assertEqual(reason, "")
         self.assertIs(permanent, False)
@@ -83,6 +85,42 @@ class VerifiedJobSnapshotTests(unittest.TestCase):
         self.assertIsNone(snapshot)
         self.assertIn("expected FUNDED", reason)
         self.assertIs(permanent, False)
+
+    def test_rejects_a_compatibly_recovered_signature_from_another_signer(
+        self,
+    ) -> None:
+        job = SimpleNamespace(
+            status=JobStatus.FUNDED,
+            provider=PROVIDER,
+            client=CLIENT,
+            expired_at=0,
+            description="legacy-signed-description",
+            budget=10,
+        )
+        client = SimpleNamespace(get_job=lambda _job_id: job)
+        spec = SimpleNamespace(price="5")
+        with (
+            patch.object(signing, "get_8183_client", return_value=client),
+            patch.object(
+                signing,
+                "get_wallet",
+                return_value=SimpleNamespace(address=PROVIDER),
+            ),
+            patch(
+                "bnbagent_studio_core.erc8183.verify.JobDescription.from_str",
+                return_value=spec,
+            ),
+            patch.object(
+                signing,
+                "recover_quote_signer_compat",
+                return_value=CLIENT,
+            ),
+        ):
+            snapshot, reason, permanent = signing.verify_signed_job_snapshot(42)
+
+        self.assertIsNone(snapshot)
+        self.assertIn("quote signature does not match", reason)
+        self.assertIs(permanent, True)
 
 
 if __name__ == "__main__":
