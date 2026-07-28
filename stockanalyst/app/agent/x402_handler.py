@@ -46,17 +46,24 @@ import json
 import logging
 import os
 import time
-import urllib.parse
 import uuid
-from typing import Any, AsyncGenerator, Callable
+from collections.abc import AsyncGenerator, Callable
+from typing import Any
+from urllib.parse import parse_qs
 
 import httpx
 
 from x402_verify import (
-    CHAIN_ID, MIN_PRICE_WEI, PRICE_WEI, SELLER_WALLET, U_TOKEN_BSC_TESTNET,
+    CHAIN_ID,
     FREE_TIER_LIMIT,
-    build_payment_challenge, verify_payment_proof,
-    build_free_payment_challenge, verify_free_payment_proof,
+    MIN_PRICE_WEI,
+    PRICE_WEI,
+    SELLER_WALLET,
+    U_TOKEN_BSC_TESTNET,
+    build_free_payment_challenge,
+    build_payment_challenge,
+    verify_free_payment_proof,
+    verify_payment_proof,
 )
 
 logger = logging.getLogger("seller-agent.x402")
@@ -292,7 +299,7 @@ class X402Handler:
 
     async def _handle_challenge(self, scope, send) -> None:
         """GET /x402/analyze?symbols=... — return 402 payment challenge."""
-        qs = urllib.parse.parse_qs((scope.get("query_string") or b"").decode())
+        qs = parse_qs((scope.get("query_string") or b"").decode())
         symbols_raw = (qs.get("symbols") or [""])[0]
         symbols = _parse_symbols(symbols_raw)
         host = _host(scope)
@@ -451,7 +458,7 @@ class X402Handler:
 
     async def _handle_free_challenge(self, scope, send) -> None:
         """GET /x402/free?symbol=AAPL — return 402 free tier challenge (0 U)."""
-        qs = urllib.parse.parse_qs((scope.get("query_string") or b"").decode())
+        qs = parse_qs((scope.get("query_string") or b"").decode())
         symbol = ((qs.get("symbol") or qs.get("symbols") or [""])[0]).strip().upper()
         host = _host(scope)
         challenge = build_free_payment_challenge(symbol, host)

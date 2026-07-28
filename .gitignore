@@ -64,3 +64,5 @@ htmlcov/
 !.env.example
 
 docs/superpowers/
+output/
+agentcore/
