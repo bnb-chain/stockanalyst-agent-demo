@@ -24,6 +24,7 @@ def _description(
     *,
     stored_marker: str = MARKER,
     signed_marker: object | None = None,
+    prefix_negotiation_hash: bool = True,
 ) -> tuple[str, str]:
     account = Account.create()
     content = {
@@ -46,6 +47,8 @@ def _description(
         signed["terms"]["success_criteria"] = signed_marker
     canonical = json.dumps(signed, sort_keys=True, separators=(",", ":"))
     negotiation_hash = Web3.keccak(text=canonical).hex()
+    if prefix_negotiation_hash:
+        negotiation_hash = f"0x{negotiation_hash}"
     signature = Account.sign_message(
         encode_defunct(text=negotiation_hash),
         private_key=account.key,
@@ -74,6 +77,16 @@ class QuoteSignatureCompatibilityTests(unittest.TestCase):
 
     def test_recovers_legacy_marker_character_list_signature(self) -> None:
         description, expected = _description(signed_marker=list(MARKER))
+        self.assertEqual(
+            signing.recover_quote_signer_compat(description).lower(),
+            expected.lower(),
+        )
+
+    def test_recovers_legacy_signature_with_sdk_prefixed_negotiation_hash(self) -> None:
+        description, expected = _description(
+            signed_marker=list(MARKER),
+            prefix_negotiation_hash=True,
+        )
         self.assertEqual(
             signing.recover_quote_signer_compat(description).lower(),
             expected.lower(),

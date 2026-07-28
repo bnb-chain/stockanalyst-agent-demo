@@ -72,6 +72,7 @@ def recover_quote_signer_compat(description: str) -> str | None:
 
         canonical = json.dumps(content, sort_keys=True, separators=(",", ":"))
         recomputed = Web3.keccak(text=canonical).hex()
+        recomputed = recomputed if recomputed.startswith("0x") else f"0x{recomputed}"
         if recomputed.lower() != negotiation_hash.lower():
             return None
 
