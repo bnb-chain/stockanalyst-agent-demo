@@ -32,6 +32,58 @@ from bnbagent_studio_core.erc8183.workflows import settle_workflow
 from bnbagent_studio_core.wallet import get_wallet
 
 
+_CONTEXT_REQUIRED_CRITERION = "uomp_notify_context_required_v1"
+
+
+def recover_quote_signer_compat(description: str) -> str | None:
+    from bnbagent_studio_core.erc8183.verify import recover_quote_signer
+
+    recovered = recover_quote_signer(description)
+    if recovered is not None:
+        return recovered
+
+    import json
+
+    try:
+        parsed = json.loads(description)
+        terms = parsed["terms"]
+        if (
+            not isinstance(parsed, dict)
+            or not isinstance(terms, dict)
+            or terms.get("success_criteria") != _CONTEXT_REQUIRED_CRITERION
+        ):
+            return None
+        negotiation_hash = parsed["negotiation_hash"]
+        provider_sig = parsed["provider_sig"]
+        if not isinstance(negotiation_hash, str) or not isinstance(provider_sig, str):
+            return None
+
+        content = {
+            key: value
+            for key, value in parsed.items()
+            if key not in ("negotiation_hash", "provider_sig")
+        }
+        content["terms"] = dict(terms)
+        content["terms"]["success_criteria"] = list(_CONTEXT_REQUIRED_CRITERION)
+
+        from web3 import Web3
+
+        canonical = json.dumps(content, sort_keys=True, separators=(",", ":"))
+        recomputed = Web3.keccak(text=canonical).hex()
+        if recomputed.lower() != negotiation_hash.lower():
+            return None
+
+        from eth_account import Account
+        from eth_account.messages import encode_defunct
+
+        return Account.recover_message(
+            encode_defunct(text=negotiation_hash),
+            signature=provider_sig,
+        )
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
 def _erc8183_cfg() -> dict:
     """Read ``[payments.erc8183]`` from studio.toml ({} when absent)."""
     try:
