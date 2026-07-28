@@ -38,7 +38,10 @@ _CONTEXT_REQUIRED_CRITERION = "uomp_notify_context_required_v1"
 def recover_quote_signer_compat(description: str) -> str | None:
     from bnbagent_studio_core.erc8183.verify import recover_quote_signer
 
-    recovered = recover_quote_signer(description)
+    try:
+        recovered = recover_quote_signer(description)
+    except (TypeError, ValueError):
+        recovered = None
     if recovered is not None:
         return recovered
 

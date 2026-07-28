@@ -59,6 +59,13 @@ class QuoteSignatureCompatibilityTests(unittest.TestCase):
         self.assertEqual(recovered, "0x1111111111111111111111111111111111111111")
         normal.assert_called_once_with("{}")
 
+    def test_returns_none_when_sdk_recovery_rejects_malformed_input(self) -> None:
+        with patch(
+            "bnbagent_studio_core.erc8183.verify.recover_quote_signer",
+            side_effect=ValueError("malformed description"),
+        ):
+            self.assertIsNone(signing.recover_quote_signer_compat("not-json"))
+
     def test_recovers_legacy_marker_character_list_signature(self) -> None:
         description, expected = _description(signed_marker=list(MARKER))
         self.assertEqual(
