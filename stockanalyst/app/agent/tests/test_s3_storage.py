@@ -20,6 +20,8 @@ class FakeBody:
 class FakeS3:
     def __init__(self) -> None:
         self.put_calls: list[dict] = []
+        self.get_calls: list[dict] = []
+        self.head_calls: list[dict] = []
         self.objects: dict[tuple[str, str], bytes] = {}
 
     def put_object(self, **kwargs):
@@ -28,10 +30,12 @@ class FakeS3:
         return {"ETag": '"test"'}
 
     def get_object(self, *, Bucket: str, Key: str):
+        self.get_calls.append({"Bucket": Bucket, "Key": Key})
         value = self.objects[(Bucket, Key)]
         return {"ContentLength": len(value), "Body": FakeBody(value)}
 
     def head_object(self, *, Bucket: str, Key: str):
+        self.head_calls.append({"Bucket": Bucket, "Key": Key})
         if (Bucket, Key) not in self.objects:
             raise ClientError(
                 {"Error": {"Code": "404", "Message": "Not Found"}},
@@ -99,6 +103,13 @@ class S3StorageUploadTests(unittest.IsolatedAsyncioTestCase):
 
 
 class S3StorageReadTests(S3StorageUploadTests):
+    def canonical_url(self, stem: str, body: bytes) -> str:
+        digest = hashlib.sha256(body).hexdigest()
+        return (
+            "https://d111111abcdef8.cloudfront.net/"
+            f"deliverables/{stem}-{digest}.json"
+        )
+
     async def test_download_reads_validated_cloudfront_url_from_s3(self) -> None:
         provider = self.provider()
         url = await provider.upload({"job_id": 397}, "job.json")
@@ -118,19 +129,17 @@ class S3StorageReadTests(S3StorageUploadTests):
 
     async def test_download_rejects_oversized_body(self) -> None:
         provider = self.provider()
-        self.client.objects[
-            ("bnbagent-code-stock-analyst-agent", "deliverables/large.json")
-        ] = b"x" * (2 * 1024 * 1024 + 1)
+        body = b"x" * (2 * 1024 * 1024 + 1)
+        url = self.canonical_url("large", body)
+        key = url.removeprefix("https://d111111abcdef8.cloudfront.net/")
+        self.client.objects[("bnbagent-code-stock-analyst-agent", key)] = body
         with self.assertRaisesRegex(S3StorageError, "2 MiB"):
-            await provider.download(
-                "https://d111111abcdef8.cloudfront.net/deliverables/large.json"
-            )
+            await provider.download(url)
 
     async def test_exists_returns_false_only_for_missing_key(self) -> None:
+        url = self.canonical_url("missing", b"{}")
         self.assertFalse(
-            await self.provider().exists(
-                "https://d111111abcdef8.cloudfront.net/deliverables/missing.json"
-            )
+            await self.provider().exists(url)
         )
 
     async def test_exists_propagates_non_missing_s3_errors(self) -> None:
@@ -141,8 +150,54 @@ class S3StorageReadTests(S3StorageUploadTests):
             )
 
         self.client.head_object = fail_head_object
+        url = self.canonical_url("missing", b"{}")
 
         with self.assertRaises(ClientError):
-            await self.provider().exists(
-                "https://d111111abcdef8.cloudfront.net/deliverables/missing.json"
-            )
+            await self.provider().exists(url)
+
+    async def test_rejects_noncanonical_key_before_s3_calls(self) -> None:
+        url = "https://d111111abcdef8.cloudfront.net/deliverables/job.json"
+
+        with self.assertRaisesRegex(S3StorageError, "content-addressed"):
+            await self.provider().download(url)
+        with self.assertRaisesRegex(S3StorageError, "content-addressed"):
+            await self.provider().exists(url)
+
+        self.assertEqual(self.client.get_calls, [])
+        self.assertEqual(self.client.head_calls, [])
+
+    async def test_download_rejects_key_digest_mismatch(self) -> None:
+        body = b'{"job_id":397}'
+        url = (
+            "https://d111111abcdef8.cloudfront.net/deliverables/"
+            f"job-{'0' * 64}.json"
+        )
+        key = url.removeprefix("https://d111111abcdef8.cloudfront.net/")
+        self.client.objects[
+            ("bnbagent-code-stock-analyst-agent", key)
+        ] = body
+
+        with self.assertRaisesRegex(S3StorageError, "digest"):
+            await self.provider().download(url)
+
+    async def test_download_rejects_noncanonical_json_bytes(self) -> None:
+        body = b'{"job_id": 397}'
+        url = self.canonical_url("job", body)
+        key = url.removeprefix("https://d111111abcdef8.cloudfront.net/")
+        self.client.objects[
+            ("bnbagent-code-stock-analyst-agent", key)
+        ] = body
+
+        with self.assertRaisesRegex(S3StorageError, "canonical"):
+            await self.provider().download(url)
+
+    async def test_download_rejects_nonfinite_json_constants(self) -> None:
+        body = b'{"value":NaN}'
+        url = self.canonical_url("job", body)
+        key = url.removeprefix("https://d111111abcdef8.cloudfront.net/")
+        self.client.objects[
+            ("bnbagent-code-stock-analyst-agent", key)
+        ] = body
+
+        with self.assertRaisesRegex(S3StorageError, "valid UTF-8 JSON"):
+            await self.provider().download(url)

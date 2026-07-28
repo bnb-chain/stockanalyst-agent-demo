@@ -16,7 +16,14 @@ _DEFAULT_PREFIX = "deliverables"
 _MAX_DOWNLOAD_BYTES = 2 * 1024 * 1024
 _BUCKET_RE = re.compile(r"[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]\Z")
 _SEGMENT_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,199}\Z")
-_OBJECT_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,299}\Z")
+_OBJECT_RE = re.compile(
+    r"(?P<stem>[A-Za-z0-9][A-Za-z0-9._-]{0,199})-"
+    r"(?P<digest>[0-9a-f]{64})\.json\Z"
+)
+
+
+def _reject_nonfinite_json_constant(value: str) -> None:
+    raise ValueError(f"non-finite JSON constant: {value}")
 
 
 class S3StorageError(RuntimeError):
@@ -116,7 +123,7 @@ class S3StorageProvider(StorageProvider):
         )
         return f"{self._config.public_base}/{key}"
 
-    def _key_from_url(self, url: str) -> str:
+    def _key_from_url(self, url: str) -> tuple[str, str]:
         parsed = urlsplit(url)
         base = urlsplit(self._config.public_base)
         if (
@@ -131,12 +138,13 @@ class S3StorageProvider(StorageProvider):
         if not path.startswith(prefix) or path == prefix or "%" in path:
             raise S3StorageError("deliverable URL must stay under the configured prefix")
         remainder = path[len(prefix) :]
-        if "/" in remainder or not _OBJECT_RE.fullmatch(remainder):
-            raise S3StorageError("deliverable object key is invalid")
-        return path
+        match = _OBJECT_RE.fullmatch(remainder)
+        if "/" in remainder or match is None:
+            raise S3StorageError("deliverable object key must be content-addressed")
+        return path, match["digest"]
 
     async def download(self, url: str) -> dict:
-        key = self._key_from_url(url)
+        key, expected_digest = self._key_from_url(url)
         response = await asyncio.to_thread(
             self._s3.get_object,
             Bucket=self._config.bucket,
@@ -152,17 +160,30 @@ class S3StorageProvider(StorageProvider):
         if len(body) > _MAX_DOWNLOAD_BYTES:
             raise S3StorageError("S3 deliverable exceeds 2 MiB")
         try:
-            value = json.loads(body.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            value = json.loads(
+                body.decode("utf-8"),
+                parse_constant=_reject_nonfinite_json_constant,
+            )
+        except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
             raise S3StorageError("S3 deliverable is not valid UTF-8 JSON") from exc
         if not isinstance(value, dict):
             raise S3StorageError("S3 deliverable root must be an object")
+        try:
+            canonical = json.dumps(
+                value, sort_keys=True, separators=(",", ":"), allow_nan=False
+            ).encode("utf-8")
+        except (TypeError, ValueError) as exc:
+            raise S3StorageError("S3 deliverable is not valid canonical JSON") from exc
+        if canonical != body:
+            raise S3StorageError("S3 deliverable JSON is not canonical")
+        if hashlib.sha256(canonical).hexdigest() != expected_digest:
+            raise S3StorageError("S3 deliverable digest does not match its key")
         return value
 
     async def exists(self, url: str) -> bool:
         from botocore.exceptions import ClientError
 
-        key = self._key_from_url(url)
+        key, _ = self._key_from_url(url)
         try:
             await asyncio.to_thread(
                 self._s3.head_object,
