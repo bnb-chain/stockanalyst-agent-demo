@@ -6,6 +6,7 @@
  * them unset for local dev (the token fetch is skipped automatically).
  */
 
+import { randomUUID } from "node:crypto";
 import { formatUnits, parseUnits, type Signer } from "ethers";
 import {
   buildNotifyContext,
@@ -91,12 +92,20 @@ export interface NegotiationEnvelope {
 
 // ── OAuth2 client_credentials token cache ────────────────────────────────────
 
-let _cachedToken: { value: string; expiresAt: number } | null = null;
+let _cachedToken: {
+  value: string;
+  expiresAt: number;
+  clientId: string;
+  clientSecret: string;
+  tokenUrl: string;
+  scope: string;
+} | null = null;
 
 /**
  * Return `{ Authorization: "Bearer …" }` when AGENT_CLIENT_ID/SECRET are set.
- * Derives the token URL and scope from the A2A endpoint URL so no extra env
- * vars are needed. Returns {} for local endpoints (no auth required).
+ * Derives the token URL and scope from the A2A endpoint URL unless their
+ * explicit AGENT_TOKEN_URL/AGENT_OAUTH_SCOPE overrides are configured.
+ * Returns {} for local endpoints (no auth required).
  */
 async function authHeaders(endpoint: string): Promise<Record<string, string>> {
   const clientId     = process.env["AGENT_CLIENT_ID"]     ?? "";
@@ -104,17 +113,24 @@ async function authHeaders(endpoint: string): Promise<Record<string, string>> {
   if (!clientId || !clientSecret) return {};
 
   const now = Date.now();
-  if (_cachedToken && _cachedToken.expiresAt > now + 30_000) {
-    return { Authorization: `Bearer ${_cachedToken.value}` };
-  }
-
   // Token URL: same origin as the A2A endpoint, path /v1/oauth/token
   const origin   = new URL(endpoint).origin;
-  const tokenUrl = `${origin}/v1/oauth/token`;
+  const tokenUrl = process.env["AGENT_TOKEN_URL"] ?? `${origin}/v1/oauth/token`;
 
   // Scope: "invoke:<agentId>" extracted from /rt/<agentId>/ in the endpoint path
   const agentId = endpoint.match(/\/rt\/([^/]+)\//)?.[1] ?? "";
-  const scope   = agentId ? `invoke:${agentId}` : "";
+  const scope   = process.env["AGENT_OAUTH_SCOPE"] ?? (agentId ? `invoke:${agentId}` : "");
+
+  if (
+    _cachedToken &&
+    _cachedToken.expiresAt > now + 30_000 &&
+    _cachedToken.clientId === clientId &&
+    _cachedToken.clientSecret === clientSecret &&
+    _cachedToken.tokenUrl === tokenUrl &&
+    _cachedToken.scope === scope
+  ) {
+    return { Authorization: `Bearer ${_cachedToken.value}` };
+  }
 
   const res = await fetch(tokenUrl, {
     method: "POST",
@@ -135,8 +151,43 @@ async function authHeaders(endpoint: string): Promise<Record<string, string>> {
   _cachedToken = {
     value:     data.access_token,
     expiresAt: now + ((data.expires_in ?? 3600) * 1000),
+    clientId,
+    clientSecret,
+    tokenUrl,
+    scope,
   };
   return { Authorization: `Bearer ${_cachedToken.value}` };
+}
+
+const AGENTCORE_SESSION_HEADER = "X-Amzn-Bedrock-AgentCore-Runtime-Session-Id";
+const MIN_AGENTCORE_SESSION_ID_LENGTH = 33;
+let _agentCoreSessionId: string | null = null;
+
+function isAgentCoreEndpoint(endpoint: string): boolean {
+  try {
+    return /^bedrock-agentcore\.[a-z0-9-]+\.amazonaws\.com$/i.test(
+      new URL(endpoint).hostname,
+    );
+  } catch {
+    return false;
+  }
+}
+
+function agentCoreSessionHeaders(endpoint: string): Record<string, string> {
+  if (!isAgentCoreEndpoint(endpoint)) return {};
+
+  const configuredSessionId = process.env["AGENT_SESSION_ID"];
+  if (
+    configuredSessionId !== undefined &&
+    configuredSessionId.length < MIN_AGENTCORE_SESSION_ID_LENGTH
+  ) {
+    throw new Error(
+      `AGENT_SESSION_ID must be at least ${MIN_AGENTCORE_SESSION_ID_LENGTH} characters for AWS AgentCore`,
+    );
+  }
+
+  const sessionId = configuredSessionId ?? (_agentCoreSessionId ??= randomUUID());
+  return { [AGENTCORE_SESSION_HEADER]: sessionId };
 }
 
 /** Normalise the A2A endpoint: strip trailing slash so both local and platform
@@ -154,6 +205,7 @@ export async function negotiate(
   deliverables: string,
   quality: string
 ): Promise<NegotiationEnvelope> {
+  const sessionHeaders = agentCoreSessionHeaders(endpoint);
   const payload = {
     jsonrpc: "2.0",
     id: 1,
@@ -182,7 +234,7 @@ export async function negotiate(
 
   const res = await fetch(a2aUrl(endpoint), {
     method: "POST",
-    headers: { "Content-Type": "application/json", ...await authHeaders(endpoint) },
+    headers: { "Content-Type": "application/json", ...sessionHeaders, ...await authHeaders(endpoint) },
     body: JSON.stringify(payload),
   });
 
@@ -268,6 +320,7 @@ export async function notifyFunded(
   jobId: bigint,
   options: NotifyOptions = {},
 ): Promise<string> {
+  const sessionHeaders = agentCoreSessionHeaders(endpoint);
   const context = buildNotifyContext(options);
   const authorization = await createNotifyAuthorization(signer, jobId, context);
   const data = {
@@ -291,7 +344,7 @@ export async function notifyFunded(
 
   const res = await fetch(a2aUrl(endpoint), {
     method: "POST",
-    headers: { "Content-Type": "application/json", ...await authHeaders(endpoint) },
+    headers: { "Content-Type": "application/json", ...sessionHeaders, ...await authHeaders(endpoint) },
     body: JSON.stringify(payload),
   });
 
