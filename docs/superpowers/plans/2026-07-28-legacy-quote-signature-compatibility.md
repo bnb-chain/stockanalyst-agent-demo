@@ -259,7 +259,49 @@ and add after the call:
 recover.assert_called_once_with("signed-description")
 ```
 
-- [ ] **Step 2: Run the snapshot test and verify RED**
+- [ ] **Step 2: Add the wrong-signer rejection test**
+
+Add this test to `VerifiedJobSnapshotTests`:
+
+```python
+def test_rejects_a_compatibly_recovered_signature_from_another_signer(
+    self,
+) -> None:
+    job = SimpleNamespace(
+        status=JobStatus.FUNDED,
+        provider=PROVIDER,
+        client=CLIENT,
+        expired_at=0,
+        description="legacy-signed-description",
+        budget=10,
+    )
+    client = SimpleNamespace(get_job=lambda _job_id: job)
+    spec = SimpleNamespace(price="5")
+    with (
+        patch.object(signing, "get_8183_client", return_value=client),
+        patch.object(
+            signing,
+            "get_wallet",
+            return_value=SimpleNamespace(address=PROVIDER),
+        ),
+        patch(
+            "bnbagent_studio_core.erc8183.verify.JobDescription.from_str",
+            return_value=spec,
+        ),
+        patch.object(
+            signing,
+            "recover_quote_signer_compat",
+            return_value=CLIENT,
+        ),
+    ):
+        snapshot, reason, permanent = signing.verify_signed_job_snapshot(42)
+
+    self.assertIsNone(snapshot)
+    self.assertIn("quote signature does not match", reason)
+    self.assertIs(permanent, True)
+```
+
+- [ ] **Step 3: Run the snapshot test and verify RED**
 
 Run:
 
@@ -271,7 +313,7 @@ cd stockanalyst/app/agent
 Expected: the main snapshot test fails because
 `verify_signed_job_snapshot` still calls the SDK verifier directly.
 
-- [ ] **Step 3: Wire the compatibility verifier**
+- [ ] **Step 4: Wire the compatibility verifier**
 
 In `verify_signed_job_snapshot`, keep `JobDescription` imported from the SDK but
 remove the local `recover_quote_signer` import:
@@ -292,7 +334,7 @@ with:
 signer = recover_quote_signer_compat(job.description)
 ```
 
-- [ ] **Step 4: Run focused and full validation**
+- [ ] **Step 5: Run focused and full validation**
 
 Run:
 
@@ -310,7 +352,7 @@ PATH=/Users/zhaoyu/.cache/codex-runtimes/codex-primary-runtime/dependencies/node
 Expected: all Python tests pass, Ruff reports no errors, and all 134 buyer tests
 pass.
 
-- [ ] **Step 5: Commit the integration**
+- [ ] **Step 6: Commit the integration**
 
 ```bash
 git add stockanalyst/app/agent/signing.py \
