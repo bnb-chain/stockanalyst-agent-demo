@@ -196,3 +196,20 @@ class S3StorageProvider(StorageProvider):
                 return False
             raise
         return True
+
+
+def install_s3_storage_from_env(
+    env: Mapping[str, str] = os.environ,
+    *,
+    storage_module: Any | None = None,
+    s3_client: Any | None = None,
+) -> bool:
+    bucket_present = bool(env.get("DELIVERABLE_S3_BUCKET", "").strip())
+    base_present = bool(env.get("DELIVERABLE_PUBLIC_BASE", "").strip())
+    if not bucket_present and not base_present:
+        return False
+    provider = S3StorageProvider.from_env(env, s3_client=s3_client)
+    if storage_module is None:
+        import bnbagent_studio_core.storage as storage_module
+    storage_module.storage_provider_from_config = lambda **_kwargs: provider
+    return True

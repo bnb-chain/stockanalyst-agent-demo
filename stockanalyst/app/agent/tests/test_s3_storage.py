@@ -3,10 +3,15 @@ from __future__ import annotations
 import hashlib
 import json
 import unittest
+from types import SimpleNamespace
 
 from botocore.exceptions import ClientError
 
-from s3_storage import S3StorageError, S3StorageProvider
+from s3_storage import (
+    S3StorageError,
+    S3StorageProvider,
+    install_s3_storage_from_env,
+)
 
 
 class FakeBody:
@@ -42,6 +47,39 @@ class FakeS3:
                 "HeadObject",
             )
         return {"ContentLength": len(self.objects[(Bucket, Key)])}
+
+
+class S3StorageInstallerTests(unittest.TestCase):
+    def test_absent_configuration_leaves_factory_unchanged(self) -> None:
+        original = lambda **kwargs: object()
+        storage_module = SimpleNamespace(storage_provider_from_config=original)
+
+        self.assertFalse(
+            install_s3_storage_from_env(
+                {},
+                storage_module=storage_module,
+                s3_client=FakeS3(),
+            )
+        )
+        self.assertIs(storage_module.storage_provider_from_config, original)
+
+    def test_complete_configuration_installs_one_provider(self) -> None:
+        storage_module = SimpleNamespace(storage_provider_from_config=lambda **kwargs: None)
+
+        self.assertTrue(
+            install_s3_storage_from_env(
+                {
+                    "DELIVERABLE_S3_BUCKET": "bnbagent-code-stock-analyst-agent",
+                    "DELIVERABLE_PUBLIC_BASE": "https://d111111abcdef8.cloudfront.net",
+                },
+                storage_module=storage_module,
+                s3_client=FakeS3(),
+            )
+        )
+        first = storage_module.storage_provider_from_config()
+        second = storage_module.storage_provider_from_config()
+        self.assertIs(first, second)
+        self.assertIsInstance(first, S3StorageProvider)
 
 
 class S3StorageUploadTests(unittest.IsolatedAsyncioTestCase):
