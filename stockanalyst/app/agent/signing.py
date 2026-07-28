@@ -31,7 +31,6 @@ from bnbagent_studio_core.erc8183.client import get_8183_client
 from bnbagent_studio_core.erc8183.workflows import settle_workflow
 from bnbagent_studio_core.wallet import get_wallet
 
-
 _CONTEXT_REQUIRED_CRITERION = "uomp_notify_context_required_v1"
 
 

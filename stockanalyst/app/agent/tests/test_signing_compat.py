@@ -1,15 +1,21 @@
 from __future__ import annotations
 
 import copy
+import importlib
 import json
+import sys
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 from eth_account import Account
 from eth_account.messages import encode_defunct
 from web3 import Web3
 
-import signing
+_REPOSITORY_ROOT = Path(__file__).resolve().parents[4]
+sys.path.insert(0, str(_REPOSITORY_ROOT))
+
+signing = importlib.import_module("stockanalyst.app.agent.signing")
 
 MARKER = "uomp_notify_context_required_v1"
 
