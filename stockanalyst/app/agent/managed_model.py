@@ -36,13 +36,12 @@ from __future__ import annotations
 from collections.abc import AsyncGenerator, Callable
 from typing import TYPE_CHECKING, Any
 
-from google.adk.models.lite_llm import LiteLlm
-
 from bnbagent_studio_core import config
 from bnbagent_studio_core.llm import _resolve_provider_config
 from bnbagent_studio_core.pieverse import PieverseCreditEnsurer
 from bnbagent_studio_core.pieverse.policy import BudgetPolicy, PieversePolicy
 from bnbagent_studio_core.wallet import get_wallet
+from google.adk.models.lite_llm import LiteLlm
 
 if TYPE_CHECKING:  # pragma: no cover
     from google.adk.models.llm_request import LlmRequest

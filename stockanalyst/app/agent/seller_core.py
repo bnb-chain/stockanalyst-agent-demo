@@ -40,10 +40,27 @@ import asyncio
 import json
 import logging
 import os
+from dataclasses import replace
 from typing import Any
 
+from bnbagent_studio_core.erc8183.errors import (
+    SdkCallFailedError,
+    SubmitPermanentlyUnsupportedError,
+)
+
 import signing
-from bnbagent_studio_core.erc8183.errors import SubmitPermanentlyUnsupportedError
+from notify_security import (
+    JobContext,
+    NotifySecurityError,
+    preflight_notify_authorization,
+    validate_gateway_url,
+    verify_notify_authorization,
+)
+
+try:
+    from .prompt_builder import _build_stock_analysis_prompt
+except ImportError:
+    from prompt_builder import _build_stock_analysis_prompt
 
 logger = logging.getLogger("seller-agent.core")
 
@@ -68,6 +85,51 @@ def _env_seconds(name: str, default: int) -> float:
 _JOB_DELIVERY_TIMEOUT_SECONDS = _env_seconds("NOTIFY_DELIVERY_TIMEOUT_SECONDS", 1800)
 _SWEEP_TIMEOUT_SECONDS = _env_seconds("NOTIFY_SWEEP_TIMEOUT_SECONDS", 60)
 _PREVERIFY_TIMEOUT_SECONDS = _env_seconds("NOTIFY_PREVERIFY_TIMEOUT_SECONDS", 30)
+_MAX_NOTIFY_VALIDATION_WORKERS = 4
+# The funded-job snapshot read hits the chain BEFORE any signature check, so an
+# unauthenticated flood of structurally-valid notifications could otherwise open
+# an unbounded burst of RPC reads / thread-pool jobs. Bound their concurrency.
+_MAX_CHAIN_READ_WORKERS = 4
+# Ceiling on distinct jobs whose off-chain context/spec/grace state is retained
+# for retry. Un-delivered (funded-but-abandoned) jobs would otherwise accrete for
+# the whole VM lifetime; past the cap the oldest idle (non-inflight) entries are
+# evicted — a later notify/sweep re-supplies them idempotently.
+_MAX_TRACKED_JOBS = 1024
+_MAX_JOB_ID = 2**256 - 1
+_CONTEXT_REQUIRED_CRITERION = "uomp_notify_context_required_v1"
+_SWEEP_CONTEXT_GRACE_SECONDS = 60.0
+_JOB_SPEC_UNSET = object()
+
+
+def _requires_notify_context(spec: object) -> bool:
+    terms = getattr(spec, "terms", None)
+    return (
+        isinstance(terms, dict)
+        and terms.get("success_criteria") == _CONTEXT_REQUIRED_CRITERION
+    )
+
+
+def _verify_and_validate_notify_context(
+    authorization: object,
+    *,
+    job_id: int,
+    expected_client: str,
+    chain_id: int,
+    verifying_contract: str,
+) -> JobContext:
+    context = verify_notify_authorization(
+        authorization,
+        job_id=job_id,
+        expected_client=expected_client,
+        chain_id=chain_id,
+        verifying_contract=verifying_contract,
+    )
+    if context.gateway_url is not None:
+        context = replace(
+            context,
+            gateway_url=validate_gateway_url(context.gateway_url),
+        )
+    return context
 
 
 class SellerCore:
@@ -89,16 +151,41 @@ class SellerCore:
         self._network = network or "bsc-testnet"
         # Background delivery bookkeeping (see notify_funded / is_busy):
         #  _tasks       — live background asyncio tasks (busy-status source).
-        #  _inflight    — job ids in flight OR already terminally handled this
-        #                 process (notify/sweep dedup; retained on success so a
-        #                 slower sweep never re-delivers a just-submitted job).
+        #  _inflight    — job ids with active background work.
+        #  _handled     — terminal jobs retained for process-lifetime dedup so a
+        #                 stale notify/sweep cannot reinstall context or redeliver.
         self._tasks: set[asyncio.Task] = set()
         self._inflight: set[int] = set()
-        # Per-job UOMP gateway params extracted from the buyer's notify_funded data.
-        # Keyed by job_id; consumed (popped) in _do_work_and_submit.
-        self._job_gateways: dict[int, tuple[str, str]] = {}
-        # Per-job UOMP portfolio context (holdings + risk profile) from the buyer.
-        self._job_portfolios: dict[int, dict] = {}
+        # Records the mode of the worker that owns each inflight slot. A named
+        # verified delivery deduped behind an unverified sweep is remembered
+        # explicitly so every transient sweep exit can transfer ownership.
+        self._inflight_verified: dict[int, bool] = {}
+        self._pending_verified_handoffs: set[int] = set()
+        # A timed-out submit may still land before its uncancellable thread exits.
+        # This temporary marker carries that success into the await-free terminal
+        # cleanup section, where _handled replaces it atomically.
+        self._late_submit_successes: set[int] = set()
+        # Terminal jobs are distinct from live work. This marker is checked in
+        # the same no-await section as context compare-and-set, so a stale
+        # verification can never reinstall context after terminal cleanup.
+        self._handled: set[int] = set()
+        # Context-free sweep work records when it has irreversibly consumed the
+        # absence of notification context. It exists only while delivery is
+        # active and is cleared during either terminal or transient cleanup.
+        self._contextless_started: set[int] = set()
+        self._sweep_active = False
+        # Immutable, authorization-bound off-chain context. This is installed
+        # only after all on-chain and wallet checks succeed.
+        self._job_contexts: dict[int, JobContext] = {}
+        # Immutable, provider-signed on-chain spec captured by the same verified
+        # chain read as the job client used for notification authorization.
+        self._job_specs: dict[int, object] = {}
+        self._context_deadlines: dict[int, float] = {}
+        self._context_events: dict[int, asyncio.Event] = {}
+        self._notify_validation_slots = asyncio.Semaphore(
+            _MAX_NOTIFY_VALIDATION_WORKERS
+        )
+        self._chain_read_slots = asyncio.Semaphore(_MAX_CHAIN_READ_WORKERS)
 
     def is_busy(self) -> bool:
         """True while any background delivery is in flight.
@@ -107,6 +194,104 @@ class SellerCore:
         busy) so the scale-to-zero runtime is not reaped on idle while work runs.
         """
         return bool(self._tasks)
+
+    @staticmethod
+    async def _run_bounded_thread(
+        semaphore: asyncio.Semaphore,
+        func: Any,
+        /,
+        *args: Any,
+        **kwargs: Any,
+    ) -> Any:
+        """Run ``func`` on a worker thread while holding one ``semaphore`` slot.
+
+        The slot bounds concurrency of a blocking, uncancellable operation
+        (DNS + ecrecover, or a chain read). ``to_thread`` cancellation only
+        detaches the awaiter — the thread runs on — so if THIS caller is
+        cancelled (e.g. an outer ``wait_for`` deadline) the slot is not freed
+        eagerly; a completion callback releases it once the thread truly exits.
+        Otherwise a cancelled-but-still-running worker would leak its slot and a
+        hostile slow input could starve the pool.
+        """
+        await semaphore.acquire()
+        release_in_finally = True
+        worker: asyncio.Task[Any] | None = None
+        try:
+            worker = asyncio.create_task(asyncio.to_thread(func, *args, **kwargs))
+            try:
+                # ``wait`` observes the task without cancelling it with this
+                # caller and, unlike Python 3.14 ``shield``, does not log a
+                # late worker exception before our completion callback can
+                # retrieve it.
+                await asyncio.wait({worker})
+                return worker.result()
+            except asyncio.CancelledError:
+                release_in_finally = False
+
+                def release_when_finished(done: asyncio.Task[Any]) -> None:
+                    semaphore.release()
+                    try:
+                        done.exception()
+                    except asyncio.CancelledError:
+                        pass
+
+                worker.add_done_callback(release_when_finished)
+                raise
+        finally:
+            if release_in_finally:
+                semaphore.release()
+
+    async def _run_notify_validation(
+        self,
+        authorization: object,
+        *,
+        job_id: int,
+        expected_client: str,
+        chain_id: int,
+        verifying_contract: str,
+    ) -> JobContext:
+        return await self._run_bounded_thread(
+            self._notify_validation_slots,
+            _verify_and_validate_notify_context,
+            authorization,
+            job_id=job_id,
+            expected_client=expected_client,
+            chain_id=chain_id,
+            verifying_contract=verifying_contract,
+        )
+
+    def _prune_tracked_state(self, *, protect: int | None = None) -> None:
+        """Bound retained per-job off-chain state to ``_MAX_TRACKED_JOBS``.
+
+        Terminal jobs already release their state; jobs that were funded but never
+        reached a terminal outcome (buyer never notified / perpetual transient
+        retry) leave context/spec/grace entries behind. Over the VM lifetime those
+        would grow without bound. When the tracked set exceeds the cap, evict the
+        stalest entries that carry NO live work (not in-flight, not awaiting a
+        verified hand-off). Eviction is safe: a later notify or sweep re-derives
+        the same authorization-bound state idempotently.
+        """
+        tracked = (
+            self._job_contexts.keys()
+            | self._job_specs.keys()
+            | self._context_deadlines.keys()
+            | self._context_events.keys()
+        )
+        overflow = len(tracked) - _MAX_TRACKED_JOBS
+        if overflow <= 0:
+            return
+        protected = self._inflight | self._pending_verified_handoffs
+        if protect is not None:
+            protected = protected | {protect}
+        evictable = sorted(
+            (job for job in tracked if job not in protected),
+            key=lambda job: self._context_deadlines.get(job, float("inf")),
+        )
+        for job in evictable[:overflow]:
+            self._job_contexts.pop(job, None)
+            self._job_specs.pop(job, None)
+            self._context_deadlines.pop(job, None)
+            self._context_events.pop(job, None)
 
     # -- skills ----------------------------------------------------------------
     async def negotiate(self, data: dict[str, Any]) -> dict[str, Any]:
@@ -144,47 +329,117 @@ class SellerCore:
         """
         raw = data.get("job_id")
         if raw is None or str(raw) == "":
-            self._spawn(self._sweep())  # bare notify → just scan stragglers
+            self._spawn_sweep()  # bare notify → just scan stragglers
             return {"status": "accepted", "note": "no job_id — scanning funded jobs in the background; poll the chain for results"}
         try:
             job_id = _parse_job_id(raw)
         except (TypeError, ValueError):
             return {"status": "rejected", "error": f"invalid job_id: {raw!r}"}
 
-        # UOMP delivery: buyer passes its relay URL + token so the seller can
-        # upload the report directly to the buyer's local gateway.
-        gw_url = data.get("delivery_gateway_url")
-        gw_tok = data.get("delivery_gateway_token")
-        if gw_url and gw_tok:
-            self._job_gateways[job_id] = (str(gw_url), str(gw_tok))
-            logger.info("job %s: UOMP gateway delivery → %s", job_id, gw_url)
-
-        # UOMP portfolio context: buyer passes holdings + risk profile for personalised analysis.
-        portfolio = data.get("portfolio")
-        risk_profile = data.get("risk_profile")
-        if portfolio or risk_profile:
-            self._job_portfolios[job_id] = {
-                "portfolio": portfolio or [],
-                "risk_profile": risk_profile or {},
+        legacy_context_keys = {
+            "delivery_gateway_url",
+            "delivery_gateway_token",
+            "portfolio",
+            "risk_profile",
+        }
+        if legacy_context_keys.intersection(data):
+            reason = (
+                "invalid_authorization" if "authorization" in data else "authorization_required"
+            )
+            return {"status": "rejected", "job_id": job_id, "reason": reason}
+        authorization = data.get("authorization")
+        if not isinstance(authorization, dict):
+            return {
+                "status": "rejected",
+                "job_id": job_id,
+                "reason": "authorization_required",
             }
-            logger.info("job %s: portfolio context received (%d holdings)", job_id, len(portfolio or []))
-
-        verified = False
         try:
-            # Off the event loop + time-bounded: a blocking RPC must not stall the
-            # ack path. On timeout we fall through to accept-and-re-verify below.
-            ok, reason, permanent = await asyncio.wait_for(
-                asyncio.to_thread(signing.verify_signed_job, job_id),
+            preflight_notify_authorization(authorization)
+        except NotifySecurityError as error:
+            logger.warning("job %s: notification rejected — %s", job_id, error.code)
+            return {"status": "rejected", "job_id": job_id, "reason": error.code}
+
+        try:
+            snapshot, reason, permanent = await asyncio.wait_for(
+                self._run_bounded_thread(
+                    self._chain_read_slots,
+                    signing.verify_signed_job_snapshot,
+                    job_id,
+                ),
                 timeout=_PREVERIFY_TIMEOUT_SECONDS,
             )
-            if not ok and permanent:
+        except Exception:
+            logger.warning("job %s: verification unavailable", job_id)
+            return {
+                "status": "rejected",
+                "job_id": job_id,
+                "reason": "verification_unavailable",
+                "retryable": True,
+            }
+        if snapshot is None:
+            if permanent:
                 logger.warning("job %s: verify rejected permanently — %s", job_id, reason)
                 return {"status": "rejected", "job_id": job_id, "reason": reason}
-            verified = ok
-        except Exception as e:  # noqa: BLE001 — pre-verify is best-effort; bg re-verifies (incl. TimeoutError)
-            logger.warning("pre-verify of job %s failed (%s); accepting, will re-verify in background", job_id, e)
-        self._spawn_job(job_id, verified=verified)
-        self._spawn(self._sweep())  # straggler fallback alongside the named job
+            logger.warning("job %s: verification unavailable", job_id)
+            return {
+                "status": "rejected",
+                "job_id": job_id,
+                "reason": "verification_unavailable",
+                "retryable": True,
+            }
+
+        try:
+            context = await asyncio.wait_for(
+                self._run_notify_validation(
+                    authorization,
+                    job_id=job_id,
+                    expected_client=snapshot.client,
+                    chain_id=snapshot.chain_id,
+                    verifying_contract=snapshot.verifying_contract,
+                ),
+                timeout=_PREVERIFY_TIMEOUT_SECONDS,
+            )
+        except NotifySecurityError as error:
+            reason = "unsafe_gateway" if error.code == "invalid_gateway_url" else error.code
+            logger.warning("job %s: notification rejected — %s", job_id, reason)
+            return {"status": "rejected", "job_id": job_id, "reason": reason}
+        except Exception:
+            logger.warning("job %s: notification validation unavailable", job_id)
+            return {
+                "status": "rejected",
+                "job_id": job_id,
+                "reason": "verification_unavailable",
+                "retryable": True,
+            }
+
+        # Atomic with the worker's context lookup/marker update: neither path
+        # awaits between observing the marker/context and committing its state.
+        if (
+            job_id in self._handled
+            or job_id in self._late_submit_successes
+            or job_id in self._contextless_started
+        ):
+            logger.warning("job %s: notification rejected — delivery_already_started", job_id)
+            return {
+                "status": "rejected",
+                "job_id": job_id,
+                "reason": "delivery_already_started",
+            }
+        self._prune_tracked_state(protect=job_id)
+        existing_context = self._job_contexts.get(job_id)
+        if existing_context is None:
+            self._job_contexts[job_id] = context
+        elif existing_context.digest != context.digest:
+            logger.warning("job %s: notification rejected — context_conflict", job_id)
+            return {"status": "rejected", "job_id": job_id, "reason": "context_conflict"}
+        if snapshot.spec is not None:
+            self._job_specs[job_id] = snapshot.spec
+        context_event = self._context_events.get(job_id)
+        if context_event is not None:
+            context_event.set()
+        self._spawn_job(job_id, verified=True)
+        self._spawn_sweep()  # straggler fallback alongside the named job
         return {
             "status": "accepted",
             "job_id": job_id,
@@ -198,15 +453,34 @@ class SellerCore:
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
 
+    def _spawn_sweep(self) -> None:
+        """Start at most one pending-job scan at a time."""
+        if self._sweep_active:
+            return
+        self._sweep_active = True
+
+        async def run_sweep() -> None:
+            try:
+                await self._sweep()
+            finally:
+                self._sweep_active = False
+
+        self._spawn(run_sweep())
+
     def _spawn_job(self, job_id: int, *, verified: bool) -> None:
         """Background-deliver ``job_id`` once, deduped against in-flight jobs.
 
         ``_inflight`` is updated SYNCHRONOUSLY here (before scheduling) so a
         concurrent notify + sweep can never double-deliver the same job.
         """
+        if job_id in self._handled or job_id in self._late_submit_successes:
+            return
         if job_id in self._inflight:
+            if verified and self._inflight_verified.get(job_id) is False:
+                self._pending_verified_handoffs.add(job_id)
             return
         self._inflight.add(job_id)
+        self._inflight_verified[job_id] = verified
         self._spawn(self._run_job(job_id, verified=verified))
 
     async def _run_job(self, job_id: int, *, verified: bool) -> None:
@@ -216,38 +490,100 @@ class SellerCore:
         work; unverified ones (the sweep) run the full verify gate first.
         """
         terminal = False
+        self._inflight_verified.setdefault(job_id, verified)
         try:
             # Hard ceiling so a hung delivery (e.g. unresponsive RPC) cannot keep
             # is_busy() True — which would pin the microVM to its 8h max-lifetime.
             # A timeout is TRANSIENT: terminal stays False, the slot is freed, and
             # the funded job is re-delivered idempotently by a later sweep.
+            if verified:
+                spec = self._job_specs.get(job_id, _JOB_SPEC_UNSET)
+                delivery = (
+                    self._do_work_and_submit(job_id)
+                    if spec is _JOB_SPEC_UNSET
+                    else self._do_work_and_submit(job_id, spec=spec)
+                )
+            else:
+                delivery = self._fulfill_job(job_id)
             result = await asyncio.wait_for(
-                self._do_work_and_submit(job_id) if verified else self._fulfill_job(job_id),
+                delivery,
                 timeout=_JOB_DELIVERY_TIMEOUT_SECONDS,
             )
-            logger.info("notify_funded job %s → %s", job_id, result)
-            # A terminal outcome (delivered, or a permanent skip) must STAY in
-            # _inflight: keeping it lets the dedup gate in _spawn_job reject a
-            # slower concurrent sweep that still sees this job as FUNDED, so the
-            # just-submitted job is never re-delivered. Clearing on success
-            # reopened that race — the sweep re-ran the work and then failed the
-            # on-chain FUNDED gate (Job status is SUBMITTED). Only transient
-            # failures fall through to discard so a later sweep can retry them.
+            logger.info(
+                "notify_funded job %s completed (ok=%s, skip=%s)",
+                job_id,
+                bool(result.get("ok")),
+                bool(result.get("skip")),
+            )
+            # A terminal outcome (delivered, or a permanent skip) moves to the
+            # distinct handled marker. The _spawn_job gate then rejects a slower
+            # concurrent sweep that still sees this job as FUNDED, while the
+            # notify CAS gate rejects stale verified requests after context cleanup.
+            # Transient failures release only live-work markers, retaining context
+            # and grace state for a later retry.
             terminal = bool(result.get("ok") or result.get("skip"))
-        except (asyncio.TimeoutError, TimeoutError):
+        except TimeoutError:
             # Transient by design — leave terminal False so a later sweep retries.
             logger.warning(
                 "background delivery of job %s timed out after %ss; will retry",
                 job_id,
                 _JOB_DELIVERY_TIMEOUT_SECONDS,
             )
-        except Exception:  # noqa: BLE001 — a background job must never crash the loop
+        except Exception:
             logger.exception("background delivery of job %s failed", job_id)
         finally:
-            if not terminal:
+            late_submit_succeeded = job_id in self._late_submit_successes
+            if terminal or late_submit_succeeded:
+                self._handled.add(job_id)
+                self._late_submit_successes.discard(job_id)
+                self._pending_verified_handoffs.discard(job_id)
+                self._job_contexts.pop(job_id, None)
+                self._job_specs.pop(job_id, None)
+                self._context_deadlines.pop(job_id, None)
+                self._context_events.pop(job_id, None)
+                self._contextless_started.discard(job_id)
+                self._inflight_verified.pop(job_id, None)
                 self._inflight.discard(job_id)
+            else:
+                self._inflight.discard(job_id)
+                self._inflight_verified.pop(job_id, None)
+                self._contextless_started.discard(job_id)
+                handoff_verified = (
+                    not verified
+                    and not late_submit_succeeded
+                    and job_id in self._pending_verified_handoffs
+                    and job_id in self._job_contexts
+                )
+                self._pending_verified_handoffs.discard(job_id)
+                if handoff_verified:
+                    self._spawn_job(job_id, verified=True)
 
     # -- internals -------------------------------------------------------------
+    async def _await_sweep_context(self, job_id: int, *, required: bool) -> bool:
+        self._prune_tracked_state(protect=job_id)
+        if job_id in self._job_contexts:
+            return True
+
+        loop = asyncio.get_running_loop()
+        deadline = self._context_deadlines.setdefault(
+            job_id,
+            loop.time() + _SWEEP_CONTEXT_GRACE_SECONDS,
+        )
+        event = self._context_events.setdefault(job_id, asyncio.Event())
+        remaining = max(0.0, deadline - loop.time())
+        if remaining > 0 and not event.is_set():
+            try:
+                await asyncio.wait_for(event.wait(), timeout=remaining)
+            except TimeoutError:
+                pass
+
+        if job_id in self._job_contexts:
+            return True
+        if required:
+            return False
+        self._contextless_started.add(job_id)
+        return True
+
     async def _fulfill_job(self, job_id: int) -> dict[str, Any]:
         """Verify the signed deal on-chain, then deliver (the sweep's per-job worker).
 
@@ -256,12 +592,39 @@ class SellerCore:
         (not our signature, tampered terms, underfunded, expired) returns
         ``skip: True``; a transient one returns ``ok: False`` to retry.
         """
-        ok, reason, permanent = await asyncio.to_thread(signing.verify_signed_job, job_id)
-        if not ok:
-            return {"ok": False, "job_id": job_id, "skip": permanent, "reason": reason}
-        return await self._do_work_and_submit(job_id)
+        snapshot, reason, permanent = await asyncio.to_thread(
+            signing.verify_signed_job_snapshot,
+            job_id,
+        )
+        if snapshot is None:
+            return {
+                "ok": False,
+                "job_id": job_id,
+                "skip": permanent,
+                "reason": reason,
+            }
 
-    async def _do_work_and_submit(self, job_id: int) -> dict[str, Any]:
+        spec = snapshot.spec
+        self._job_specs[job_id] = spec
+        ready = await self._await_sweep_context(
+            job_id,
+            required=_requires_notify_context(spec),
+        )
+        if not ready:
+            return {
+                "ok": False,
+                "job_id": job_id,
+                "skip": False,
+                "reason": "notify_context_required",
+            }
+        return await self._do_work_and_submit(job_id, spec=spec)
+
+    async def _do_work_and_submit(
+        self,
+        job_id: int,
+        *,
+        spec: object = _JOB_SPEC_UNSET,
+    ) -> dict[str, Any]:
         """LLM work → sign + submit. Assumes ``job_id`` is already verified.
 
         DEVELOPER HOOK: the LLM block produces the deliverable text — specialise
@@ -269,28 +632,31 @@ class SellerCore:
         (defense in depth) and RAISES on a failed submit, so an ``ok: True`` result
         always carries a landed tx hash.
         """
-        # Pop gateway params (if the buyer sent them in notify_funded). These are
-        # consumed once here and not retained — each notify_funded is independent.
-        gateway = self._job_gateways.pop(job_id, None)
-        gateway_url, gateway_token = gateway if gateway else (None, None)
+        # Read without consuming: a transient work/submit failure must retry with
+        # the exact same authorization-bound values. Swept jobs have no context.
+        context = self._job_contexts.get(job_id)
+        if context is None:
+            self._contextless_started.add(job_id)
+        gateway_url = context.gateway_url if context is not None else None
+        gateway_token = context.gateway_token if context is not None else None
+        portfolio = context.portfolio_for_prompt() if context is not None else []
+        risk_profile = context.risk_profile_for_prompt() if context is not None else None
 
-        # Pop UOMP portfolio context (if the buyer sent it in notify_funded).
-        portfolio_data = self._job_portfolios.pop(job_id, {})
-
-        spec = await asyncio.to_thread(signing.job_spec, job_id)
+        if spec is _JOB_SPEC_UNSET:
+            spec = await asyncio.to_thread(signing.job_spec, job_id)
         if spec is not None:
             task = json.dumps({"task": spec.task, "terms": spec.terms}, ensure_ascii=False)
         else:
             task = f"job {job_id}"
         prompt, symbols = _build_stock_analysis_prompt(
             task,
-            portfolio=portfolio_data.get("portfolio", []),
-            risk_profile=portfolio_data.get("risk_profile", {}),
+            portfolio=portfolio,
+            risk_profile=risk_profile,
         )
         work = await self._run_work(prompt, session_id=str(job_id), symbols=symbols)
 
-        try:
-            res = await asyncio.to_thread(
+        submit_task = asyncio.create_task(
+            asyncio.to_thread(
                 signing.submit_result,
                 job_id,
                 response_content=work,
@@ -302,16 +668,72 @@ class SellerCore:
                 gateway_url=gateway_url,
                 gateway_token=gateway_token,
             )
+        )
+        try:
+            res = await self._await_submit_task(submit_task)
+        except asyncio.CancelledError:
+            if (
+                submit_task.done()
+                and not submit_task.cancelled()
+                and submit_task.exception() is None
+            ):
+                self._late_submit_successes.add(job_id)
+            raise
         except SubmitPermanentlyUnsupportedError as e:
             # Deterministic for this wallet kind: submit can NEVER succeed →
             # permanent skip (a transient error would burn one LLM call / retry).
             return {"ok": False, "job_id": job_id, "skip": True, "reason": str(e)}
+        except SdkCallFailedError as error:
+            # bnbagent's structured contract marks only genuine transient
+            # chain/internal failures with ``retryable=True``. Missing/false
+            # retryability is terminal; retrying an unclassified SDK failure
+            # would repeat costly LLM work forever.
+            if error.retryable is True:
+                raise
+            result = {
+                "ok": False,
+                "job_id": job_id,
+                "skip": True,
+                "reason": error.code or "submission_failed",
+            }
+            if error.tx_hash is not None:
+                result["tx_hash"] = error.tx_hash
+            return result
         return {
             "ok": True,
             "job_id": job_id,
             "tx_hash": res.submit_tx,
             "deliverable_url": res.deliverable_url,
         }
+
+    @staticmethod
+    async def _await_submit_task(submit_task: asyncio.Task[Any]) -> Any:
+        """Retain submit ownership until its uncancellable worker thread exits."""
+        shielded_submit = asyncio.shield(submit_task)
+        try:
+            # Observe the shield through ``wait`` so cancellation of this caller
+            # does not cancel the shield Future itself. Python 3.14 installs an
+            # eager exception logger when a directly-awaited shield is cancelled;
+            # retaining the shield lets us retrieve the late result ourselves.
+            await asyncio.wait({shielded_submit})
+            return shielded_submit.result()
+        except asyncio.CancelledError:
+            # Cancelling ``to_thread`` only cancels its asyncio waiter; the Python
+            # thread keeps uploading/submitting. Keep this coroutine (and therefore
+            # the job's inflight/contextless ownership) alive until the irreversible
+            # operation really exits. Repeated caller cancellation cannot release
+            # ownership early.
+            while not shielded_submit.done():
+                try:
+                    await asyncio.wait({shielded_submit})
+                except asyncio.CancelledError:
+                    continue
+            if shielded_submit.done():
+                try:
+                    shielded_submit.exception()
+                except asyncio.CancelledError:
+                    pass
+            raise
 
     async def _sweep(self) -> None:
         """Best-effort background fallback: deliver any FUNDED jobs for this provider.
@@ -324,14 +746,13 @@ class SellerCore:
         """
         try:
             from bnbagent.erc8183 import ERC8183JobOps
-
             from bnbagent_studio_core.wallet import get_wallet
 
             ops = ERC8183JobOps(wallet_provider=get_wallet(), network=self._network)
             # Time-bounded: a hung scan would otherwise keep is_busy() True (it runs
             # on every notify) and pin the microVM to its 8h max-lifetime.
             pending = await asyncio.wait_for(ops.get_pending_jobs(), timeout=_SWEEP_TIMEOUT_SECONDS)
-        except Exception as e:  # noqa: BLE001 — the sweep is best-effort (incl. TimeoutError)
+        except Exception as e:
             logger.warning("funded-job sweep failed: %s", e)
             return
         for job in (pending or {}).get("jobs", []):
@@ -344,227 +765,19 @@ class SellerCore:
                 continue
 
 
-def _build_stock_analysis_prompt(
-    task_json: str,
-    portfolio: list | None = None,
-    risk_profile: dict | None = None,
-) -> tuple[str, list[str]]:
-    """Build the analysis prompt and return (prompt, symbols).
-
-    Stage 1 drives tool-call data collection per symbol.
-    Stage 2 instructs the LLM to output a single raw JSON object matching the
-    StockReport schema — the JSON is parsed + validated in _run_llm and rendered
-    to Markdown by report_renderer.render_report().
-    """
-    import re as _re
-
-    try:
-        data = json.loads(task_json)
-        task_desc = data.get("task", "")
-        terms = data.get("terms", {})
-        if isinstance(terms, str):
-            try:
-                terms = json.loads(terms)
-            except Exception:
-                terms = {}
-    except Exception:
-        task_desc = task_json
-        terms = {}
-
-    symbols: list[str] = terms.get("symbols") or []
-    analysis_type = terms.get("analysis_type", "comprehensive")
-
-    if not symbols and task_desc:
-        found = _re.findall(r'\b[A-Z]{1,5}(?:\.[A-Z]{1,2})?\b', task_desc)
-        symbols = list(dict.fromkeys(found))[:10]
-
-    symbol_list = ", ".join(symbols) if symbols else "the requested stocks"
-    n_symbols = len(symbols) if symbols else 1
-
-    # ── Portfolio context ──────────────────────────────────────────────────
-    portfolio_block = ""
-    if portfolio:
-        lines = ["CLIENT PORTFOLIO (use for personalised P&L in client_position fields):"]
-        for h in portfolio:
-            sym = str(h.get("symbol", "")).upper()
-            avg_cost = h.get("avgCost")
-            shares = h.get("shares")
-            currency = h.get("currency", "USD")
-            if sym and avg_cost is not None and shares is not None:
-                lines.append(f"  {sym}: {shares} shares @ {currency} {avg_cost:.2f} avg cost")
-        if len(lines) > 1:
-            portfolio_block = "\n".join(lines)
-
-    risk_block = ""
-    if risk_profile:
-        tolerance = risk_profile.get("tolerance", "moderate")
-        horizon = risk_profile.get("horizonMonths", 12)
-        indicators = risk_profile.get("preferredIndicators", [])
-        parts = [f"CLIENT RISK PROFILE: {tolerance} tolerance, {horizon}mo horizon"]
-        if indicators:
-            parts.append(f"  Preferred indicators: {', '.join(indicators)}")
-        risk_block = "\n".join(parts)
-
-    context_section = "\n".join(filter(None, [portfolio_block, risk_block]))
-    if context_section:
-        context_section = f"\n{context_section}\n"
-
-    # ── Stage 1 checklist ──────────────────────────────────────────────────
-    symbol_checklist = "\n".join(
-        f"  {i+1}. {sym}: get_stock_quote, get_technical_signals, get_options_sentiment, "
-        f"get_insider_activity, get_news_sentiment"
-        for i, sym in enumerate(symbols)
-    ) if symbols else f"  1. {symbol_list}: all five tools"
-
-    # ── Stage 2 JSON schema (compact reference) ────────────────────────────
-    held_symbols = []
-    if portfolio:
-        held_symbols = [
-            str(h.get("symbol", "")).upper()
-            for h in portfolio
-            if h.get("symbol") and h.get("avgCost") is not None and h.get("shares") is not None
-        ]
-
-    client_position_note = (
-        f"  Populate client_position for held symbols ({', '.join(held_symbols)}); "
-        f"set to null for non-held symbols."
-        if held_symbols else
-        "  Set client_position to null for all symbols (no holdings provided)."
-    )
-
-    json_schema = f"""{{
-  "executive_summary": "(string, 3-5 sentences: macro backdrop + one-line verdict per stock + top action)",
-  "macro_snapshot": {{
-    "vix": "(string)", "vix_signal": "(string)",
-    "fed_rate": "(string)", "fed_rate_signal": "(string)",
-    "treasury_10y": "(string)", "treasury_10y_signal": "(string)",
-    "cpi_yoy": "(string or '—')", "unemployment": "(string or '—')",
-    "macro_posture": "(string, 1-2 sentences)"
-  }},
-  "analyses": [
-    {{
-      "symbol": "(string, e.g. 'AAPL')",
-      "company_name": "(string)",
-      "rating": "Buy|Hold|Sell",
-      "price_target": (number),
-      "implied_return_pct": (number, e.g. 18.5 means +18.5%),
-      "horizon_months": (integer),
-      "risk_level": "Low|Moderate|High|Very High",
-      "rating_rationale": "(string, 2-3 institutional sentences)",
-      "current_price": (number|null), "week_52_low": (number|null), "week_52_high": (number|null),
-      "market_cap": "(string|null, e.g. '2.85T')",
-      "pe_trailing": (number|null), "pe_forward": (number|null), "peg": (number|null),
-      "analyst_target": (number|null), "analyst_upside_pct": (number|null),
-      "revenue_growth_pct": (number|null), "gross_margin_pct": (number|null),
-      "beta": (number|null), "short_float_pct": (number|null),
-      "fundamentals_commentary": "(string, 2-3 sentences on valuation vs sector/history)",
-      "rsi_14": (number|null), "rsi_14_signal": "(string|null)",
-      "rsi_weekly": (number|null), "rsi_weekly_signal": "(string|null)",
-      "macd_signal": "(string|null)",
-      "bollinger_position": (number|null, 0.0=lower band 1.0=upper band),
-      "bollinger_signal": "(string|null)",
-      "ma_50": (number|null), "ma_200": (number|null),
-      "ma_cross": "(string|null: 'Golden Cross'|'Death Cross'|'None')",
-      "adx": (number|null), "adx_signal": "(string|null)",
-      "obv_trend": "(string|null)", "atr_pct": (number|null), "var_95_pct": (number|null),
-      "technicals_commentary": "(string, 2-3 sentences on overall technical picture)",
-      "upside_catalysts": ["(string, numbered prose, mechanism + timeframe)", "(string)", "(string)"],
-      "principal_risks": ["(string, numbered prose, trigger + impact)", "(string)", "(string)"],
-      "insider_activity": "(string, e.g. '3 buy transactions by CEO (90 days)')",
-      "options_pcr": (number|null), "implied_vol_pct": (number|null),
-      "news_sentiment_score": (number|null, -1.0 to +1.0),
-      "top_headline": "(string|null)",
-      "sentiment_summary": "(string, 2-3 sentences synthesising all sentiment signals)",
-      "client_position": {{
-        "shares": (number), "avg_cost": (number), "unrealised_pnl_pct": (number),
-        "stop_loss": (number), "stop_loss_basis": "(string, e.g. 'MA-200 at $175.80')",
-        "action_summary": "(string, one sentence recommendation for this position)"
-      }} or null
-    }}
-  ],
-  "portfolio_actions": [
-    {{
-      "priority": (integer, 1=highest), "action": "Trim|Add|New Buy|Hold",
-      "symbol": "(string)", "quantity": "(string, e.g. '20 shares' or 'Reduce by 15%')",
-      "price_level": "(string, e.g. 'Current ~$185' or 'On pullback to $170')",
-      "capital_impact": "(string, e.g. 'Free ~$3,600')", "rationale": "(string, one sentence)"
-    }}
-  ],
-  "stop_losses": [
-    {{
-      "symbol": "(string)", "avg_cost": (number), "stop_loss_level": (number),
-      "risk_per_share": (number), "position_size": "(string)",
-      "max_loss_at_stop": "(string, e.g. '$1,000 (10.8%)')",
-      "technical_basis": "(string, e.g. 'MA-200 at $175.80')"
-    }}
-  ],
-  "watchlist": [
-    {{
-      "ticker": "(string)", "company": "(string)",
-      "strategic_rationale": "(string, one sentence)",
-      "key_catalyst": "(string)", "entry_zone": "(string)", "risk": "(string, brief)",
-      "thesis": "(string, exactly 2 sentences)"
-    }}
-  ],
-  "risk_factors": [
-    {{
-      "factor": "(string, e.g. 'Sector Concentration')",
-      "assessment": "Low|Moderate|High",
-      "supporting_observation": "(string, specific data point)",
-      "threshold_to_act": "(string, trigger level or event)"
-    }}
-  ]
-}}"""
-
-    prompt = f"""You are a senior equity analyst at a top-tier investment bank. \
-A client has paid for a professional, actionable research report.
-
-STOCKS TO ANALYZE: {symbol_list}
-NUMBER OF STOCKS: {n_symbols} — you must produce a complete analyses entry for EACH one.
-ANALYSIS TYPE: {analysis_type}
-{context_section}
-════════════════════════════════════════════════════════
-STAGE 1 — COLLECT ALL DATA (complete every call before writing)
-════════════════════════════════════════════════════════
-Call all five tools for EACH symbol, then call get_macro_context() once:
-
-{symbol_checklist}
-  + get_macro_context()  (once only)
-
-Do not begin writing until every tool call above has returned a result.
-NEVER fabricate a number — use only values returned by the tools.
-
-════════════════════════════════════════════════════════
-STAGE 2 — OUTPUT JSON
-════════════════════════════════════════════════════════
-Your ENTIRE final response must be a single raw JSON object.
-- Do NOT output any text before or after the JSON.
-- Do NOT wrap it in markdown code fences (no ```json).
-- Do NOT add comments inside the JSON.
-
-The JSON must match this schema exactly:
-
-{json_schema}
-
-FIELD RULES:
-1. analyses array must contain EXACTLY {n_symbols} entries, one per symbol in STOCKS TO ANALYZE.
-   Symbols (in order): {symbol_list}
-2. Use null for any field where the tool returned no data — never omit a field.
-3. upside_catalysts and principal_risks must each have EXACTLY 3 items.
-4. rating must be exactly "Buy", "Hold", or "Sell" (capital first letter, no other values).
-5. risk_level must be exactly "Low", "Moderate", "High", or "Very High".
-6. All prices and numbers must come verbatim from tool call results.
-7. watchlist must have 3–5 entries of stocks NOT in the client's current portfolio.
-8. risk_factors must have exactly 5 entries covering: Sector Concentration, Rate Sensitivity,
-   Inter-Holding Correlation, Portfolio VaR (95%), Liquidity Risk.
-{client_position_note}
-"""
-    return prompt, symbols
 
 
 def _parse_job_id(raw: Any) -> int:
     """Normalise an envelope ``job_id`` (``0x..`` / decimal string / int) to int."""
+    if isinstance(raw, bool):
+        raise TypeError("job_id must be an unsigned integer")
     if isinstance(raw, int):
-        return raw
-    s = str(raw).strip()
-    return int(s, 16) if s.lower().startswith("0x") else int(s)
+        job_id = raw
+    elif isinstance(raw, str):
+        s = raw.strip()
+        job_id = int(s, 16) if s.lower().startswith("0x") else int(s)
+    else:
+        raise TypeError("job_id must be an integer or string")
+    if not 0 <= job_id <= _MAX_JOB_ID:
+        raise ValueError("job_id is outside uint256")
+    return job_id

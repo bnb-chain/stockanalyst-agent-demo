@@ -46,15 +46,22 @@ import logging
 import os
 import time
 import urllib.parse
-from typing import Any, AsyncGenerator, Callable
+from collections.abc import AsyncGenerator, Callable
+from typing import Any
 
 import httpx
 
 from x402_verify import (
-    CHAIN_ID, MIN_PRICE_WEI, PRICE_WEI, SELLER_WALLET, U_TOKEN_BSC_TESTNET,
+    CHAIN_ID,
     FREE_TIER_LIMIT,
-    build_payment_challenge, verify_payment_proof,
-    build_free_payment_challenge, verify_free_payment_proof,
+    MIN_PRICE_WEI,
+    PRICE_WEI,
+    SELLER_WALLET,
+    U_TOKEN_BSC_TESTNET,
+    build_free_payment_challenge,
+    build_payment_challenge,
+    verify_free_payment_proof,
+    verify_payment_proof,
 )
 
 logger = logging.getLogger("seller-agent.x402")

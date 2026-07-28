@@ -12,13 +12,35 @@ import { ROUTER_ABI } from "./abi/router.js";
 import { POLICY_ABI } from "./abi/policy.js";
 import { ERC20_ABI } from "./abi/erc20.js";
 
+const DEFAULT_RPC_URL = "https://data-seed-prebsc-2-s2.binance.org:8545";
+
+function httpUrl(value: string | undefined, variable: string): string {
+  if (!value) {
+    throw new Error(`${variable} is required`);
+  }
+  try {
+    const parsed = new URL(value);
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+      throw new Error("unsupported protocol");
+    }
+    return parsed.toString();
+  } catch {
+    throw new Error(`${variable} must be a valid HTTP(S) URL`);
+  }
+}
+
+export function resolveRpcUrls(
+  env: Readonly<Record<string, string | undefined>> = process.env,
+): { rpcUrl: string; logRpcUrl: string } {
+  return {
+    rpcUrl: httpUrl(env["BSC_RPC_URL"] ?? DEFAULT_RPC_URL, "BSC_RPC_URL"),
+    logRpcUrl: httpUrl(env["BSC_LOG_RPC_URL"], "BSC_LOG_RPC_URL"),
+  };
+}
+
 // ── BSC Testnet contract addresses ──────────────────────────────────────────
 export const CONTRACTS = {
   CHAIN_ID: 97,
-  // data-seed nodes block eth_getLogs (-32005), so we use a separate archive
-  // endpoint for event queries while keeping data-seed for tx submission.
-  RPC_URL:     "https://data-seed-prebsc-2-s2.binance.org:8545",
-  LOG_RPC_URL: "https://bsc-testnet.nodereal.io/v1/64a9df0874fb4a93b9d0a3849de012d3",
   COMMERCE: "0xa206c0517b6371c6638cd9e4a42cc9f02a33b0de",
   ROUTER:   "0xd7d36d66d2f1b608a0f943f722d27e3744f66f25",
   POLICY:   "0x4f4678d4439fec812ac7674bb3efb4c8f5fb78a6",
@@ -58,13 +80,14 @@ export class ERC8183Buyer {
   private uToken: Contract;
 
   constructor(walletOrKey: BaseWallet | string) {
-    this.provider = new JsonRpcProvider(CONTRACTS.RPC_URL, {
+    const { rpcUrl, logRpcUrl } = resolveRpcUrls();
+    this.provider = new JsonRpcProvider(rpcUrl, {
       chainId: CONTRACTS.CHAIN_ID,
       name: "bsc-testnet",
     });
     // data-seed nodes block eth_getLogs; use a separate archive endpoint for
     // event queries so deliverable URL lookups work.
-    this.logProvider = new JsonRpcProvider(CONTRACTS.LOG_RPC_URL, {
+    this.logProvider = new JsonRpcProvider(logRpcUrl, {
       chainId: CONTRACTS.CHAIN_ID,
       name: "bsc-testnet",
     });
@@ -180,6 +203,14 @@ export class ERC8183Buyer {
     return { status: JobStatus[statusCode] ?? "UNKNOWN", statusCode };
   }
 
+  async getDeliverableCommitment(jobId: bigint): Promise<string> {
+    const job = await this.commerce.getJob(jobId) as { deliverable?: unknown };
+    if (typeof job.deliverable !== "string" || !/^0x[0-9a-fA-F]{64}$/.test(job.deliverable)) {
+      throw new Error("On-chain job has no valid deliverable commitment");
+    }
+    return job.deliverable;
+  }
+
   /**
    * Poll until job reaches SUBMITTED (or a terminal error status).
    * Returns the final status string.
@@ -248,8 +279,12 @@ export class ERC8183Buyer {
       const hex = optParamsHex.startsWith("0x") ? optParamsHex.slice(2) : optParamsHex;
       const bytes = Buffer.from(hex, "hex");
       const json = bytes.toString("utf8");
-      const parsed = JSON.parse(json) as { deliverable_url?: string };
-      return parsed.deliverable_url ?? null;
+      const parsed: unknown = JSON.parse(json);
+      if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+        return null;
+      }
+      const deliverableUrl = (parsed as Record<string, unknown>)["deliverable_url"];
+      return typeof deliverableUrl === "string" ? deliverableUrl : null;
     } catch {
       return null;
     }

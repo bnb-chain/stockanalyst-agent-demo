@@ -40,25 +40,29 @@ import asyncio
 import json
 import logging
 import os
-import re
 import sys
-from typing import AsyncGenerator
+from collections.abc import AsyncGenerator
 
-from google.adk.agents import Agent
-from google.adk.runners import InMemoryRunner
-from google.genai import types as gtypes
-
-from managed_model import build_model
 from bnbagent_studio_core.wallet import (
     ensure_keystore_materialized,
     ensure_twak_materialized,
 )
+from google.adk.agents import Agent
+from google.adk.runners import InMemoryRunner
+from google.genai import types as gtypes
 
 from agent_card import build_agent_card
 from executor import SellerAgentExecutor
-from report_schema import StockReport
+from managed_model import build_model
+from report_pipeline import generate_validated_report
 from report_renderer import render_report
+from report_schema import StockReport
 from tools import LLM_READ_TOOLS
+
+try:
+    from .agent_instruction import SYSTEM_INSTRUCTION
+except ImportError:  # pragma: no cover — flat import when run as script
+    from agent_instruction import SYSTEM_INSTRUCTION
 
 APP_NAME = "agent"
 
@@ -94,7 +98,7 @@ def _generator_tag() -> str:
         from bnbagent_studio_core import config
 
         name = str(((config.load_studio_toml() or {}).get("project") or {}).get("name") or "")
-    except Exception:  # noqa: BLE001 — a metadata label must never break fulfill
+    except Exception:
         return APP_NAME
     return name[: -len("-agent")] if name.endswith("-agent") else (name or APP_NAME)
 
@@ -128,6 +132,8 @@ _load_runtime_secrets()
 # (which imported resolve_network at module level), then clear the LRU cache so
 # get_8183_client() rebuilds with use_paymaster=False.
 import dataclasses as _dc
+from datetime import UTC
+
 import bnbagent.config as _bnbagent_cfg
 import bnbagent.erc8183.client as _bnb_erc8183_client
 
@@ -144,9 +150,12 @@ _bnb_erc8183_client.resolve_network = _resolve_no_paymaster
 
 try:
     from bnbagent_studio_core.erc8183.client import _reset_cache as _reset_8183_cache
+
     _reset_8183_cache()
 except Exception:
-    pass
+    logging.getLogger("seller-agent").debug(
+        "8183 client cache reset skipped", exc_info=True
+    )
 
 # --- Wallet bootstrap -----------------------------------------------------------
 # Wallet material is NEVER bundled into the deploy artifact. `bag deploy`
@@ -182,31 +191,7 @@ _model = build_model()  # managed model with the auto-renew hook (fulfill only)
 agent = Agent(
     name="seller_agent",
     model=_model,
-    instruction=(
-        "You are a professional buy-side portfolio analyst. A client has paid for a premium, actionable report.\n\n"
-        "STAGE 1 — DATA COLLECTION (call ALL tools before writing anything):\n"
-        "For EACH symbol call in order:\n"
-        "  1. get_stock_quote(symbol)       — price, PE, PB, PEG, beta, analyst target\n"
-        "  2. get_technical_signals(symbol) — RSI-14, weekly RSI, MACD, Bollinger, MA50/200, ADX, OBV, ATR, VaR\n"
-        "  3. get_options_sentiment(symbol) — put/call ratio, implied volatility\n"
-        "  4. get_insider_activity(symbol)  — SEC Form 4 insider filing count\n"
-        "  5. get_news_sentiment(symbol)    — AI sentiment score + recent headlines\n"
-        "Call once: get_macro_context() — VIX, Fed rate, 10Y yield, CPI, unemployment\n\n"
-        "NEVER fabricate numbers. Use ONLY data returned by tool calls.\n\n"
-        "STAGE 2 — WRITE A SCANNABLE, ACTIONABLE REPORT:\n"
-        "Use tables for data, direct language, no padding. Every sentence must add value.\n"
-        "Sections required:\n"
-        "  1. Market Snapshot — macro table + one-line risk-on/off verdict\n"
-        "  2. Per-stock analysis — verdict banner, fundamentals table, technical signals table,\n"
-        "     bull/bear thesis, sentiment signals, portfolio P&L (if client holds), recommendation\n"
-        "  3. Portfolio Rebalancing Plan — current allocation table, specific TRIM/ADD/HOLD actions\n"
-        "     with share counts and rationale; if recommending a new BUY, name which holding to trim\n"
-        "  4. Watchlist: Related Stocks — 3-5 sector peers or thematic names worth monitoring,\n"
-        "     using your market knowledge; include entry zone and catalyst\n"
-        "  5. Risk Dashboard — concentration, rate sensitivity, correlation in a table\n"
-        "  6. Disclaimer\n\n"
-        "If a symbol returns an error, note it briefly and continue with the remaining symbols."
-    ),
+    instruction=SYSTEM_INSTRUCTION,
     # LLM_READ_TOOLS = read-only chain tools (wallet, balances, ERC-8004/8183
     # queries). Edit `tools.py` to add/remove. These are READ-ONLY — the agent
     # never signs via a tool; all signing is in signing.py (fixed code).
@@ -255,7 +240,6 @@ def _extract_json(text: str) -> str:
 
 _log = logging.getLogger("seller-agent")
 
-
 async def _call_runner(prompt: str, session_id: str) -> str:
     """Run the ADK runner once and return raw final-response text (thought-filtered)."""
     session_service = runner.session_service
@@ -294,46 +278,12 @@ async def _run_llm(
     session_id: str,
     symbols: list[str] | None = None,
 ) -> str:
-    """Run the agent, parse its JSON output, validate the schema, render Markdown.
-
-    Flow:
-      1. Call the ADK runner → raw LLM text (thinking stripped).
-      2. Extract the JSON object from the text.
-      3. Parse + validate with StockReport (Pydantic).
-      4. Check that every requested symbol has an analyses entry.
-      5. Render to institutional Markdown via report_renderer.
-      On parse/validation failure: retry once with a correction prompt,
-      then fall back to delivering the raw LLM text so the buyer always gets
-      something.
-    """
-    raw = await _call_runner(prompt, session_id)
-
-    report = _try_parse_report(raw)
-
-    if report is None:
-        # Retry: ask the model to fix its output in the same session
-        _log.info("retrying with correction prompt (session %s)", session_id)
-        correction = (
-            "Your previous response could not be parsed as valid JSON matching the StockReport schema. "
-            "Output ONLY the corrected JSON object — no text before or after it, no code fences. "
-            "Ensure the analyses array has one entry per symbol and all required fields are present."
-        )
-        raw2 = await _call_runner(correction, session_id)
-        report = _try_parse_report(raw2)
-
-    if report is None:
-        _log.error("structured output failed after retry (session %s); delivering raw text", session_id)
-        return raw  # fall back: buyer still gets the LLM text
-
-    # Validate symbol completeness (code-level, not prompt-level)
-    if symbols:
-        returned = {a.symbol.upper() for a in report.analyses}
-        missing = [s for s in symbols if s.upper() not in returned]
-        if missing:
-            _log.warning("analyses missing for symbols %s (session %s)", missing, session_id)
-            # Deliver what we have — partial is better than nothing
-
-    return render_report(report)
+    return await generate_validated_report(
+        prompt,
+        session_id=session_id,
+        symbols=symbols,
+        call_runner=_call_runner,
+    )
 
 
 async def _stream_runner(
@@ -382,7 +332,7 @@ async def _stream_runner(
                 user_id="service", session_id=session_id, new_message=user_msg
             ):
                 await queue.put(("event", event))
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             await queue.put(("exc", exc))
         finally:
             await queue.put(("done", None))
@@ -392,7 +342,7 @@ async def _stream_runner(
         while True:
             try:
                 kind, payload = await asyncio.wait_for(queue.get(), timeout=HEARTBEAT_S)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 yield "progress", {"stage": "thinking", "message": "Generating analysis..."}
                 continue
 
@@ -421,8 +371,10 @@ async def _stream_runner(
         task.cancel()
         try:
             await task
-        except (asyncio.CancelledError, Exception):
+        except asyncio.CancelledError:
             pass
+        except Exception:
+            _log.debug("progress task teardown ignored", exc_info=True)
 
     raw = "\n".join(parts).strip()
 
@@ -448,10 +400,11 @@ async def _stream_runner(
 
 def _format_free_report(symbol: str, quote: dict) -> str:
     """Format a simple markdown table from a fetch_quote result dict."""
-    import datetime
-    today = datetime.date.today().isoformat()
-    name  = quote.get("name", symbol)
-    cur   = quote.get("currency", "USD")
+    from datetime import datetime
+
+    today = datetime.now(tz=UTC).date().isoformat()
+    name = quote.get("name", symbol)
+    cur = quote.get("currency", "USD")
 
     def fp(v):   return f"{cur} {v:,.2f}" if v is not None else "N/A"
     def fpct(v): return f"{v:+.2f}%" if v is not None else "N/A"
@@ -488,8 +441,11 @@ def _format_free_report(symbol: str, quote: dict) -> str:
         "|--------|-------|",
         *[f"| {k} | {v} |" for k, v in rows],
         "",
-        "> **Full analysis** (RSI / MACD / Bollinger Bands, options sentiment, insider activity, portfolio rebalancing) "
-        "→ **Paid tier (1.0 U)** via `POST /x402/analyze`",
+        (
+            "> **Full analysis** (RSI / MACD / Bollinger Bands, options sentiment, "
+            "insider activity, portfolio rebalancing) "
+            "→ **Paid tier (1.0 U)** via `POST /x402/analyze`"
+        ),
     ]
     return "\n".join(lines)
 
@@ -507,7 +463,7 @@ async def _stream_free(symbol: str) -> AsyncGenerator[tuple[str, dict], None]:
         "message": f"Fetching market data for {symbol}...",
     }
     try:
-        loop  = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         quote = await loop.run_in_executor(None, fetch_quote, symbol)
     except Exception as exc:
         yield "error", {"message": f"Failed to fetch {symbol}: {exc}"}
@@ -523,7 +479,7 @@ def _default_network() -> str:
         from bnbagent_studio_core import config
 
         return str(((config.load_studio_toml() or {}).get("network") or {}).get("default") or "bsc-testnet")
-    except Exception:  # noqa: BLE001
+    except Exception:
         return "bsc-testnet"
 
 
@@ -609,7 +565,7 @@ async def _emit(send, start_message, body: bytes):
                 if isinstance(e, dict):
                     e.pop("input", None)
             new_body = json.dumps(payload).encode("utf-8")
-    except Exception:  # noqa: BLE001 — never let hardening break a response
+    except Exception:
         new_body = body
 
     if start_message is not None:

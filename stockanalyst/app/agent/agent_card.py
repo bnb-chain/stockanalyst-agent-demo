@@ -34,11 +34,14 @@ _NEGOTIATE = AgentSkill(
     name="Negotiate an ERC-8183 job",
     description=(
         'Send a data part {"skill": "negotiate", "task_description": "...", '
-        '"terms": {"deliverables": "...", "quality_standards": "..."}} (both '
-        "terms keys are REQUIRED) and receive a "
-        "wallet-signed price quote (price, currency, negotiation_hash, provider_sig). "
-        "Anchor the returned envelope on-chain via createJob + fund, then send the "
-        "`notify_funded` skill with the job_id to request delivery."
+        '"terms": {"deliverables": "...", "quality_standards": "...", '
+        '"success_criteria": "uomp_notify_context_required_v1"}} (all three terms '
+        "keys are REQUIRED) and receive a wallet-signed price quote. The exact "
+        "success_criteria value must be copied from the signed response into the "
+        "on-chain job description before funding. "
+        "Anchor the returned envelope on-chain via createJob + fund, then use the "
+        "buyer client's notifyFunded helper with the job-creation wallet. It sends "
+        "the job_id with an EIP-712 authorization for the exact delivery context."
     ),
     tags=["erc8183", "negotiation", "bnb-chain"],
     input_modes=["application/json"],
@@ -49,10 +52,16 @@ _NOTIFY_FUNDED = AgentSkill(
     id="notify_funded",
     name="Notify the seller a job is funded (request delivery)",
     description=(
-        "After you fund the job on-chain, send {\"skill\": \"notify_funded\", "
-        '"job_id": <int>} to tell the seller "I funded job X — please deliver". '
-        "The seller verifies the funded job carries its signed quote and replies "
-        'AT ONCE with {"status": "accepted"|"rejected", "job_id"}; delivery then '
+        "After you fund a named job on-chain, use the buyer client's "
+        "notifyFunded helper to send its decimal job_id plus an authorization "
+        "envelope. The EIP-712 authorization signs the exact context string "
+        "(delivery gateway, token, portfolio, and risk profile) and must recover "
+        "to the on-chain job client; the seller-owned chain and contract domain "
+        "values are never supplied by the request. A bare {\"skill\": "
+        '"notify_funded"} call requests only a context-free funded-job sweep and '
+        "returns status and note without job_id. A signed named call returns status, "
+        "reason, and job_id as applicable after the seller verifies the funded job "
+        "carries its signed quote; delivery then "
         "runs in the background (work takes time). Do NOT wait on this call for "
         "the result — read the deliverable back from the CHAIN once the job "
         "reaches SUBMITTED (the `submit` tx carries the deliverable_url; "
@@ -69,7 +78,7 @@ def _agent_name() -> str:
         from bnbagent_studio_core import config
 
         name = str(((config.load_studio_toml() or {}).get("project") or {}).get("name") or "")
-    except Exception:  # noqa: BLE001 — a card label must never break boot
+    except Exception:
         name = ""
     return name or "bnbagent-seller"
 

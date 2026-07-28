@@ -24,6 +24,7 @@ dependencies = [
     "requests>=2.28",
     "fredapi>=0.3.12",
     "newsapi-python>=0.2.7",
+    "eth-account>=0.13,<1",
 ]
 
 [build-system]
@@ -41,3 +42,36 @@ packages = ["."]
 # which is exactly what the AgentCore CDK packager uses.
 [tool.uv.pip]
 find-links = ["./wheels"]
+
+[tool.ruff]
+src = ["."]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+# BLE001: cold-start / stream paths intentionally catch broad Exception.
+# TRY004: this codebase uses ValueError as the domain validation error
+# (gateway/notify parsers); changing to TypeError would break callers/tests.
+ignore = ["BLE001", "TRY004"]
+
+[tool.ruff.lint.isort]
+known-first-party = [
+    "agent_card",
+    "agent_instruction",
+    "analysis",
+    "data_sources",
+    "executor",
+    "managed_model",
+    "notify_security",
+    "prompt_builder",
+    "report_pipeline",
+    "report_renderer",
+    "report_schema",
+    "seller_core",
+    "signing",
+    "tools",
+    "untrusted_text",
+    "uomp_storage",
+    "x402_handler",
+    "x402_verify",
+]

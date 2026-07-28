@@ -6,14 +6,75 @@
  * them unset for local dev (the token fetch is skipped automatically).
  */
 
+import { formatUnits, parseUnits, type Signer } from "ethers";
+import {
+  buildNotifyContext,
+  createNotifyAuthorization,
+  type NotifyOptions,
+} from "./notify-auth.js";
+
+export type { NotifyOptions } from "./notify-auth.js";
+
+/** Default per-job spend ceiling (in U) when MAX_PRICE_U is unset. */
+export const DEFAULT_MAX_PRICE_U = 100;
+
+/**
+ * Resolve the buyer's per-job spend ceiling in raw wei from `MAX_PRICE_U`.
+ * The seller signs and returns its own price; without a client-side ceiling a
+ * hostile or misconfigured seller could quote an arbitrarily large amount that
+ * the buyer would fund up to its wallet balance. Fund nothing above this cap.
+ */
+export function resolveMaxBudgetWei(
+  env: Readonly<Record<string, string | undefined>> = process.env,
+): bigint {
+  const raw = env["MAX_PRICE_U"];
+  const maxU = raw !== undefined && raw.trim() !== "" ? Number(raw) : DEFAULT_MAX_PRICE_U;
+  if (!Number.isFinite(maxU) || maxU <= 0) {
+    throw new Error("MAX_PRICE_U must be a positive number");
+  }
+  return parseUnits(String(maxU), 18);
+}
+
+/**
+ * Reject a seller quote that is non-positive or exceeds the buyer's spend cap,
+ * BEFORE any on-chain funding. Comparison is exact (raw wei), never via float.
+ */
+export function assertQuoteWithinBudget(priceWei: bigint, maxBudgetWei: bigint): void {
+  if (priceWei <= 0n) {
+    throw new Error(`Seller quoted a non-positive price (${priceWei} wei); refusing to fund`);
+  }
+  if (priceWei > maxBudgetWei) {
+    throw new Error(
+      `Seller quote ${formatUnits(priceWei, 18)} U exceeds the MAX_PRICE_U cap of ` +
+        `${formatUnits(maxBudgetWei, 18)} U; refusing to fund. ` +
+        `Raise MAX_PRICE_U to accept a higher quote.`,
+    );
+  }
+}
+
+export const NOTIFY_CONTEXT_REQUIRED = "uomp_notify_context_required_v1";
+const INVALID_NOTIFY_CONTEXT_MARKER =
+  "Invalid negotiation: required notify-context marker missing or altered";
+
 export interface NegotiationEnvelope {
   request: {
     task_description: string;
-    terms: { deliverables: string; quality_standards: string };
+    terms: {
+      deliverables: string;
+      quality_standards: string;
+      success_criteria?: string;
+    };
   };
   response: {
     accepted: boolean;
-    terms: { price: string; currency: string; deliverables?: string; quality_standards?: string; [key: string]: unknown };
+    terms: {
+      price: string;
+      currency: string;
+      deliverables?: string;
+      quality_standards?: string;
+      success_criteria?: string;
+      [key: string]: unknown;
+    };
     negotiated_at?: number;
     quote_expires_at?: number;
     estimated_completion_seconds?: number;
@@ -107,7 +168,11 @@ export async function negotiate(
             data: {
               skill: "negotiate",
               task_description: task,
-              terms: { deliverables, quality_standards: quality },
+              terms: {
+                deliverables,
+                quality_standards: quality,
+                success_criteria: NOTIFY_CONTEXT_REQUIRED,
+              },
             },
           },
         ],
@@ -135,8 +200,17 @@ export async function negotiate(
   if (!envelope.response?.accepted) {
     throw new Error(`Negotiate rejected: ${envelope.response?.reason ?? "unknown"}`);
   }
+  requireNotifyContextMarker(envelope);
 
   return envelope;
+}
+
+function requireNotifyContextMarker(envelope: NegotiationEnvelope): string {
+  const marker = envelope.response?.terms?.success_criteria;
+  if (marker !== NOTIFY_CONTEXT_REQUIRED) {
+    throw new Error(INVALID_NOTIFY_CONTEXT_MARKER);
+  }
+  return marker;
 }
 
 /** Sanitize strings for UMA claim embedding (mirrors Python _sanitize_for_claim). */
@@ -159,10 +233,12 @@ function sortKeys(v: unknown): unknown {
 export function buildJobDescription(envelope: NegotiationEnvelope): string {
   const response = envelope.response;
   const responseTerms = response.terms;
+  const successCriteria = requireNotifyContextMarker(envelope);
 
   const terms: Record<string, unknown> = {
     deliverables: sanitize(responseTerms.deliverables ?? ""),
     quality_standards: sanitize(responseTerms.quality_standards ?? ""),
+    success_criteria: sanitize(successCriteria),
   };
 
   const content: Record<string, unknown> = {
@@ -186,28 +262,19 @@ export function buildJobDescription(envelope: NegotiationEnvelope): string {
   return JSON.stringify(sortKeys(content));
 }
 
-export interface NotifyOptions {
-  gatewayUrl?:   string;
-  gatewayToken?: string;
-  /** UOMP portfolio holdings — passed to the seller for personalised P&L analysis. */
-  portfolio?:    Array<{ symbol: string; shares: number; avgCost: number; currency: string }>;
-  /** UOMP risk profile — passed to the seller to tailor the report to the client's risk tolerance. */
-  riskProfile?:  { tolerance: string; horizonMonths?: number; preferredIndicators?: string[] };
-}
-
 export async function notifyFunded(
   endpoint: string,
+  signer: Signer,
   jobId: bigint,
   options: NotifyOptions = {},
 ): Promise<string> {
-  const data: Record<string, unknown> = {
+  const context = buildNotifyContext(options);
+  const authorization = await createNotifyAuthorization(signer, jobId, context);
+  const data = {
     skill:  "notify_funded",
-    job_id: Number(jobId),
+    job_id: jobId.toString(),
+    authorization,
   };
-  if (options.gatewayUrl)   data["delivery_gateway_url"]   = options.gatewayUrl;
-  if (options.gatewayToken) data["delivery_gateway_token"] = options.gatewayToken;
-  if (options.portfolio?.length)   data["portfolio"]    = options.portfolio;
-  if (options.riskProfile)         data["risk_profile"] = options.riskProfile;
 
   const payload = {
     jsonrpc: "2.0",
@@ -229,8 +296,21 @@ export async function notifyFunded(
   });
 
   if (!res.ok) throw new Error(`notify_funded HTTP error: ${res.status} ${await res.text()}`);
-  const body = await res.json() as { result?: { parts?: Array<{ data?: { status?: string; note?: string } }> } };
+  const body = await res.json() as {
+    result?: {
+      parts?: Array<{ data?: { status?: string; reason?: string; retryable?: boolean; note?: string } }>;
+    };
+  };
   const parts = body.result?.parts ?? [];
   const ack = parts[0]?.data ?? {};
-  return ack.status ?? "unknown";
+  const status = ack.status ?? "unknown";
+  // A rejected/unknown ACK means the seller did NOT start delivery (bad/missing
+  // authorization, unsafe gateway, verification unavailable, …). Fail loudly so
+  // the caller does not fund-then-poll to a fruitless timeout.
+  if (status !== "accepted") {
+    const reason = ack.reason ? ` (${ack.reason})` : "";
+    const retryable = ack.retryable ? " [retryable]" : "";
+    throw new Error(`notify_funded not accepted: status=${status}${reason}${retryable}`);
+  }
+  return status;
 }

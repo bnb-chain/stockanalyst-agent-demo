@@ -6,8 +6,11 @@
  * Falls back to saving an HTML file if Chrome is unavailable.
  */
 
-import { writeFileSync } from "fs";
+import { rmSync, writeFileSync } from "fs";
 import { resolve } from "path";
+import { renderPdf, type PuppeteerLike } from "./pdf-renderer.js";
+
+const MAX_UINT256_DECIMAL = "115792089237316195423570985008687907853269984665640564039457584007913129639935";
 
 // ── Logo SVG (inline, no external deps) ──────────────────────────────────────
 const LOGO_SVG = `<svg width="54" height="54" viewBox="0 0 54 54" xmlns="http://www.w3.org/2000/svg">
@@ -20,8 +23,24 @@ const LOGO_SVG = `<svg width="54" height="54" viewBox="0 0 54 54" xmlns="http://
   <circle cx="13" cy="38" r="2.2" fill="#aab8d4"/>
 </svg>`;
 
+export interface ReportMeta {
+  jobId: string;
+  date: string;
+  symbols: string;
+}
+
+function escapeHtml(value: string): string {
+  return value.replace(/[&<>"']/g, (char) => ({
+    "&": "&amp;",
+    "<": "&lt;",
+    ">": "&gt;",
+    '"': "&quot;",
+    "'": "&#39;",
+  })[char] ?? char);
+}
+
 // ── HTML template ─────────────────────────────────────────────────────────────
-function buildHtml(markdownHtml: string, meta: { jobId: string; date: string; symbols: string }): string {
+function buildHtml(markdownHtml: string, meta: ReportMeta): string {
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -84,7 +103,7 @@ em{color:#5a6f8a}
 /* Code (used for tickers) */
 code{background:#e8ecf4;border-radius:3px;padding:1px 5px;font-family:monospace;font-size:9pt;color:var(--navy)}
 
-/* BUY / HOLD / SELL inline badges — applied by JS post-processing */
+/* BUY / HOLD / SELL inline badges — applied by trusted Markdown conversion */
 .badge{display:inline-block;padding:2px 9px;border-radius:3px;font-family:Arial,sans-serif;font-weight:700;font-size:9pt;color:#fff;letter-spacing:.5px}
 .badge-buy{background:var(--green)}
 .badge-hold{background:var(--amber)}
@@ -143,22 +162,6 @@ ${markdownHtml}
   <span class="right">This report is for informational purposes only and does not constitute investment advice.</span>
 </div>
 
-<script>
-// Post-process: badge-ify BUY / HOLD / SELL text in the rendered HTML
-(function(){
-  const body = document.getElementById('report-body');
-  if (!body) return;
-  body.innerHTML = body.innerHTML
-    .replace(/\b(BUY)\b/g, '<span class="badge badge-buy">BUY</span>')
-    .replace(/\b(HOLD)\b/g, '<span class="badge badge-hold">HOLD</span>')
-    .replace(/\b(SELL)\b/g, '<span class="badge badge-sell">SELL</span>');
-
-  // Colourise P&L numbers: e.g. +12.5% green, -3.2% red
-  body.innerHTML = body.innerHTML
-    .replace(/(\+\d+(?:\.\d+)?%)/g, '<span class="pos">$1</span>')
-    .replace(/(?<![="])(−|\-)\d+(?:\.\d+)?%/g, m => '<span class="neg">' + m + '</span>');
-})();
-</script>
 </body>
 </html>`;
 }
@@ -169,89 +172,152 @@ function inlineToHtml(s: string): string {
     .replace(/\*\*\*(.+?)\*\*\*/g, "<strong><em>$1</em></strong>")
     .replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>")
     .replace(/\*(.+?)\*/g, "<em>$1</em>")
-    .replace(/`([^`]+)`/g, "<code>$1</code>");
+    .replace(/`([^`]+)`/g, "<code>$1</code>")
+    .replace(/\b(BUY)\b/g, '<span class="badge badge-buy">BUY</span>')
+    .replace(/\b(HOLD)\b/g, '<span class="badge badge-hold">HOLD</span>')
+    .replace(/\b(SELL)\b/g, '<span class="badge badge-sell">SELL</span>')
+    .replace(/(\+\d+(?:\.\d+)?%)/g, '<span class="pos">$1</span>')
+    .replace(/(−|-)\d+(?:\.\d+)?%/g, (value) => `<span class="neg">${value}</span>`);
 }
 
 // ── Markdown → HTML ───────────────────────────────────────────────────────────
 function mdToHtml(md: string): string {
-  // Block-level element tag names — paragraph catch-all skips these
-  const BLOCK = /^<(h[1-6]|table|thead|tbody|tr|ul|ol|li|blockquote|hr|div|p)\b/;
-
-  return md
-    // Fenced code blocks (strip — reports shouldn't have code)
+  const lines = escapeHtml(md)
+    // Reports should not contain code blocks. This non-nested scan is linear.
     .replace(/```[\s\S]*?```/g, "")
-    // HR
-    .replace(/^---+$/gm, "<hr>")
-    // H1-H4 (run before blockquotes so "## heading" inside prose isn't swallowed)
-    .replace(/^#### (.+)$/gm, (_, t) => `<h4>${inlineToHtml(t)}</h4>`)
-    .replace(/^### (.+)$/gm,  (_, t) => `<h3>${inlineToHtml(t)}</h3>`)
-    .replace(/^## (.+)$/gm,   (_, t) => `<h2>${inlineToHtml(t)}</h2>`)
-    .replace(/^# (.+)$/gm,    (_, t) => `<h1>${inlineToHtml(t)}</h1>`)
-    // Blockquotes — process inline markup inside them
-    .replace(/^> (.+)$/gm, (_, content) => {
-      // Strip any stray heading markers left inside a blockquote
-      const clean = content.replace(/^#{1,4}\s+/, "");
-      return `<blockquote><p>${inlineToHtml(clean)}</p></blockquote>`;
-    })
-    // Inline markup for remaining prose (not already inside block tags)
-    .replace(/\*\*\*(.+?)\*\*\*/g, "<strong><em>$1</em></strong>")
-    .replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>")
-    .replace(/\*(.+?)\*/g, "<em>$1</em>")
-    .replace(/`([^`]+)`/g, "<code>$1</code>")
-    // Unordered lists
-    .replace(/^(\s*[-*] .+(\n\s*[-*] .+)*)/gm, (block) => {
-      const items = block
-        .trim()
-        .split(/\n\s*[-*] /)
-        .filter(Boolean)
-        .map((s) => `<li>${inlineToHtml(s.replace(/^[-*] /, "").trim())}</li>`)
-        .join("");
-      return `<ul>${items}</ul>`;
-    })
-    // Ordered lists
-    .replace(/^(\s*\d+\. .+(\n\s*\d+\. .+)*)/gm, (block) => {
-      const items = block
-        .trim()
-        .split(/\n\s*\d+\. /)
-        .filter(Boolean)
-        .map((s) => `<li>${inlineToHtml(s.replace(/^\d+\. /, "").trim())}</li>`)
-        .join("");
-      return `<ol>${items}</ol>`;
-    })
-    // Tables — apply inline markup inside cells
-    .replace(/^\|(.+)\|$/gm, (_, row) => {
-      const cells = row.split("|").map((c: string) => c.trim());
-      return `<tr-row>${cells.map((c: string) => `<cell>${inlineToHtml(c)}</cell>`).join("")}</tr-row>`;
-    })
-    // Table assembler
-    .replace(/(<tr-row>.*?<\/tr-row>\n?)+/gs, (block) => {
-      const rows = [...block.matchAll(/<tr-row>(.*?)<\/tr-row>/gs)];
-      if (rows.length === 0) return block;
+    .split("\n");
+  const html: string[] = [];
+
+  for (let index = 0; index < lines.length;) {
+    const line = lines[index]!;
+    if (!line.trim()) {
+      index += 1;
+      continue;
+    }
+
+    if (/^---+$/.test(line)) {
+      html.push("<hr>");
+      index += 1;
+      continue;
+    }
+
+    const heading = /^(#{1,4}) (.+)$/.exec(line);
+    if (heading) {
+      html.push(`<h${heading[1]!.length}>${inlineToHtml(heading[2]!)}</h${heading[1]!.length}>`);
+      index += 1;
+      continue;
+    }
+
+    const quote = /^&gt; (.+)$/.exec(line);
+    if (quote) {
+      const content = quote[1]!.replace(/^#{1,4}\s+/, "");
+      html.push(`<blockquote><p>${inlineToHtml(content)}</p></blockquote>`);
+      index += 1;
+      continue;
+    }
+
+    const unordered = /^[ \t]*[-*] (.+)$/.exec(line);
+    if (unordered) {
+      const items: string[] = [];
+      while (index < lines.length) {
+        const item = /^[ \t]*[-*] (.+)$/.exec(lines[index]!);
+        if (!item) break;
+        items.push(`<li>${inlineToHtml(item[1]!.trim())}</li>`);
+        index += 1;
+      }
+      html.push(`<ul>${items.join("")}</ul>`);
+      continue;
+    }
+
+    const ordered = /^[ \t]*\d+\. (.+)$/.exec(line);
+    if (ordered) {
+      const items: string[] = [];
+      while (index < lines.length) {
+        const item = /^[ \t]*\d+\. (.+)$/.exec(lines[index]!);
+        if (!item) break;
+        items.push(`<li>${inlineToHtml(item[1]!.trim())}</li>`);
+        index += 1;
+      }
+      html.push(`<ol>${items.join("")}</ol>`);
+      continue;
+    }
+
+    const tableRow = /^\|(.+)\|$/.exec(line);
+    if (tableRow) {
+      const rows: string[][] = [];
+      while (index < lines.length) {
+        const row = /^\|(.+)\|$/.exec(lines[index]!);
+        if (!row) break;
+        rows.push(row[1]!.split("|").map((cell) => inlineToHtml(cell.trim())));
+        index += 1;
+      }
       let table = "<table>";
-      rows.forEach((m, i) => {
-        const cells = [...(m[1] ?? "").matchAll(/<cell>(.*?)<\/cell>/gs)].map((c) => c[1]);
-        if (i === 0) {
-          table += "<thead><tr>" + cells.map((c) => `<th>${c}</th>`).join("") + "</tr></thead><tbody>";
-        } else if (i === 1 && cells.every((c) => /^[-|: ]+$/.test(c ?? ""))) {
-          // separator row — skip
-        } else {
-          table += "<tr>" + cells.map((c) => `<td>${c}</td>`).join("") + "</tr>";
+      rows.forEach((cells, rowIndex) => {
+        if (rowIndex === 0) {
+          table += `<thead><tr>${cells.map((cell) => `<th>${cell}</th>`).join("")}</tr></thead><tbody>`;
+        } else if (rowIndex !== 1 || !cells.every((cell) => /^[-|: ]+$/.test(cell))) {
+          table += `<tr>${cells.map((cell) => `<td>${cell}</td>`).join("")}</tr>`;
         }
       });
-      table += "</tbody></table>";
-      return table;
-    })
-    // Paragraphs — wrap any non-empty line that is not already a block element.
-    // Inline elements (<strong>, <em>, <code>) ARE wrapped; block elements are NOT.
-    .replace(/^.+$/gm, (line) => {
-      if (!line.trim()) return "";
-      if (BLOCK.test(line)) return line;
-      // Already wrapped by a previous rule (e.g. heading lines that were converted inline)
-      if (/^<(tr-row|cell)/.test(line)) return line;
-      return `<p>${line}</p>`;
-    })
-    // Cleanup
-    .replace(/<p>\s*<\/p>/g, "");
+      html.push(`${table}</tbody></table>`);
+      continue;
+    }
+
+    html.push(`<p>${inlineToHtml(line)}</p>`);
+    index += 1;
+  }
+
+  return html.join("\n");
+}
+
+export function renderReportHtml(reportText: string, meta: ReportMeta): string {
+  return buildHtml(mdToHtml(reportText), {
+    jobId: escapeHtml(meta.jobId),
+    date: escapeHtml(meta.date),
+    symbols: escapeHtml(meta.symbols),
+  });
+}
+
+export type PdfRenderer = (html: string, pdfPath: string) => Promise<void>;
+
+function assertCanonicalUint256(jobId: string): void {
+  if (
+    typeof jobId !== "string"
+    || !/^(0|[1-9]\d{0,77})$/.test(jobId)
+    || (jobId.length === MAX_UINT256_DECIMAL.length && jobId > MAX_UINT256_DECIMAL)
+  ) {
+    throw new TypeError("jobId must be a canonical decimal uint256");
+  }
+}
+
+export async function saveReportWithRenderer(
+  reportText: string,
+  jobId: string,
+  symbols: string[],
+  renderer: PdfRenderer,
+): Promise<{ pdfPath: string | null; htmlPath: string }> {
+  assertCanonicalUint256(jobId);
+  const date = new Date().toLocaleDateString("en-GB", {
+    year: "numeric", month: "long", day: "numeric",
+  });
+  const html = renderReportHtml(reportText, { jobId, date, symbols: symbols.join(", ") });
+
+  const base = `stock-analysis-${jobId}`;
+  const htmlPath = resolve(process.cwd(), `${base}.html`);
+  const candidatePdfPath = resolve(process.cwd(), `${base}.pdf`);
+  writeFileSync(htmlPath, html, "utf8");
+
+  try {
+    await renderer(html, candidatePdfPath);
+    return { pdfPath: candidatePdfPath, htmlPath };
+  } catch {
+    try {
+      rmSync(candidatePdfPath, { force: true });
+    } catch {
+      // Preserve the inert HTML fallback if cleanup fails.
+    }
+    return { pdfPath: null, htmlPath };
+  }
 }
 
 // ── Main export ───────────────────────────────────────────────────────────────
@@ -260,54 +326,8 @@ export async function saveReport(
   jobId: string,
   symbols: string[],
 ): Promise<{ pdfPath: string | null; htmlPath: string }> {
-  const date = new Date().toLocaleDateString("en-GB", {
-    year: "numeric", month: "long", day: "numeric",
-  });
-  const meta = { jobId, date, symbols: symbols.join(", ") };
-  const markdownHtml = mdToHtml(reportText);
-  const html = buildHtml(markdownHtml, meta);
-
-  const base = `stock-analysis-${jobId}`;
-  const htmlPath = resolve(process.cwd(), `${base}.html`);
-  writeFileSync(htmlPath, html, "utf8");
-
-  // Try puppeteer PDF generation
-  let pdfPath: string | null = null;
-  try {
-    // Dynamic import so a missing puppeteer doesn't crash the whole process
+  return saveReportWithRenderer(reportText, jobId, symbols, async (html, pdfPath) => {
     const puppeteer = await import("puppeteer" as string);
-    // Prefer system Chrome on macOS if puppeteer's bundled Chrome failed to extract
-    const systemChrome = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
-    const { existsSync } = await import("fs");
-    const launchOpts: Record<string, unknown> = {
-      headless: true,
-      args: ["--no-sandbox", "--disable-setuid-sandbox"],
-    };
-    if (existsSync(systemChrome)) launchOpts["executablePath"] = systemChrome;
-    const browser = await (puppeteer as unknown as {
-      launch: (opts: object) => Promise<{
-        newPage: () => Promise<{
-          setContent: (html: string, opts: object) => Promise<void>;
-          pdf: (opts: object) => Promise<Buffer>;
-          close: () => Promise<void>;
-        }>;
-        close: () => Promise<void>;
-      }>;
-    }).launch(launchOpts);
-
-    const page = await browser.newPage();
-    await page.setContent(html, { waitUntil: "networkidle0" });
-    pdfPath = resolve(process.cwd(), `${base}.pdf`);
-    await page.pdf({
-      path: pdfPath,
-      format: "A4",
-      printBackground: true,
-      margin: { top: "0", right: "0", bottom: "0", left: "0" },
-    });
-    await browser.close();
-  } catch {
-    // puppeteer not installed or Chrome unavailable — HTML is the fallback
-  }
-
-  return { pdfPath, htmlPath };
+    await renderPdf(puppeteer as unknown as PuppeteerLike, html, pdfPath);
+  });
 }

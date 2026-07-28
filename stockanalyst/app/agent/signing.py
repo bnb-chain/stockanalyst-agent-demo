@@ -20,8 +20,11 @@ domain needs it, but keep these ops OUT of the LLM tool list.
 """
 from __future__ import annotations
 
-from bnbagent.erc8183 import NegotiationHandler
+import time
+from dataclasses import dataclass
+from typing import Any
 
+from bnbagent.erc8183 import NegotiationHandler
 from bnbagent_studio_core import config
 from bnbagent_studio_core.erc8183 import submit_workflow
 from bnbagent_studio_core.erc8183.client import get_8183_client
@@ -145,18 +148,103 @@ def sign_quote(request: dict, clamped_price_wei: int) -> dict:
     return result.to_dict()
 
 
+@dataclass(frozen=True)
+class VerifiedJobSnapshot:
+    """One verified chain read shared by authorization and delivery setup."""
+
+    client: str
+    chain_id: int
+    verifying_contract: str
+    spec: Any
+
+
+def verify_signed_job_snapshot(
+    job_id: int,
+) -> tuple[VerifiedJobSnapshot | None, str, bool]:
+    """Verify one fetched job and return its immutable authorization/work fields."""
+    from bnbagent.erc8183.types import JobStatus
+    from bnbagent_studio_core.erc8183.verify import (
+        JobDescription,
+        recover_quote_signer,
+    )
+
+    client = get_8183_client()
+    try:
+        job = client.get_job(job_id)
+    except Exception as exc:
+        return None, f"chain read failed: {exc}", False
+
+    if job.status != JobStatus.FUNDED:
+        return None, f"job status {job.status.name}, expected FUNDED", False
+
+    expected_signer = str(get_wallet().address)
+    if str(job.provider).lower() != expected_signer.lower():
+        return None, "job is not assigned to this provider", True
+
+    if job.expired_at and job.expired_at <= int(time.time()):
+        return None, "job has expired", True
+
+    spec = JobDescription.from_str(job.description)
+    if spec is None:
+        return None, "no signed quote anchored in job description", True
+
+    signer = recover_quote_signer(job.description)
+    if signer is None or signer.lower() != expected_signer.lower():
+        return (
+            None,
+            "quote signature does not match this provider (or terms were tampered)",
+            True,
+        )
+
+    try:
+        if int(job.budget) < int(spec.price):
+            return (
+                None,
+                f"funded budget {job.budget} is below the agreed price {spec.price}",
+                True,
+            )
+    except (TypeError, ValueError):
+        return None, f"unparseable agreed price {spec.price!r}", True
+
+    return (
+        VerifiedJobSnapshot(
+            client=str(job.client),
+            chain_id=int(client.network.chain_id),
+            verifying_contract=str(client.commerce.address),
+            spec=spec,
+        ),
+        "",
+        False,
+    )
+
+
 def verify_signed_job(job_id: int) -> tuple[bool, str, bool]:
     """Verify funded ``job_id`` carries the quote THIS agent signed.
 
-    Thin wrapper over :func:`bnbagent_studio_core.erc8183.verify.verify_signed_job` with
-    ``expected_signer`` = our own wallet address. Returns ``(ok, reason,
-    permanent)``: ``ok`` → safe to work; otherwise ``permanent`` distinguishes a
-    job to skip-forever (record + tell the client) from a transient retry.
+    Compatibility wrapper over :func:`verify_signed_job_snapshot`.
     """
-    from bnbagent_studio_core.erc8183.verify import verify_signed_job as _verify
+    snapshot, reason, permanent = verify_signed_job_snapshot(job_id)
+    return snapshot is not None, reason, permanent
 
-    v = _verify(job_id, expected_signer=get_wallet().address)
-    return v.ok, v.reason, v.permanent
+
+@dataclass(frozen=True)
+class JobAuthorizationTarget:
+    """On-chain identity and EIP-712 domain for a funded job's client."""
+
+    client: str
+    chain_id: int
+    verifying_contract: str
+
+
+def job_authorization_target(job_id: int) -> JobAuthorizationTarget:
+    """Return the chain-owned client and EIP-712 domain for ``job_id``."""
+    client = get_8183_client()
+    job = client.get_job(job_id)
+    return JobAuthorizationTarget(
+        client=str(job.client),
+        chain_id=int(client.network.chain_id),
+        verifying_contract=str(client.commerce.address),
+    )
 
 
 def job_spec(job_id: int):
@@ -193,11 +281,19 @@ def submit_result(
     Without gateway params the function falls back to the default storage backend
     configured in studio.toml (typically LocalStorageProvider for local dev).
     """
-    if gateway_url and gateway_token:
-        import bnbagent_studio_core.storage as _storage_mod
-        from uomp_storage import UOMPGatewayStorageProvider, submit_lock
+    # The gateway path temporarily replaces a process-global SDK factory. Every
+    # submission, including default-storage sweeps, must share this lock or a
+    # concurrent default call can capture another buyer's gateway provider.
+    # The current SDK has no explicit provider-injection seam, so the lock
+    # cannot safely be shortened to provider construction alone.
+    from uomp_storage import submit_lock
 
-        with submit_lock:
+    with submit_lock:
+        if gateway_url and gateway_token:
+            import bnbagent_studio_core.storage as _storage_mod
+
+            from uomp_storage import UOMPGatewayStorageProvider
+
             _orig = _storage_mod.storage_provider_from_config
             _storage_mod.storage_provider_from_config = (
                 lambda **_kw: UOMPGatewayStorageProvider(gateway_url, gateway_token)
@@ -207,7 +303,7 @@ def submit_result(
             finally:
                 _storage_mod.storage_provider_from_config = _orig
 
-    return submit_workflow(job_id, response_content, metadata=metadata)
+        return submit_workflow(job_id, response_content, metadata=metadata)
 
 
 def settle(job_id: int) -> str:

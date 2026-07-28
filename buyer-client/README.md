@@ -57,6 +57,53 @@ The free tier proves wallet identity via a 0-U EIP-712 signature and is rate-lim
 
 ---
 
+## Authenticated `notify_funded`
+
+For a named job, do not construct a raw notification payload. Use the signing
+helper with the same wallet that created the on-chain job:
+
+```ts
+const status = await notifyFunded(AGENT_ENDPOINT, wallet, jobId, {
+  gatewayUrl: relay.publicUrl,
+  gatewayToken: relay.token,
+  portfolio,
+  riskProfile,
+});
+```
+
+The helper serializes the complete context exactly once and creates an EIP-712
+authorization for the decimal job ID. The seller uses its configured chain and
+Commerce contract as the domain, recovers the signer, and accepts the context
+only when that signer is the on-chain job client. Gateway, token, portfolio,
+and risk-profile fields therefore must not be sent outside the signed context.
+
+## Authenticated payload delivery
+
+The `deliverable_url` written on-chain is a public locator, not an access
+credential. The gateway token stays in the signed off-chain `notify_funded`
+context. The seller uses it for `POST /v1/payload/upload`, and the buyer and
+seller use it as a Bearer token for `GET` and `HEAD` payload requests. Payload
+IDs or on-chain URLs alone do not authorize a read, and credentials are never
+placed in the URL, query string, fragment, or on-chain metadata.
+
+The buyer attaches its token only to a canonical
+`/v1/payload/pay_<32 lowercase hex>` URL whose origin exactly matches its
+public or local relay, and rejects redirects for authenticated downloads.
+Cross-origin and noncanonical URLs are fetched without relay credentials so a
+seller-controlled locator cannot disclose the token.
+
+The in-memory relay limits each upload to 2 MiB, all stored plus in-flight data
+to 16 MiB, and stored plus active payload slots to 32. It returns `413 Payload
+Too Large` for a per-upload overflow and `507 Insufficient Storage` when the
+aggregate byte or slot limit is exhausted. Existing payloads are not evicted.
+
+Production accepts public HTTPS `*.trycloudflare.com` relay origins by default.
+For a local HTTP loopback relay only, set
+`ALLOW_PRIVATE_DELIVERY_GATEWAY=true` on the seller. To use an alternative
+approved public origin, set the seller's `DELIVERY_GATEWAY_ALLOWED_HOSTS` to a
+comma-separated exact hostname or `.suffix` allowlist. Keep this allowlist as
+narrow as possible.
+
 ## Setup
 
 ```bash
