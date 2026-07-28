@@ -5,8 +5,9 @@ import hashlib
 import json
 import os
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any, Mapping
+from typing import Any
 from urllib.parse import urlsplit
 
 import boto3
@@ -37,7 +38,7 @@ class S3StorageConfig:
     prefix: str = _DEFAULT_PREFIX
 
     @classmethod
-    def from_env(cls, env: Mapping[str, str]) -> "S3StorageConfig":
+    def from_env(cls, env: Mapping[str, str]) -> S3StorageConfig:
         bucket = env.get("DELIVERABLE_S3_BUCKET", "").strip()
         public_base = env.get("DELIVERABLE_PUBLIC_BASE", "").strip()
         if bool(bucket) != bool(public_base):
@@ -50,7 +51,7 @@ class S3StorageConfig:
             raise S3StorageError("DELIVERABLE_S3_BUCKET is invalid")
         parsed = urlsplit(public_base)
         try:
-            parsed.port
+            _ = parsed.port
         except ValueError as exc:
             raise S3StorageError("DELIVERABLE_PUBLIC_BASE has an invalid port") from exc
         if (
@@ -89,7 +90,7 @@ class S3StorageProvider(StorageProvider):
         env: Mapping[str, str] = os.environ,
         *,
         s3_client: Any | None = None,
-    ) -> "S3StorageProvider":
+    ) -> S3StorageProvider:
         return cls(
             S3StorageConfig.from_env(env),
             s3_client if s3_client is not None else boto3.client("s3"),
@@ -100,7 +101,7 @@ class S3StorageProvider(StorageProvider):
         value = filename or "manifest.json"
         if not _SEGMENT_RE.fullmatch(value):
             raise S3StorageError("filename must be one safe basename")
-        return value[:-5] if value.endswith(".json") else value
+        return value.removesuffix(".json")
 
     async def upload(self, data: dict, filename: str | None = None) -> str:
         if not isinstance(data, dict):

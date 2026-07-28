@@ -236,11 +236,17 @@ def verify_signed_job_snapshot(
     if job.expired_at and job.expired_at <= int(time.time()):
         return None, "job has expired", True
 
-    spec = JobDescription.from_str(job.description)
+    try:
+        spec = JobDescription.from_str(job.description)
+    except Exception:
+        return None, "no signed quote anchored in job description", True
     if spec is None:
         return None, "no signed quote anchored in job description", True
 
-    signer = recover_quote_signer_compat(job.description)
+    try:
+        signer = recover_quote_signer_compat(job.description)
+    except Exception:
+        signer = None
     if signer is None or signer.lower() != expected_signer.lower():
         return (
             None,

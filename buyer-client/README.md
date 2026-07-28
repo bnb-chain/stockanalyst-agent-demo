@@ -130,6 +130,9 @@ AGENT_CLIENT_SECRET=<cognito-secret>
 # AGENT_TOKEN_URL=https://<domain>.auth.<region>.amazoncognito.com/oauth2/token
 # AGENT_OAUTH_SCOPE=<resource-server-identifier>/<scope>
 # AGENT_SESSION_ID=<stable-session-id-at-least-33-characters>
+# Required when the seller delivers through AWS S3/CloudFront rather than the
+# buyer-hosted relay. The existing mode name remains `ipfs` for compatibility.
+DELIVERY_MODE=ipfs
 PROVIDER_ADDRESS=0x1FF095E1C5Cf4bC72a3DC54be17B6cf85043Fb67
 
 # ── x402 (local agent, no auth needed) ───────────────────────────
@@ -163,13 +166,17 @@ AGENT_OAUTH_SCOPE=<resource-server-identifier>/<scope>
 # Optional; must contain at least 33 characters. If omitted, the buyer creates
 # one stable value for its process.
 AGENT_SESSION_ID=<stable-session-id-at-least-33-characters>
+# Disable the buyer relay so the seller's S3/CloudFront URL is fetched directly.
+# `ipfs` is the existing external-delivery mode name and is intentionally retained.
+DELIVERY_MODE=ipfs
 ```
 
 For an AgentCore runtime, the buyer sends the same session value in
 `X-Amzn-Bedrock-AgentCore-Runtime-Session-Id` on both `negotiate` and
 `notify_funded`. It does not log OAuth credentials, access tokens, or session
-values. Leave the three overrides unset for the existing managed-platform and
-local flows.
+values. Leave the three AgentCore overrides unset for the existing
+managed-platform and local flows. Set `DELIVERY_MODE=ipfs` whenever the seller
+uses the AWS S3/CloudFront delivery path.
 
 ---
 
