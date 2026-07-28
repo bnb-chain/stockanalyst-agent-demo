@@ -45,6 +45,15 @@ class S3StorageUploadTests(unittest.IsolatedAsyncioTestCase):
                 s3_client=self.client,
             )
 
+    def test_rejects_public_base_with_out_of_range_port(self) -> None:
+        env = {
+            "DELIVERABLE_S3_BUCKET": "bnbagent-code-stock-analyst-agent",
+            "DELIVERABLE_PUBLIC_BASE": "https://cdn.example:99999",
+        }
+
+        with self.assertRaisesRegex(S3StorageError, "DELIVERABLE_PUBLIC_BASE"):
+            S3StorageProvider.from_env(env, s3_client=self.client)
+
     async def test_upload_uses_canonical_content_addressed_json(self) -> None:
         data = {"z": 1, "a": {"value": "ok"}}
         canonical = json.dumps(

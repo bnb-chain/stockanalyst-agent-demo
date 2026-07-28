@@ -42,6 +42,10 @@ class S3StorageConfig:
         if not _BUCKET_RE.fullmatch(bucket):
             raise S3StorageError("DELIVERABLE_S3_BUCKET is invalid")
         parsed = urlsplit(public_base)
+        try:
+            parsed.port
+        except ValueError as exc:
+            raise S3StorageError("DELIVERABLE_PUBLIC_BASE has an invalid port") from exc
         if (
             parsed.scheme != "https"
             or not parsed.hostname
