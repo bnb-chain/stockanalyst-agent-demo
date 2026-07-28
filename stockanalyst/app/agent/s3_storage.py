@@ -116,8 +116,62 @@ class S3StorageProvider(StorageProvider):
         )
         return f"{self._config.public_base}/{key}"
 
+    def _key_from_url(self, url: str) -> str:
+        parsed = urlsplit(url)
+        base = urlsplit(self._config.public_base)
+        if (
+            parsed.scheme != "https"
+            or parsed.netloc != base.netloc
+            or parsed.query
+            or parsed.fragment
+        ):
+            raise S3StorageError("deliverable URL must use the configured public base")
+        path = parsed.path.lstrip("/")
+        prefix = f"{self._config.prefix}/"
+        if not path.startswith(prefix) or path == prefix or "%" in path:
+            raise S3StorageError("deliverable URL must stay under the configured prefix")
+        remainder = path[len(prefix) :]
+        if "/" in remainder or not _OBJECT_RE.fullmatch(remainder):
+            raise S3StorageError("deliverable object key is invalid")
+        return path
+
     async def download(self, url: str) -> dict:
-        raise S3StorageError("S3 deliverable downloads are not implemented")
+        key = self._key_from_url(url)
+        response = await asyncio.to_thread(
+            self._s3.get_object,
+            Bucket=self._config.bucket,
+            Key=key,
+        )
+        declared = int(response.get("ContentLength", 0))
+        if declared > _MAX_DOWNLOAD_BYTES:
+            raise S3StorageError("S3 deliverable exceeds 2 MiB")
+        body = await asyncio.to_thread(
+            response["Body"].read,
+            _MAX_DOWNLOAD_BYTES + 1,
+        )
+        if len(body) > _MAX_DOWNLOAD_BYTES:
+            raise S3StorageError("S3 deliverable exceeds 2 MiB")
+        try:
+            value = json.loads(body.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise S3StorageError("S3 deliverable is not valid UTF-8 JSON") from exc
+        if not isinstance(value, dict):
+            raise S3StorageError("S3 deliverable root must be an object")
+        return value
 
     async def exists(self, url: str) -> bool:
-        raise S3StorageError("S3 deliverable existence checks are not implemented")
+        from botocore.exceptions import ClientError
+
+        key = self._key_from_url(url)
+        try:
+            await asyncio.to_thread(
+                self._s3.head_object,
+                Bucket=self._config.bucket,
+                Key=key,
+            )
+        except ClientError as exc:
+            code = str(exc.response.get("Error", {}).get("Code", ""))
+            if code in {"404", "NoSuchKey"}:
+                return False
+            raise
+        return True

@@ -4,6 +4,8 @@ import hashlib
 import json
 import unittest
 
+from botocore.exceptions import ClientError
+
 from s3_storage import S3StorageError, S3StorageProvider
 
 
@@ -24,6 +26,18 @@ class FakeS3:
         self.put_calls.append(kwargs)
         self.objects[(kwargs["Bucket"], kwargs["Key"])] = kwargs["Body"]
         return {"ETag": '"test"'}
+
+    def get_object(self, *, Bucket: str, Key: str):
+        value = self.objects[(Bucket, Key)]
+        return {"ContentLength": len(value), "Body": FakeBody(value)}
+
+    def head_object(self, *, Bucket: str, Key: str):
+        if (Bucket, Key) not in self.objects:
+            raise ClientError(
+                {"Error": {"Code": "404", "Message": "Not Found"}},
+                "HeadObject",
+            )
+        return {"ContentLength": len(self.objects[(Bucket, Key)])}
 
 
 class S3StorageUploadTests(unittest.IsolatedAsyncioTestCase):
@@ -82,3 +96,53 @@ class S3StorageUploadTests(unittest.IsolatedAsyncioTestCase):
     async def test_upload_rejects_path_filename(self) -> None:
         with self.assertRaisesRegex(S3StorageError, "filename"):
             await self.provider().upload({"ok": True}, "../job.json")
+
+
+class S3StorageReadTests(S3StorageUploadTests):
+    async def test_download_reads_validated_cloudfront_url_from_s3(self) -> None:
+        provider = self.provider()
+        url = await provider.upload({"job_id": 397}, "job.json")
+        self.assertEqual(await provider.download(url), {"job_id": 397})
+
+    async def test_download_rejects_another_origin(self) -> None:
+        with self.assertRaisesRegex(S3StorageError, "public base"):
+            await self.provider().download(
+                "https://attacker.example/deliverables/job.json"
+            )
+
+    async def test_download_rejects_path_outside_prefix(self) -> None:
+        with self.assertRaisesRegex(S3StorageError, "prefix"):
+            await self.provider().download(
+                "https://d111111abcdef8.cloudfront.net/private/job.json"
+            )
+
+    async def test_download_rejects_oversized_body(self) -> None:
+        provider = self.provider()
+        self.client.objects[
+            ("bnbagent-code-stock-analyst-agent", "deliverables/large.json")
+        ] = b"x" * (2 * 1024 * 1024 + 1)
+        with self.assertRaisesRegex(S3StorageError, "2 MiB"):
+            await provider.download(
+                "https://d111111abcdef8.cloudfront.net/deliverables/large.json"
+            )
+
+    async def test_exists_returns_false_only_for_missing_key(self) -> None:
+        self.assertFalse(
+            await self.provider().exists(
+                "https://d111111abcdef8.cloudfront.net/deliverables/missing.json"
+            )
+        )
+
+    async def test_exists_propagates_non_missing_s3_errors(self) -> None:
+        def fail_head_object(*, Bucket: str, Key: str) -> None:
+            raise ClientError(
+                {"Error": {"Code": "NotFound", "Message": "Unexpected error"}},
+                "HeadObject",
+            )
+
+        self.client.head_object = fail_head_object
+
+        with self.assertRaises(ClientError):
+            await self.provider().exists(
+                "https://d111111abcdef8.cloudfront.net/deliverables/missing.json"
+            )
