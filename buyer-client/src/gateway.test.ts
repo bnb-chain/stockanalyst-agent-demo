@@ -15,11 +15,18 @@ import {
   createGatewayHandler,
   fetchDeliverable,
   findCloudflared,
+  shouldUseBuyerRelay,
   type GatewayHandlerOptions,
   type GatewayRelay,
 } from "./gateway.js";
 
 const TEST_TIMEOUT_MS = 1_000;
+
+test("uses the buyer relay unless delivery mode selects external IPFS storage", () => {
+  assert.equal(shouldUseBuyerRelay(undefined), true);
+  assert.equal(shouldUseBuyerRelay("ipfs"), false);
+  assert.equal(shouldUseBuyerRelay("  IpFs  "), false);
+});
 
 async function withHandler(
   handler: RequestListener,

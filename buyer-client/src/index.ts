@@ -35,6 +35,7 @@ import {
 import { CONTRACTS, ERC8183Buyer } from "./erc8183.js";
 import {
   fetchDeliverable,
+  shouldUseBuyerRelay,
   startGatewayRelay,
   type GatewayRelay,
 } from "./gateway.js";
@@ -46,6 +47,7 @@ const KEYSTORE_PATH  = process.env["KEYSTORE_PATH"]  ?? "../stockanalyst/.studio
 const WALLET_PASSWORD = process.env["WALLET_PASSWORD"] ?? "";
 const AGENT_ENDPOINT  = process.env["AGENT_ENDPOINT"]  ?? "http://localhost:9000";
 const PROVIDER_ADDRESS = process.env["PROVIDER_ADDRESS"] ?? "0x1FF095E1C5Cf4bC72a3DC54be17B6cf85043Fb67";
+const DELIVERY_MODE = process.env["DELIVERY_MODE"];
 
 const POLL_INTERVAL_MS = 15_000;
 const POLL_TIMEOUT_MS  = 1_800_000;
@@ -82,14 +84,19 @@ async function main(): Promise<void> {
   // ── Start UOMP payload relay (reverse gateway for report delivery) ────────
   // The seller uploads the report here; Cloudflare Tunnel exposes it publicly
   // so the seller can reach it even when the buyer has no public IP.
-  hr("UOMP Gateway: starting payload relay + Cloudflare Tunnel");
-  try {
-    relay = await startGatewayRelay();
-    console.log(`  publicUrl:   ${relay.publicUrl}`);
-    console.log(`  localUrl:    ${relay.localUrl}`);
-  } catch (err: unknown) {
-    console.log(`  ⚠  Failed to start relay: ${err instanceof Error ? err.message : err}`);
-    console.log("  Continuing without UOMP delivery (seller will use local storage).");
+  if (shouldUseBuyerRelay(DELIVERY_MODE)) {
+    hr("UOMP Gateway: starting payload relay + Cloudflare Tunnel");
+    try {
+      relay = await startGatewayRelay();
+      console.log(`  publicUrl:   ${relay.publicUrl}`);
+      console.log(`  localUrl:    ${relay.localUrl}`);
+    } catch (err: unknown) {
+      console.log(`  ⚠  Failed to start relay: ${err instanceof Error ? err.message : err}`);
+      console.log("  Continuing without UOMP delivery (seller will use local storage).");
+    }
+  } else {
+    hr("UOMP Gateway: external storage delivery");
+    console.log("  External storage delivery is enabled; buyer relay is disabled.");
   }
 
   // ── Step 0: Pre-flight balance check ────────────────────────────────────
