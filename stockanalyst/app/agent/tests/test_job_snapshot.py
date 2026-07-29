@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import json
+import time
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import ANY, patch
 
 from bnbagent.erc8183.types import JobStatus
+from eth_account import Account
+from eth_account.messages import encode_defunct
 from stockanalyst.app.agent import signing
 from web3 import Web3
 
@@ -20,10 +23,12 @@ class VerifiedJobSnapshotTests(unittest.TestCase):
     def _verify_description(
         self,
         description: str,
+        *,
+        provider: str = PROVIDER,
     ) -> tuple[signing.VerifiedJobSnapshot | None, str, bool]:
         job = SimpleNamespace(
             status=JobStatus.FUNDED,
-            provider=PROVIDER,
+            provider=provider,
             client=CLIENT,
             expired_at=0,
             description=description,
@@ -39,12 +44,19 @@ class VerifiedJobSnapshotTests(unittest.TestCase):
             patch.object(
                 signing,
                 "get_wallet",
-                return_value=SimpleNamespace(address=PROVIDER),
+                return_value=SimpleNamespace(address=provider),
             ),
         ):
             return signing.verify_signed_job_snapshot(42)
 
-    def _legacy_description(self, provider_sig: str) -> str:
+    def _legacy_description(
+        self,
+        provider_sig: str,
+        *,
+        quote_expires_at: int = 1_785_224_900,
+        chain_id: int = 97,
+        verifying_contract: str = COMMERCE,
+    ) -> str:
         content = {
             "version": 1,
             "negotiated_at": 1_785_224_000,
@@ -56,9 +68,9 @@ class VerifiedJobSnapshotTests(unittest.TestCase):
             },
             "price": "5",
             "currency": "0xc70B8741B8B07A6d61E54fd4B20f22Fa648E5565",
-            "quote_expires_at": 1_785_224_900,
-            "chain_id": 97,
-            "verifying_contract": COMMERCE,
+            "quote_expires_at": quote_expires_at,
+            "chain_id": chain_id,
+            "verifying_contract": verifying_contract,
         }
         signed_content = json.loads(json.dumps(content))
         signed_content["terms"]["success_criteria"] = list(
@@ -72,6 +84,23 @@ class VerifiedJobSnapshotTests(unittest.TestCase):
         content["negotiation_hash"] = f"0x{Web3.keccak(text=canonical).hex()}"
         content["provider_sig"] = provider_sig
         return json.dumps(content, sort_keys=True, separators=(",", ":"))
+
+    def _signed_legacy_description(
+        self,
+        **overrides: object,
+    ) -> tuple[str, str]:
+        account = Account.create()
+        unsigned = self._legacy_description("", **overrides)
+        content = json.loads(unsigned)
+        signature = Account.sign_message(
+            encode_defunct(text=content["negotiation_hash"]),
+            private_key=account.key,
+        ).signature.hex()
+        content["provider_sig"] = signature
+        return (
+            json.dumps(content, sort_keys=True, separators=(",", ":")),
+            account.address,
+        )
 
     def test_verifies_and_extracts_authorization_and_spec_from_one_chain_read(
         self,
@@ -110,13 +139,18 @@ class VerifiedJobSnapshotTests(unittest.TestCase):
             ),
             patch.object(
                 signing,
-                "recover_quote_signer_compat",
+                "recover_bound_quote_signer_compat",
                 return_value=PROVIDER,
             ) as recover,
         ):
             snapshot, reason, permanent = signing.verify_signed_job_snapshot(42)
 
-        recover.assert_called_once_with("signed-description")
+        recover.assert_called_once_with(
+            "signed-description",
+            expected_chain_id=97,
+            expected_verifying_contract=COMMERCE,
+            now=ANY,
+        )
         self.assertEqual(reads, [42])
         self.assertEqual(reason, "")
         self.assertIs(permanent, False)
@@ -155,7 +189,11 @@ class VerifiedJobSnapshotTests(unittest.TestCase):
             description="legacy-signed-description",
             budget=10,
         )
-        client = SimpleNamespace(get_job=lambda _job_id: job)
+        client = SimpleNamespace(
+            get_job=lambda _job_id: job,
+            network=SimpleNamespace(chain_id=97),
+            commerce=SimpleNamespace(address=COMMERCE),
+        )
         spec = SimpleNamespace(price="5")
         with (
             patch.object(signing, "get_8183_client", return_value=client),
@@ -170,7 +208,7 @@ class VerifiedJobSnapshotTests(unittest.TestCase):
             ),
             patch.object(
                 signing,
-                "recover_quote_signer_compat",
+                "recover_bound_quote_signer_compat",
                 return_value=CLIENT,
             ),
         ):
@@ -179,6 +217,64 @@ class VerifiedJobSnapshotTests(unittest.TestCase):
         self.assertIsNone(snapshot)
         self.assertIn("quote signature does not match", reason)
         self.assertIs(permanent, True)
+
+    def test_rejects_an_expired_legacy_compatible_quote(self) -> None:
+        description, provider = self._signed_legacy_description(
+            quote_expires_at=int(time.time()) - 1,
+        )
+
+        snapshot, reason, permanent = self._verify_description(
+            description,
+            provider=provider,
+        )
+
+        self.assertIsNone(snapshot)
+        self.assertIn("quote signature does not match", reason)
+        self.assertIs(permanent, True)
+
+    def test_rejects_a_legacy_compatible_quote_from_another_chain(self) -> None:
+        description, provider = self._signed_legacy_description(
+            quote_expires_at=int(time.time()) + 300,
+            chain_id=56,
+        )
+
+        snapshot, reason, permanent = self._verify_description(
+            description,
+            provider=provider,
+        )
+
+        self.assertIsNone(snapshot)
+        self.assertIn("quote signature does not match", reason)
+        self.assertIs(permanent, True)
+
+    def test_rejects_a_legacy_compatible_quote_for_another_contract(self) -> None:
+        description, provider = self._signed_legacy_description(
+            quote_expires_at=int(time.time()) + 300,
+            verifying_contract="0x4444444444444444444444444444444444444444",
+        )
+
+        snapshot, reason, permanent = self._verify_description(
+            description,
+            provider=provider,
+        )
+
+        self.assertIsNone(snapshot)
+        self.assertIn("quote signature does not match", reason)
+        self.assertIs(permanent, True)
+
+    def test_accepts_an_unexpired_domain_bound_legacy_quote(self) -> None:
+        description, provider = self._signed_legacy_description(
+            quote_expires_at=int(time.time()) + 300,
+        )
+
+        snapshot, reason, permanent = self._verify_description(
+            description,
+            provider=provider,
+        )
+
+        self.assertIsNotNone(snapshot)
+        self.assertEqual(reason, "")
+        self.assertIs(permanent, False)
 
     def test_incomplete_versioned_description_is_a_permanent_rejection(self) -> None:
         for description in (
