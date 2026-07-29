@@ -85,7 +85,7 @@ All created resources use the tags:
 ```text
 Project=stockanalyst-agent
 Purpose=fixed-egress
-ManagedBy=codex
+ManagedBy=cloudformation
 Environment=testnet
 ```
 
