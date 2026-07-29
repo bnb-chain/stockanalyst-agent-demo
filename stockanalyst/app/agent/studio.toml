@@ -41,8 +41,8 @@ kind = "evm-local"
 signer = "local"
 keystore_dir = "../../.studio/wallets"
 # address = "0x..."   # filled by `bag wallet new`
-address = "0x1FF095E1C5Cf4bC72a3DC54be17B6cf85043Fb67"
-platform_exposed_addresses = ["0x1FF095E1C5Cf4bC72a3DC54be17B6cf85043Fb67"]
+address = "0xd10BdDC20E4DC42A1a19a9653e994991e25b8153"
+platform_exposed_addresses = ["0xd10BdDC20E4DC42A1a19a9653e994991e25b8153"]
 
 [llm]
 provider = "openrouter"
