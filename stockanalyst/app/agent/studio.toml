@@ -139,6 +139,12 @@ public = true
 # ── U token EIP-712 domain (default "U" / "1") ─────────────────────────────
 #   bag env set U_TOKEN_DOMAIN_NAME    U
 #   bag env set U_TOKEN_DOMAIN_VERSION 1
+#
+# ── Competition successful-call accounting (optional) ──────────────────────
+# Set both variables to enable reporting; leave both unset to disable it.
+# COMPETITION_AI_CALLS_URL is the complete backend API URL, including its path.
+#   bag env set COMPETITION_AI_CALLS_URL https://<backend>/<api-path>
+#   bag env set COMPETITION_INTERNAL_TOKEN <internal-token>
 
 [deploy.platform]
 terms_accepted_at = "2026-07-16T15:01:53Z"

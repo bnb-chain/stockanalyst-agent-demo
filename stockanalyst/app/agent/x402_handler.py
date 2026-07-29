@@ -53,6 +53,7 @@ from urllib.parse import parse_qs
 
 import httpx
 
+from competition_reporting import report_competition_call
 from x402_verify import (
     CHAIN_ID,
     FREE_TIER_LIMIT,
@@ -391,6 +392,18 @@ class X402Handler:
             return
 
         logger.info("x402 payment verified — streaming analysis for %s", symbols)
+        if txhash_or_err != "demo":
+            try:
+                from_addr, nonce = _payment_identity(payment_header)
+                await report_competition_call(
+                    event_id=f"b402:{CHAIN_ID}:{from_addr}:{nonce}",
+                    address=from_addr,
+                    called_at=int(time.time() * 1000),
+                )
+            except ValueError:
+                logger.exception("x402 verified payment identity extraction failed")
+            except Exception:
+                logger.exception("x402 competition accounting failed")
         analysis_type = str(req.get("analysis_type") or "comprehensive")
         portfolio = req.get("portfolio") or []
         risk_profile = req.get("risk_profile") or {}
@@ -546,6 +559,20 @@ class X402Handler:
             })
             return
 
+        try:
+            proof_addr, nonce = _payment_identity(payment_header)
+            if proof_addr != from_addr.lower():
+                raise ValueError("verified free payment identity mismatch")
+            await report_competition_call(
+                event_id=f"b402-free:{CHAIN_ID}:{proof_addr}:{nonce}",
+                address=proof_addr,
+                called_at=int(time.time() * 1000),
+            )
+        except ValueError:
+            logger.exception("x402 verified free payment identity extraction failed")
+        except Exception:
+            logger.exception("x402 free-tier competition accounting failed")
+
         logger.info("x402 free tier: streaming quote for %s (from=%s, %s)", symbol, from_addr, msg)
         await self._stream_free_sse(send, symbol, from_addr, msg)
 
@@ -588,6 +615,23 @@ class X402Handler:
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
+
+def _payment_identity(proof_header: str) -> tuple[str, str]:
+    """Extract canonical wallet and nonce after proof verification succeeded."""
+    try:
+        proof = json.loads(base64.b64decode(proof_header.strip()))
+        authorization = (proof.get("payload") or {}).get("authorization") or {}
+        address = str(authorization["from"]).lower()
+        address_bytes = bytes.fromhex(address.removeprefix("0x"))
+        nonce_bytes = bytes.fromhex(
+            str(authorization["nonce"]).removeprefix("0x").zfill(64)
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError("verified payment proof has no valid identity") from exc
+    if len(address_bytes) != 20 or len(nonce_bytes) != 32:
+        raise ValueError("verified payment proof has no valid identity")
+    return f"0x{address_bytes.hex()}", f"0x{nonce_bytes.hex()}"
+
 
 def _parse_symbols(raw) -> list[str]:
     """Accept a list, a comma-string, or a single string → upper-cased list."""
