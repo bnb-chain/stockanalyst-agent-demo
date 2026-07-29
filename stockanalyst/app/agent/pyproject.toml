@@ -59,6 +59,7 @@ known-first-party = [
     "agent_card",
     "agent_instruction",
     "analysis",
+    "competition_reporting",
     "data_sources",
     "executor",
     "managed_model",

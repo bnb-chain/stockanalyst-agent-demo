@@ -13,7 +13,7 @@ import threading
 import time
 import unittest
 from types import ModuleType, SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import ANY, AsyncMock, patch
 
 from eth_account import Account
 from eth_account.messages import encode_typed_data
@@ -748,6 +748,7 @@ class NotifyFundedAuthorizationTests(unittest.IsolatedAsyncioTestCase):
             verifying_contract=COMMERCE,
             spec=_job_spec(required=True),
         )
+        report = AsyncMock(return_value=True)
         with (
             patch.object(
                 seller_core_module.signing,
@@ -765,11 +766,22 @@ class NotifyFundedAuthorizationTests(unittest.IsolatedAsyncioTestCase):
                 "job_authorization_target",
                 side_effect=AssertionError("second authorization read"),
             ),
+            patch.object(
+                seller_core_module,
+                "report_competition_call",
+                report,
+                create=True,
+            ),
         ):
             result = await self.core.notify_funded(self._signed_request())
 
         self.assertEqual(result["status"], "accepted")
         verify_snapshot.assert_called_once_with(JOB_ID)
+        report.assert_awaited_once_with(
+            event_id=f"erc8183:{CHAIN_ID}:{COMMERCE.lower()}:{JOB_ID}",
+            address=self.client.address,
+            called_at=ANY,
+        )
 
     async def test_sweep_reuses_spec_from_one_verified_job_snapshot(self) -> None:
         run_work = AsyncMock(return_value="report")
@@ -786,6 +798,7 @@ class NotifyFundedAuthorizationTests(unittest.IsolatedAsyncioTestCase):
             submit_tx="0xtx",
             deliverable_url="https://result",
         )
+        report = AsyncMock(return_value=True)
         with (
             patch.object(
                 seller_core_module.signing,
@@ -808,11 +821,22 @@ class NotifyFundedAuthorizationTests(unittest.IsolatedAsyncioTestCase):
                 "submit_result",
                 return_value=submitted,
             ),
+            patch.object(
+                seller_core_module,
+                "report_competition_call",
+                report,
+                create=True,
+            ),
         ):
             result = await core._fulfill_job(JOB_ID)
 
         self.assertIs(result["ok"], True)
         verify_snapshot.assert_called_once_with(JOB_ID)
+        report.assert_awaited_once_with(
+            event_id=f"erc8183:{CHAIN_ID}:{COMMERCE.lower()}:{JOB_ID}",
+            address=self.client.address,
+            called_at=ANY,
+        )
         run_work.assert_awaited_once()
 
     async def test_transient_delivery_keeps_context_for_retry(self) -> None:

@@ -40,6 +40,7 @@ import asyncio
 import json
 import logging
 import os
+import time
 from dataclasses import replace
 from typing import Any
 
@@ -49,6 +50,7 @@ from bnbagent_studio_core.erc8183.errors import (
 )
 
 import signing
+from competition_reporting import report_competition_call
 from notify_security import (
     JobContext,
     NotifySecurityError,
@@ -438,6 +440,7 @@ class SellerCore:
         context_event = self._context_events.get(job_id)
         if context_event is not None:
             context_event.set()
+        await self._report_funded_call(snapshot, job_id)
         self._spawn_job(job_id, verified=True)
         self._spawn_sweep()  # straggler fallback alongside the named job
         return {
@@ -604,6 +607,7 @@ class SellerCore:
                 "reason": reason,
             }
 
+        await self._report_funded_call(snapshot, job_id)
         spec = snapshot.spec
         self._job_specs[job_id] = spec
         ready = await self._await_sweep_context(
@@ -618,6 +622,23 @@ class SellerCore:
                 "reason": "notify_context_required",
             }
         return await self._do_work_and_submit(job_id, spec=spec)
+
+    @staticmethod
+    async def _report_funded_call(snapshot: Any, job_id: int) -> None:
+        """Best-effort competition accounting for a verified funded job."""
+        try:
+            await report_competition_call(
+                event_id=(
+                    f"erc8183:{snapshot.chain_id}:"
+                    f"{snapshot.verifying_contract.lower()}:{job_id}"
+                ),
+                address=snapshot.client,
+                called_at=int(time.time() * 1000),
+            )
+        except Exception:
+            # Accounting is deliberately fail-open: a transient internal API
+            # failure must never deny service after the buyer has paid.
+            logger.exception("job %s: competition accounting failed", job_id)
 
     async def _do_work_and_submit(
         self,
