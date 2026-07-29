@@ -57,6 +57,7 @@ from managed_model import build_model
 from report_pipeline import generate_validated_report
 from report_renderer import render_report
 from report_schema import StockReport
+from s3_storage import install_s3_storage_from_env
 from tools import LLM_READ_TOOLS
 
 try:
@@ -124,6 +125,7 @@ def _load_runtime_secrets() -> None:
 
 
 _load_runtime_secrets()
+install_s3_storage_from_env()
 
 # --- Paymaster patch -----------------------------------------------------------
 # MegaFuel paymaster (bsc-testnet default) accepts transactions but never

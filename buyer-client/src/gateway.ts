@@ -64,6 +64,10 @@ export interface CloudflaredDiscoveryOptions {
   isExecutable?: (path: string) => boolean;
 }
 
+export function shouldUseBuyerRelay(deliveryMode: string | undefined): boolean {
+  return deliveryMode?.trim().toLowerCase() !== "ipfs";
+}
+
 export async function fetchDeliverable(
   url: string,
   relay: GatewayRelay | undefined,

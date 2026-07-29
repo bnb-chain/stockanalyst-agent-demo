@@ -81,11 +81,9 @@ poll_interval_seconds = 30
 auto_settle = false                            # opt-in: detect dispute-window-elapsed → settle
 
 [storage]
-# Deliverables pinned to IPFS. upload() returns ipfs://CID, published
-# on-chain verbatim — durable, public, deploy-ready. Works with any
-# pinning service or self-hosted node: the upload endpoint is
-# STORAGE_API_URL and the write key/JWT is STORAGE_API_KEY, both in
-# .studio/.env.local.
+# Local development fallback. Deployed S3 deliverable storage is installed
+# at runtime from DELIVERABLE_S3_BUCKET, DELIVERABLE_PUBLIC_BASE, and optional
+# DELIVERABLE_S3_PREFIX environment variables after runtime secrets load.
 kind = "local"
 
 

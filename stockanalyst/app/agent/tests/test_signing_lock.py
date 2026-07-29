@@ -10,6 +10,8 @@ from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from unittest.mock import patch
 
+from s3_storage import S3StorageProvider, install_s3_storage_from_env
+
 
 def _load_signing_with_stubs(submit_workflow, storage_module, uomp_module):
     bnbagent = ModuleType("bnbagent")
@@ -55,10 +57,20 @@ def _load_signing_with_stubs(submit_workflow, storage_module, uomp_module):
 
 class SubmissionLockTests(unittest.TestCase):
     def test_gateway_patch_excludes_concurrent_default_submission(self) -> None:
-        default_provider = object()
-        gateway_provider = object()
         storage_module = ModuleType("bnbagent_studio_core.storage")
-        storage_module.storage_provider_from_config = lambda **kwargs: default_provider
+        self.assertTrue(
+            install_s3_storage_from_env(
+                {
+                    "DELIVERABLE_S3_BUCKET": "bnbagent-code-stock-analyst-agent",
+                    "DELIVERABLE_PUBLIC_BASE": "https://d111111abcdef8.cloudfront.net",
+                },
+                storage_module=storage_module,
+                s3_client=object(),
+            )
+        )
+        default_provider = storage_module.storage_provider_from_config()
+        self.assertIsInstance(default_provider, S3StorageProvider)
+        gateway_provider = object()
         uomp_module = ModuleType("uomp_storage")
         uomp_module.submit_lock = threading.Lock()
         uomp_module.UOMPGatewayStorageProvider = (
@@ -116,6 +128,14 @@ class SubmissionLockTests(unittest.TestCase):
         self.assertFalse(default_thread.is_alive())
         self.assertTrue(default_entered.is_set())
         self.assertEqual(captured, [(1, gateway_provider), (2, default_provider)])
+
+    def test_runtime_secrets_load_before_s3_storage_installation(self) -> None:
+        main_text = (Path(__file__).parents[1] / "main.py").read_text(encoding="utf-8")
+
+        self.assertLess(
+            main_text.index("\n_load_runtime_secrets()\n"),
+            main_text.index("\ninstall_s3_storage_from_env()\n"),
+        )
 
 
 if __name__ == "__main__":

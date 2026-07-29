@@ -14,9 +14,206 @@ import {
   DEFAULT_MAX_PRICE_U,
   negotiate,
   NOTIFY_CONTEXT_REQUIRED,
+  notifyFunded,
   resolveMaxBudgetWei,
   type NegotiationEnvelope,
 } from "./negotiate.js";
+
+const agentEnvironmentKeys = [
+  "AGENT_CLIENT_ID",
+  "AGENT_CLIENT_SECRET",
+  "AGENT_TOKEN_URL",
+  "AGENT_OAUTH_SCOPE",
+  "AGENT_SESSION_ID",
+] as const;
+
+async function withAgentEnvironment(
+  values: Partial<Record<(typeof agentEnvironmentKeys)[number], string>>,
+  run: () => Promise<void>,
+): Promise<void> {
+  const original = Object.fromEntries(
+    agentEnvironmentKeys.map((key) => [key, process.env[key]]),
+  ) as Record<(typeof agentEnvironmentKeys)[number], string | undefined>;
+
+  for (const key of agentEnvironmentKeys) {
+    const value = values[key];
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  }
+
+  try {
+    await run();
+  } finally {
+    for (const key of agentEnvironmentKeys) {
+      const value = original[key];
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+}
+
+function acceptedNegotiationResponse(): Response {
+  return new Response(JSON.stringify({
+    result: {
+      parts: [{
+        data: {
+          request: {
+            task_description: "analyse portfolio",
+            terms: {
+              deliverables: "report",
+              quality_standards: "cited",
+              success_criteria: NOTIFY_CONTEXT_REQUIRED,
+            },
+          },
+          response: {
+            accepted: true,
+            terms: {
+              price: "1",
+              currency: "USDT",
+              deliverables: "report",
+              quality_standards: "cited",
+              success_criteria: NOTIFY_CONTEXT_REQUIRED,
+            },
+          },
+        },
+      }],
+    },
+  }));
+}
+
+test("uses explicit Cognito token URL and scope", async () => {
+  const originalFetch = globalThis.fetch;
+  const requests: Array<{ url: string; body: string; authorization: string | null }> = [];
+  globalThis.fetch = async (input, init) => {
+    const url = String(input);
+    const headers = new Headers(init?.headers);
+    requests.push({
+      url,
+      body: String(init?.body),
+      authorization: headers.get("Authorization"),
+    });
+    if (requests.length === 1) {
+      return new Response(JSON.stringify({ access_token: "override-token", expires_in: 3600 }));
+    }
+    return acceptedNegotiationResponse();
+  };
+
+  try {
+    await withAgentEnvironment({
+      AGENT_CLIENT_ID: "override-client",
+      AGENT_CLIENT_SECRET: "override-secret",
+      AGENT_TOKEN_URL: "https://stockanalyst.auth.us-east-1.amazoncognito.com/oauth2/token",
+      AGENT_OAUTH_SCOPE: "stockanalyst/invoke",
+    }, async () => {
+      await negotiate(
+        "https://bedrock-agentcore.us-east-1.amazonaws.com/runtimes/runtime-1/invocations?qualifier=DEFAULT",
+        "analyse portfolio",
+        "report",
+        "cited",
+      );
+    });
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+
+  assert.equal(
+    requests[0]?.url,
+    "https://stockanalyst.auth.us-east-1.amazoncognito.com/oauth2/token",
+  );
+  const tokenBody = new URLSearchParams(requests[0]?.body);
+  assert.equal(tokenBody.get("scope"), "stockanalyst/invoke");
+  assert.equal(requests[1]?.authorization, "Bearer override-token");
+});
+
+test("sends one stable generated AgentCore session header for negotiate and notify", async () => {
+  const originalFetch = globalThis.fetch;
+  const sessionHeaders: Array<string | null> = [];
+  globalThis.fetch = async (_input, init) => {
+    sessionHeaders.push(new Headers(init?.headers).get("X-Amzn-Bedrock-AgentCore-Runtime-Session-Id"));
+    return sessionHeaders.length === 1
+      ? acceptedNegotiationResponse()
+      : new Response(JSON.stringify({ result: { parts: [{ data: { status: "accepted" } }] } }));
+  };
+
+  try {
+    await withAgentEnvironment({}, async () => {
+      const endpoint = "https://bedrock-agentcore.us-east-1.amazonaws.com/runtimes/runtime-2/invocations?qualifier=DEFAULT";
+      await negotiate(endpoint, "analyse portfolio", "report", "cited");
+      await notifyFunded(endpoint, Wallet.createRandom(), 7n);
+    });
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+
+  assert.equal(sessionHeaders.length, 2);
+  assert.ok(sessionHeaders[0]);
+  assert.ok(sessionHeaders[0]!.length >= 33);
+  assert.equal(sessionHeaders[1], sessionHeaders[0]);
+});
+
+test("rejects a short explicit AgentCore session ID before fetch", async () => {
+  const originalFetch = globalThis.fetch;
+  let fetchCalls = 0;
+  globalThis.fetch = async () => {
+    fetchCalls += 1;
+    return acceptedNegotiationResponse();
+  };
+
+  try {
+    await withAgentEnvironment({ AGENT_SESSION_ID: "too-short" }, async () => {
+      await assert.rejects(
+        negotiate(
+          "https://bedrock-agentcore.us-east-1.amazonaws.com/runtimes/runtime-3/invocations?qualifier=DEFAULT",
+          "analyse portfolio",
+          "report",
+          "cited",
+        ),
+        /AGENT_SESSION_ID must be at least 33 characters/,
+      );
+    });
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+
+  assert.equal(fetchCalls, 0);
+});
+
+test("keeps managed-platform token derivation isolated from Cognito overrides", async () => {
+  const originalFetch = globalThis.fetch;
+  const requests: Array<{ url: string; body: string; authorization: string | null }> = [];
+  globalThis.fetch = async (input, init) => {
+    const headers = new Headers(init?.headers);
+    requests.push({
+      url: String(input),
+      body: String(init?.body),
+      authorization: headers.get("Authorization"),
+    });
+    if (requests.length === 1) {
+      return new Response(JSON.stringify({ access_token: "managed-token", expires_in: 3600 }));
+    }
+    return acceptedNegotiationResponse();
+  };
+
+  try {
+    await withAgentEnvironment({
+      AGENT_CLIENT_ID: "managed-client",
+      AGENT_CLIENT_SECRET: "managed-secret",
+    }, async () => {
+      await negotiate(
+        "https://bnbagent-api.bnbchain.world/v1/rt/managed-runtime/a2a",
+        "analyse portfolio",
+        "report",
+        "cited",
+      );
+    });
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+
+  assert.equal(requests[0]?.url, "https://bnbagent-api.bnbchain.world/v1/oauth/token");
+  assert.equal(new URLSearchParams(requests[0]?.body).get("scope"), "invoke:managed-runtime");
+  assert.equal(requests[1]?.authorization, "Bearer managed-token");
+});
 
 test("resolveMaxBudgetWei falls back to the default cap when unset", () => {
   assert.equal(resolveMaxBudgetWei({}), parseUnits(String(DEFAULT_MAX_PRICE_U), 18));

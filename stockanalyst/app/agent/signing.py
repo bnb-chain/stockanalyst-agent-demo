@@ -31,6 +31,128 @@ from bnbagent_studio_core.erc8183.client import get_8183_client
 from bnbagent_studio_core.erc8183.workflows import settle_workflow
 from bnbagent_studio_core.wallet import get_wallet
 
+_CONTEXT_REQUIRED_CRITERION = "uomp_notify_context_required_v1"
+
+
+def _recover_quote_signer_compat_with_mode(
+    description: str,
+) -> tuple[str | None, bool]:
+    """Return ``(signer, used_legacy_fallback)`` for a signed description."""
+    from bnbagent_studio_core.erc8183.verify import recover_quote_signer
+
+    try:
+        recovered = recover_quote_signer(description)
+    except (TypeError, ValueError):
+        recovered = None
+    if recovered is not None:
+        return recovered, False
+
+    import json
+
+    try:
+        parsed = json.loads(description)
+        terms = parsed["terms"]
+        if (
+            not isinstance(parsed, dict)
+            or not isinstance(terms, dict)
+            or terms.get("success_criteria") != _CONTEXT_REQUIRED_CRITERION
+        ):
+            return None, True
+        negotiation_hash = parsed["negotiation_hash"]
+        provider_sig = parsed["provider_sig"]
+        if not isinstance(negotiation_hash, str) or not isinstance(provider_sig, str):
+            return None, True
+
+        content = {
+            key: value
+            for key, value in parsed.items()
+            if key not in ("negotiation_hash", "provider_sig")
+        }
+        content["terms"] = dict(terms)
+        content["terms"]["success_criteria"] = list(_CONTEXT_REQUIRED_CRITERION)
+
+        from web3 import Web3
+
+        canonical = json.dumps(content, sort_keys=True, separators=(",", ":"))
+        recomputed = Web3.keccak(text=canonical).hex()
+        recomputed = recomputed if recomputed.startswith("0x") else f"0x{recomputed}"
+        if recomputed.lower() != negotiation_hash.lower():
+            return None, True
+
+        from eth_account import Account
+        from eth_account.messages import encode_defunct
+
+        return (
+            Account.recover_message(
+                encode_defunct(text=negotiation_hash),
+                signature=provider_sig,
+            ),
+            True,
+        )
+    except (KeyError, TypeError, ValueError):
+        return None, True
+
+
+def recover_quote_signer_compat(description: str) -> str | None:
+    """Recover a normal or legacy-compatible quote signer."""
+    return _recover_quote_signer_compat_with_mode(description)[0]
+
+
+def recover_bound_quote_signer_compat(
+    description: str,
+    *,
+    expected_chain_id: int,
+    expected_verifying_contract: str,
+    now: int,
+) -> str | None:
+    """Recover a signer only when the quote is valid for the active domain.
+
+    Normal SDK quotes retain the SDK's funded-job TTL semantics. The narrowly
+    scoped legacy canonicalization fallback additionally requires an unexpired
+    quote so old compatibility signatures cannot be replayed.
+    """
+    import json
+
+    from web3 import Web3
+
+    try:
+        parsed = json.loads(description)
+        if not isinstance(parsed, dict):
+            return None
+
+        signed_chain_id = parsed.get("chain_id")
+        if (
+            type(signed_chain_id) is not int
+            or signed_chain_id != expected_chain_id
+        ):
+            return None
+
+        signed_contract = parsed.get("verifying_contract")
+        if (
+            not isinstance(signed_contract, str)
+            or not Web3.is_address(signed_contract)
+            or not Web3.is_address(expected_verifying_contract)
+            or Web3.to_checksum_address(signed_contract)
+            != Web3.to_checksum_address(expected_verifying_contract)
+        ):
+            return None
+    except (TypeError, ValueError):
+        return None
+
+    signer, used_legacy_fallback = _recover_quote_signer_compat_with_mode(description)
+    if signer is None:
+        return None
+
+    if used_legacy_fallback:
+        quote_expires_at = parsed.get("quote_expires_at")
+        if (
+            type(quote_expires_at) is not int
+            or quote_expires_at <= now
+        ):
+            return None
+
+    return signer
+
 
 def _erc8183_cfg() -> dict:
     """Read ``[payments.erc8183]`` from studio.toml ({} when absent)."""
@@ -163,10 +285,7 @@ def verify_signed_job_snapshot(
 ) -> tuple[VerifiedJobSnapshot | None, str, bool]:
     """Verify one fetched job and return its immutable authorization/work fields."""
     from bnbagent.erc8183.types import JobStatus
-    from bnbagent_studio_core.erc8183.verify import (
-        JobDescription,
-        recover_quote_signer,
-    )
+    from bnbagent_studio_core.erc8183.verify import JobDescription
 
     client = get_8183_client()
     try:
@@ -184,11 +303,24 @@ def verify_signed_job_snapshot(
     if job.expired_at and job.expired_at <= int(time.time()):
         return None, "job has expired", True
 
-    spec = JobDescription.from_str(job.description)
+    try:
+        spec = JobDescription.from_str(job.description)
+    except Exception:
+        return None, "no signed quote anchored in job description", True
     if spec is None:
         return None, "no signed quote anchored in job description", True
 
-    signer = recover_quote_signer(job.description)
+    active_chain_id = int(client.network.chain_id)
+    active_verifying_contract = str(client.commerce.address)
+    try:
+        signer = recover_bound_quote_signer_compat(
+            job.description,
+            expected_chain_id=active_chain_id,
+            expected_verifying_contract=active_verifying_contract,
+            now=int(time.time()),
+        )
+    except Exception:
+        signer = None
     if signer is None or signer.lower() != expected_signer.lower():
         return (
             None,
@@ -209,8 +341,8 @@ def verify_signed_job_snapshot(
     return (
         VerifiedJobSnapshot(
             client=str(job.client),
-            chain_id=int(client.network.chain_id),
-            verifying_contract=str(client.commerce.address),
+            chain_id=active_chain_id,
+            verifying_contract=active_verifying_contract,
             spec=spec,
         ),
         "",

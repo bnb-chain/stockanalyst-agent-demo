@@ -126,6 +126,13 @@ WALLET_PASSWORD=your_wallet_password
 AGENT_ENDPOINT=https://bnbagent-api.bnbchain.world/v1/rt/<runtime-id>/a2a
 AGENT_CLIENT_ID=<cognito-client-id>        # from `bag deploy provision-cognito`
 AGENT_CLIENT_SECRET=<cognito-secret>
+# AWS AgentCore only: exact Cognito token endpoint and resource-server scope
+# AGENT_TOKEN_URL=https://<domain>.auth.<region>.amazoncognito.com/oauth2/token
+# AGENT_OAUTH_SCOPE=<resource-server-identifier>/<scope>
+# AGENT_SESSION_ID=<stable-session-id-at-least-33-characters>
+# Required when the seller delivers through AWS S3/CloudFront rather than the
+# buyer-hosted relay. The existing mode name remains `ipfs` for compatibility.
+DELIVERY_MODE=ipfs
 PROVIDER_ADDRESS=0x1FF095E1C5Cf4bC72a3DC54be17B6cf85043Fb67
 
 # ── x402 (local agent, no auth needed) ───────────────────────────
@@ -140,6 +147,36 @@ UOMP_GUARD_TOKEN=your_guard_jwt_token
 > `AGENT_ENDPOINT` is the deployed A2A path (requires Cognito auth) used by `npm run dev`.
 > `X402_ENDPOINT` is the bare local agent URL used by `npm run x402` — it defaults to
 > `http://localhost:9000` so you only need to add it to `.env` if you change the port.
+
+### AWS AgentCore runtime
+
+For a self-hosted AWS AgentCore seller, set `AGENT_ENDPOINT` to the raw runtime
+invocation URL (not a platform `/a2a` URL):
+
+```text
+https://bedrock-agentcore.<region>.amazonaws.com/runtimes/<agent-runtime-arn>/invocations?qualifier=DEFAULT
+```
+
+Its Cognito issuer is separate from that runtime URL, so set these overrides
+exactly as issued by Cognito and its resource server:
+
+```dotenv
+AGENT_TOKEN_URL=https://<domain>.auth.<region>.amazoncognito.com/oauth2/token
+AGENT_OAUTH_SCOPE=<resource-server-identifier>/<scope>
+# Optional; must contain at least 33 characters. If omitted, the buyer creates
+# one stable value for its process.
+AGENT_SESSION_ID=<stable-session-id-at-least-33-characters>
+# Disable the buyer relay so the seller's S3/CloudFront URL is fetched directly.
+# `ipfs` is the existing external-delivery mode name and is intentionally retained.
+DELIVERY_MODE=ipfs
+```
+
+For an AgentCore runtime, the buyer sends the same session value in
+`X-Amzn-Bedrock-AgentCore-Runtime-Session-Id` on both `negotiate` and
+`notify_funded`. It does not log OAuth credentials, access tokens, or session
+values. Leave the three AgentCore overrides unset for the existing
+managed-platform and local flows. Set `DELIVERY_MODE=ipfs` whenever the seller
+uses the AWS S3/CloudFront delivery path.
 
 ---
 
