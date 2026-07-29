@@ -30,7 +30,7 @@ platform_artifact = "zip"
 packaging = "zip"
 iam_notice_accepted_at = "2026-07-29T08:12:28Z"
 iam_notice_version = 1
-last_deploy_at = "2026-07-29T08:40:49Z"
+last_deploy_at = "2026-07-29T08:55:51Z"
 runtime_arn = "arn:aws:bedrock-agentcore:us-east-1:201243086760:runtime/stockanalyst_stockanalyst-hrXlh1BUtQ"
 
 [wallet]
