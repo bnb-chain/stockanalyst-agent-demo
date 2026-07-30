@@ -1,0 +1,240 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: Public x402 HTTP adapter for an existing AgentCore A2A Runtime
+
+Parameters:
+  StageName:
+    Type: String
+    Default: testnet
+    AllowedPattern: "^[a-z0-9-]+$"
+  AgentCoreInvokeUrl:
+    Type: String
+    AllowedPattern: "^https://bedrock-agentcore\\.[a-z0-9-]+\\.amazonaws\\.com/.+$"
+  OAuthSecretArn:
+    Type: String
+    AllowedPattern: "^arn:[^:]+:secretsmanager:[^:]+:[0-9]{12}:secret:.+$"
+  RateLimitPerFiveMinutes:
+    Type: Number
+    Default: 300
+    MinValue: 100
+  ReservedConcurrency:
+    Type: Number
+    Default: 10
+    MinValue: 1
+    MaxValue: 100
+
+Resources:
+  X402Api:
+    Type: AWS::Serverless::Api
+    Properties:
+      Name: !Sub "${AWS::StackName}-api"
+      StageName: !Ref StageName
+      EndpointConfiguration: REGIONAL
+      TracingEnabled: true
+      AccessLogSetting:
+        DestinationArn: !GetAtt X402ApiAccessLogGroup.Arn
+        Format: >-
+          {"requestId":"$context.requestId","route":"$context.httpMethod $context.resourcePath","status":"$context.status","latency":"$context.responseLatency","integrationStatus":"$context.integrationStatus"}
+      MethodSettings:
+        - ResourcePath: "/*"
+          HttpMethod: "*"
+          MetricsEnabled: true
+          DataTraceEnabled: false
+          ThrottlingBurstLimit: 50
+          ThrottlingRateLimit: 25
+
+  X402Adapter:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-adapter"
+      Runtime: python3.13
+      Handler: handler.lambda_handler
+      CodeUri: ../gateway/x402_lambda/src
+      AutoPublishAlias: live
+      Timeout: 28
+      MemorySize: 256
+      ReservedConcurrentExecutions: !Ref ReservedConcurrency
+      Tracing: Active
+      Environment:
+        Variables:
+          AGENTCORE_INVOKE_URL: !Ref AgentCoreInvokeUrl
+          OAUTH_SECRET_ARN: !Ref OAuthSecretArn
+          X402_PUBLIC_BASE_URL: !Sub
+            "https://${X402Api}.execute-api.${AWS::Region}.${AWS::URLSuffix}/${StageName}"
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: secretsmanager:GetSecretValue
+              Resource: !Ref OAuthSecretArn
+      Events:
+        Price:
+          Type: Api
+          Properties:
+            RestApiId: !Ref X402Api
+            Path: /x402/price
+            Method: GET
+        Create:
+          Type: Api
+          Properties:
+            RestApiId: !Ref X402Api
+            Path: /x402/analyze/async
+            Method: POST
+        Status:
+          Type: Api
+          Properties:
+            RestApiId: !Ref X402Api
+            Path: /x402/jobs/{jobId}
+            Method: GET
+        Resume:
+          Type: Api
+          Properties:
+            RestApiId: !Ref X402Api
+            Path: /x402/jobs/{jobId}/resume
+            Method: POST
+
+  X402ApiAccessLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/apigateway/${AWS::StackName}"
+      RetentionInDays: 30
+
+  X402AdapterLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${X402Adapter}"
+      RetentionInDays: 30
+
+  X402Gateway5xxMetric:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref X402AdapterLogGroup
+      FilterPattern: '{ $.status >= 500 }'
+      MetricTransformations:
+        - MetricNamespace: Stockanalyst/X402Gateway
+          MetricName: SafeGateway5xx
+          MetricValue: "1"
+          DefaultValue: 0
+
+  X402WebAcl:
+    Type: AWS::WAFv2::WebACL
+    Properties:
+      Name: !Sub "${AWS::StackName}-regional"
+      Scope: REGIONAL
+      DefaultAction: {Allow: {}}
+      VisibilityConfig:
+        CloudWatchMetricsEnabled: true
+        MetricName: !Sub "${AWS::StackName}-waf"
+        SampledRequestsEnabled: false
+      Rules:
+        - Name: X402RateLimit
+          Priority: 0
+          Action: {Block: {}}
+          Statement:
+            RateBasedStatement:
+              AggregateKeyType: IP
+              Limit: !Ref RateLimitPerFiveMinutes
+              ScopeDownStatement:
+                ByteMatchStatement:
+                  FieldToMatch: {UriPath: {}}
+                  PositionalConstraint: STARTS_WITH
+                  SearchString: /x402/
+                  TextTransformations:
+                    - Priority: 0
+                      Type: NONE
+          VisibilityConfig:
+            CloudWatchMetricsEnabled: true
+            MetricName: x402-rate-limit
+            SampledRequestsEnabled: false
+        - Name: RejectOversizedBody
+          Priority: 1
+          Action: {Block: {}}
+          Statement:
+            SizeConstraintStatement:
+              ComparisonOperator: GT
+              Size: 262144
+              FieldToMatch:
+                Body:
+                  OversizeHandling: MATCH
+              TextTransformations:
+                - Priority: 0
+                  Type: NONE
+          VisibilityConfig:
+            CloudWatchMetricsEnabled: true
+            MetricName: x402-body-size
+            SampledRequestsEnabled: false
+        - Name: AwsCommonRulesObserveOnly
+          Priority: 2
+          OverrideAction: {Count: {}}
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesCommonRuleSet
+          VisibilityConfig:
+            CloudWatchMetricsEnabled: true
+            MetricName: x402-common-rules-count
+            SampledRequestsEnabled: false
+
+  X402WebAclAssociation:
+    Type: AWS::WAFv2::WebACLAssociation
+    DependsOn: X402ApiStage
+    Properties:
+      ResourceArn: !Sub
+        - "arn:${AWS::Partition}:apigateway:${AWS::Region}::/restapis/${ApiId}/stages/${Stage}"
+        - ApiId: !Ref X402Api
+          Stage: !Ref StageName
+      WebACLArn: !GetAtt X402WebAcl.Arn
+
+  X402LambdaErrors:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-lambda-errors"
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref X402Adapter
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+
+  X402LambdaThrottles:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-lambda-throttles"
+      Namespace: AWS/Lambda
+      MetricName: Throttles
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref X402Adapter
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+
+  X402ApiServerErrors:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-api-5xx"
+      Namespace: AWS/ApiGateway
+      MetricName: 5XXError
+      Dimensions:
+        - Name: ApiName
+          Value: !Sub "${AWS::StackName}-api"
+        - Name: Stage
+          Value: !Ref StageName
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+
+Outputs:
+  X402GatewayBaseUrl:
+    Value: !Sub
+      "https://${X402Api}.execute-api.${AWS::Region}.${AWS::URLSuffix}/${StageName}"
