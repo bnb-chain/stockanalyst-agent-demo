@@ -72,6 +72,8 @@ import json
 import logging
 import os
 import time
+from dataclasses import dataclass
+from typing import Any
 
 from eth_account import Account
 
@@ -99,19 +101,27 @@ PRICE_WEI           = 10**18         # 1.0 U
 MIN_PRICE_WEI       = 5 * 10**17    # 0.5 U
 CHAIN_ID            = 97            # BSC Testnet
 
+
+@dataclass(frozen=True)
+class VerifiedPayment:
+    proof: dict[str, Any]
+    from_address: str
+    to_address: str
+    value: int
+    valid_after: int
+    valid_before: int
+    nonce: str
+    nonce_bytes: bytes
+
 # U token EIP-712 domain — set env vars if the deployed contract differs.
 # Verify via: cast call <U_TOKEN> "name()" --rpc-url $BSC_TESTNET_RPC
 _TOKEN_DOMAIN_NAME    = os.environ.get("U_TOKEN_DOMAIN_NAME",    "U")
 _TOKEN_DOMAIN_VERSION = os.environ.get("U_TOKEN_DOMAIN_VERSION", "1")
 
-# ── Replay protection ─────────────────────────────────────────────────────────
-# Nonces are stored in-memory: they are lost on process restart and NOT shared
-# across replicas.  Mitigations in this implementation:
-#   1. validBefore TTL is capped at now+3600 (1 h max window), so a replayed
-#      nonce can only be accepted within 1 hour of the original signature.
-#   2. The Binance Pay facilitator (when configured) submits the authorization
-#      on-chain; the EIP-3009 contract nullifies the nonce permanently, making
-#      the in-process set a fast-path cache only.
+# ── Free-tier replay protection ────────────────────────────────────────────────
+# Zero-value free-tier nonces are stored in-memory: they are lost on restart and
+# NOT shared across replicas. Paid async jobs use durable job identity plus the
+# on-chain EIP-3009 authorization state instead of this set.
 #
 # For production without a facilitator, replace with an atomic Redis set:
 #   redis.set(nonce_key, 1, ex=3600, nx=True)  →  False means already used
@@ -120,9 +130,9 @@ _used_nonces: set[str] = set()
 
 if True:  # always — warn operators about the in-memory limitation at startup
     _log.warning(
-        "x402: nonce replay protection is IN-MEMORY only — nonces are lost on "
-        "restart and not shared across replicas. Set X402_FACILITATOR_URL (on-chain "
-        "nullifier) or use Redis for durable replay protection in production."
+        "x402 free-tier replay protection is IN-MEMORY only — free-tier nonces "
+        "are lost on restart and not shared across replicas. Use Redis for "
+        "durable free-tier replay protection in production."
     )
 
 
@@ -210,92 +220,105 @@ def build_payment_challenge(symbols: list[str], host: str = "localhost:9000") ->
             }
         ],
         "error":    "Payment Required",
-        "resource": f"http://{host}/x402/analyze",
+        "resource": f"http://{host}/x402/analyze/async",
     }
 
 
-def verify_payment_proof(proof_header: str) -> tuple[bool, str]:
-    """Verify an x402 v2 EIP-712 payment proof (local signature check only).
+def validate_payment_proof(
+    proof_header: str,
+    *,
+    now: int | None = None,
+    allow_expired: bool = False,
+) -> tuple[VerifiedPayment | None, str]:
+    """Validate a proof without consuming its nonce.
 
-    Does NOT call the facilitator — that is done asynchronously by the handler.
-    Returns (True, "") on success, (False, human-readable reason) on failure.
+    ``allow_expired`` is only for locating an existing recovery record. It
+    bypasses the wall-clock expiry rejection but preserves every other
+    semantic, domain, and cryptographic check.
     """
-    # ── Decode ─────────────────────────────────────────────────────────────────
     try:
-        raw   = base64.b64decode(proof_header.strip())
-        proof = json.loads(raw)
+        proof = json.loads(base64.b64decode(proof_header.strip()))
     except Exception:
-        return False, "X-Payment is not valid base64 JSON"
+        return None, "X-Payment is not valid base64 JSON"
 
-    # ── x402 version / scheme / network ───────────────────────────────────────
     if proof.get("x402Version") != 2:
-        return False, f"unsupported x402Version: {proof.get('x402Version')!r} (expected 2)"
+        return None, (
+            f"unsupported x402Version: {proof.get('x402Version')!r} "
+            "(expected 2)"
+        )
     if proof.get("scheme", "exact") != "exact":
-        return False, f"unsupported scheme: {proof.get('scheme')!r}"
+        return None, f"unsupported scheme: {proof.get('scheme')!r}"
     network = proof.get("network", f"eip155:{CHAIN_ID}")
     if network != f"eip155:{CHAIN_ID}":
-        return False, f"wrong network: {network!r} (expected eip155:{CHAIN_ID})"
+        return None, f"wrong network: {network!r} (expected eip155:{CHAIN_ID})"
 
     payload = proof.get("payload") or {}
-    auth    = payload.get("authorization") or {}
-    sig     = str(payload.get("signature") or "")
-
-    # ── Authorization field validation ─────────────────────────────────────────
-    from_addr    = str(auth.get("from",        "")).lower()
-    to_addr      = str(auth.get("to",          "")).lower()
-    value_raw    = str(auth.get("value",       "0"))
-    valid_after  = int(auth.get("validAfter",  0))
-    valid_before = int(auth.get("validBefore", 0))
-    nonce_hex    = str(auth.get("nonce", "0x" + "00" * 32))
-
-    if not from_addr.startswith("0x") or len(from_addr) != 42:
-        return False, f"invalid from address: {from_addr!r}"
-    if to_addr != SELLER_WALLET.lower():
-        return False, f"wrong recipient: {to_addr!r} (expected {SELLER_WALLET.lower()!r})"
+    auth = payload.get("authorization") or {}
+    signature = str(payload.get("signature") or "")
+    from_address = str(auth.get("from", "")).lower()
+    to_address = str(auth.get("to", "")).lower()
+    value_raw = str(auth.get("value", "0"))
     try:
         value = int(value_raw)
-    except (ValueError, TypeError):
-        return False, f"invalid value: {value_raw!r}"
+        valid_after = int(auth.get("validAfter", 0))
+        valid_before = int(auth.get("validBefore", 0))
+        nonce_bytes = bytes.fromhex(
+            str(auth.get("nonce", "")).removeprefix("0x").zfill(64)
+        )
+    except (TypeError, ValueError, OverflowError):
+        return None, "authorization contains invalid numeric or nonce fields"
+
+    nonce = "0x" + nonce_bytes.hex()
+    current_time = int(time.time()) if now is None else int(now)
+    if not from_address.startswith("0x") or len(from_address) != 42:
+        return None, f"invalid from address: {from_address!r}"
+    if to_address != SELLER_WALLET.lower():
+        return None, f"wrong recipient: {to_address!r}"
     if value < MIN_PRICE_WEI:
-        return False, f"value {value / 1e18:.3f} U < minimum {MIN_PRICE_WEI / 1e18:.3f} U"
+        return None, (
+            f"value {value / 1e18:.3f} U < minimum "
+            f"{MIN_PRICE_WEI / 1e18:.3f} U"
+        )
+    if len(nonce_bytes) != 32:
+        return None, "nonce must be bytes32"
+    if current_time < valid_after:
+        return None, "authorization not yet valid"
+    if current_time >= valid_before and not allow_expired:
+        return None, "authorization expired"
+    if valid_before - current_time > 3600:
+        return None, "authorization valid for more than 1 hour from now"
+    if not signature.startswith("0x"):
+        return None, "signature must be a 0x-prefixed hex string"
 
-    now = int(time.time())
-    if now < valid_after:
-        return False, "authorization not yet valid"
-    if now > valid_before:
-        return False, "authorization expired"
-    if valid_before - now > 3600:
-        return False, "authorization valid for more than 1 hour from now"
-    if not sig.startswith("0x"):
-        return False, "signature must be a 0x-prefixed hex string"
-
-    # ── Replay protection ──────────────────────────────────────────────────────
-    nonce_key = f"{from_addr}:{nonce_hex}"
-    if nonce_key in _used_nonces:
-        return False, "nonce already used (replay blocked)"
-
-    # ── EIP-712 signature verification ─────────────────────────────────────────
     try:
-        nonce_bytes = bytes.fromhex(nonce_hex.removeprefix("0x").zfill(64))
-        digest      = _eip712_digest(
-            from_addr, to_addr, value, valid_after, valid_before, nonce_bytes,
+        digest = _eip712_digest(
+            from_address,
+            to_address,
+            value,
+            valid_after,
+            valid_before,
+            nonce_bytes,
         )
-        recovered = Account._recover_hash(digest, signature=sig)
+        recovered = Account._recover_hash(digest, signature=signature)
     except Exception as exc:
-        return False, f"EIP-712 verification error: {exc}"
+        return None, f"EIP-712 verification error: {exc}"
 
-    if recovered.lower() != from_addr:
-        return False, (
-            f"signature mismatch: recovered {recovered.lower()!r} ≠ from {from_addr!r}"
-        )
+    if recovered.lower() != from_address:
+        return None, "signature mismatch"
 
-    # ── Accept — mark nonce used ────────────────────────────────────────────────
-    _used_nonces.add(nonce_key)
-    _log.info(
-        "x402 payment accepted: from=%s value=%.3f U nonce=%s",
-        from_addr, value / 1e18, nonce_hex,
+    return (
+        VerifiedPayment(
+            proof=proof,
+            from_address=from_address,
+            to_address=to_address,
+            value=value,
+            valid_after=valid_after,
+            valid_before=valid_before,
+            nonce=nonce,
+            nonce_bytes=nonce_bytes,
+        ),
+        "",
     )
-    return True, ""
 
 
 # ── Free tier ──────────────────────────────────────────────────────────────────
@@ -389,7 +412,10 @@ def verify_free_payment_proof(proof_header: str) -> tuple[bool, str, str]:
     except (ValueError, TypeError):
         return False, f"invalid value: {value_raw!r}", from_addr
     if value != 0:
-        return False, f"free tier requires value=0 (got {value / 1e18:.3f} U); use /x402/analyze for paid analysis", from_addr
+        return False, (
+            f"free tier requires value=0 (got {value / 1e18:.3f} U); "
+            "use /x402/analyze/async for paid analysis"
+        ), from_addr
 
     now = int(time.time())
     if now < valid_after:

@@ -74,5 +74,7 @@ known-first-party = [
     "untrusted_text",
     "uomp_storage",
     "x402_handler",
+    "x402_job_service",
+    "x402_job_store",
     "x402_verify",
 ]

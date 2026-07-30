@@ -23,11 +23,15 @@ default = "bsc-testnet"
 # (auto-reclaimed at 48h), not a production seller. `bag deploy` dispatches
 # on this; it records [deploy.platform] (slug/deployment_id/invoke_url)
 # post-deploy. Absent ⇒ self (deploy to your own cloud via [stack].runtime).
-destination = "platform"
+destination = "self"
 # Artifact channel: 'zip' (evm-local default — managed runtime, no Docker)
 # or 'container' (local Docker build → brokered ECR; forced for twak).
 platform_artifact = "zip"
 packaging = "zip"
+iam_notice_accepted_at = "2026-07-29T08:12:28Z"
+iam_notice_version = 1
+last_deploy_at = "2026-07-29T08:22:03Z"
+runtime_arn = "arn:aws:bedrock-agentcore:us-east-1:201243086760:runtime/stockanalyst_stockanalyst-hrXlh1BUtQ"
 
 [wallet]
 # Local keystore signer. The Agent is the SOLE key-holder/signer.
@@ -41,9 +45,9 @@ address = "0x1FF095E1C5Cf4bC72a3DC54be17B6cf85043Fb67"
 platform_exposed_addresses = ["0x1FF095E1C5Cf4bC72a3DC54be17B6cf85043Fb67"]
 
 [llm]
-provider = "openai"
-model = "kimi-k2.6"
-base_url = "https://api.moonshot.cn/v1"
+provider = "openrouter"
+model = "moonshotai/kimi-k2.6"
+base_url = "https://openrouter.ai/api/v1"
 
 [llm.pieverse]
 # Pieverse topup runs ONLY on BSC mainnet (chainId=56); decoupled from [network].default.
@@ -98,16 +102,16 @@ allowed_hosts = ["llm.pieverse.io"]
 
 [payments.x402.seller]
 # x402 / Binance Pay seller channel — alternative to ERC-8183 for lower-friction
-# payments. Exposes /x402/analyze as an SSE endpoint; buyers pay with a signed
-# EIP-191 authorization (produced by Binance Pay facilitator or any web3 wallet).
+# payments. Exposes durable asynchronous jobs; buyers pay with a signed EIP-3009
+# authorization and poll with a private job token.
 # Payment verification is FIXED CODE in x402_verify.py — never LLM-callable.
 enabled = true
 price_wei = "1000000000000000000"      # 1.0 U (same as [payments.erc8183].price)
 min_price_wei = "500000000000000000"   # 0.5 U floor (same as [payments.erc8183].min_price)
-endpoint = "/x402/analyze"
+endpoint = "/x402/analyze/async"
 # Price info:  GET /x402/price
-# Challenge:   GET /x402/analyze?symbols=AAPL
-# Delivery:    POST /x402/analyze  (X-Payment: <base64 proof>)  → SSE stream
+# Create:      POST /x402/analyze/async  (X-Payment: <base64 proof>) → 202
+# Poll:        GET /x402/jobs/{jobId}    (X-Job-Token: <private token>)
 
 # ── Dual-port deployment (platform-side) ──────────────────────────────────────
 # When `bag deploy` reads port + public = true, it:
@@ -145,6 +149,29 @@ public = true
 # COMPETITION_AI_CALLS_URL is the complete backend API URL, including its path.
 #   bag env set COMPETITION_AI_CALLS_URL https://<backend>/<api-path>
 #   bag env set COMPETITION_INTERNAL_TOKEN <internal-token>
+
+# ── Asynchronous x402 reports (optional; all required together) ─────────────
+# At expiresAt, authenticated polling stops and the API issues or renews no
+# download URLs. A URL minted beforehand remains independently usable until its
+# own expiry, at most 30 minutes. S3 Lifecycle marks each object eligible for
+# asynchronous AWS-controlled expiration seven days after its LastModified; it
+# is not an exact physical-deletion deadline. Use a dedicated private bucket
+# that has never had Versioning enabled; bucket reuse is unsupported here.
+# Grant only s3:GetObject and s3:PutObject on the configured x402-jobs/* prefix.
+# Full public-access-block, Lifecycle, IAM, verification, and rollback commands:
+#   ../../README.md#configure-private-storage-for-asynchronous-x402-jobs
+#   export X402_JOB_S3_BUCKET='replace-with-private-bucket-name'
+#   bag env set X402_JOB_S3_BUCKET "$X402_JOB_S3_BUCKET"
+#   bag env set X402_JOB_S3_PREFIX x402-jobs
+#   export X402_JOB_TOKEN_SECRET="$(openssl rand -hex 32)"
+#   bag env set X402_JOB_TOKEN_SECRET "$X402_JOB_TOKEN_SECRET"
+#   bag env set X402_ASYNC_ACCEPT_NEW_JOBS 1
+#
+# To stop accepting new jobs while preserving query/resume/download for paid
+# jobs, set X402_ASYNC_ACCEPT_NEW_JOBS=0 and redeploy. Keep the bucket, prefix
+# access, and token secret through the latest job's expiresAt plus 30 minutes.
+#   bag env set X402_ASYNC_ACCEPT_NEW_JOBS 0
+#   bag deploy agent --force-deploy-broken-storage
 
 [deploy.platform]
 terms_accepted_at = "2026-07-16T15:01:53Z"

@@ -1,7 +1,7 @@
 # Agent Demo — ERC-8183 + x402 + UOMP
 
 [![ERC-8183](https://img.shields.io/badge/Protocol-ERC--8183-blue)](https://github.com/bnb-chain/BEPs)
-[![x402](https://img.shields.io/badge/Payment-x402%20v2-orange)](buyer-client/src/x402.ts)
+[![x402](https://img.shields.io/badge/Payment-x402%20v2-orange)](buyer-client/src/x402-async.ts)
 [![UOMP](https://img.shields.io/badge/Context-UOMP-purple)](https://github.com/0xaicrypto/uomp-core)
 [![Network](https://img.shields.io/badge/Network-BSC%20Testnet-yellow)](https://testnet.bscscan.com)
 [![Python](https://img.shields.io/badge/Seller-Python%203.12-3776AB?logo=python)](stockanalyst/)
@@ -17,10 +17,10 @@ Three ways to pay — pick the one that fits your use case:
 | Tier | Command | Cost | Settlement | Speed |
 |------|---------|------|------------|-------|
 | **Free** quick quote | `npm run x402:free` | 0 U | none (identity proof only) | ~1s |
-| **Paid** full analysis via x402 | `npm run x402` | 1.0 U | Binance Pay facilitator | 40–120s SSE |
+| **Paid** full analysis via x402 | `npm run x402:async` | 1.0 U | Binance Pay facilitator | async job |
 | **Paid** full analysis via ERC-8183 | `npm run dev` | 1.0 U | on-chain escrow (trustless) | 5–15 min |
 
-- **Seller** (`stockanalyst/`) — stock analysis agent deployed on BNB Chain platform; serves both x402 (public SSE endpoint, EIP-712 EIP-3009) and ERC-8183 (on-chain escrow, A2A + Cognito) in parallel. LLM: **kimi-k2.6** with extended thinking.
+- **Seller** (`stockanalyst/`) — stock analysis agent deployed on BNB Chain platform; serves both x402 (durable private jobs, EIP-712 EIP-3009) and ERC-8183 (on-chain escrow, A2A + Cognito) in parallel. LLM: **kimi-k2.6** with extended thinking.
 - **Buyer** (`buyer-client/`) — TypeScript client that reads the user's portfolio and cost basis from a local UOMP Guard and supports all three payment tiers.
 
 ## Architecture
@@ -42,10 +42,11 @@ Three ways to pay — pick the one that fits your use case:
         │    POST /x402/free                   fetch_quote() — no LLM
         │◄── SSE: quick quote table ──────────                  (~1s)
         │
-        ├─── x402 paid tier ──────────────► seller agent  :9000 / :9001 (platform)
+        ├─── x402 paid async ─────────────► seller agent  :9000 / :9001 (platform)
         │    sign 1-U EIP-712 proof         └─ verify + Binance Pay facilitator
-        │    POST /x402/analyze                kimi-k2.6 extended thinking
-        │◄── SSE: full report ─────────────                     (~40–120s)
+        │    POST /x402/analyze/async          kimi-k2.6 background analysis
+        │◄── jobId + private token ────────
+        │    poll status → presigned URL ──► private S3 report
         │
         ├─[2]─ A2A negotiate ─────────────► seller agent (BNB Chain Platform :9000)
         │      OAuth2 token                  └─ sign quote → 1.0 U
@@ -80,7 +81,7 @@ Three ways to pay — pick the one that fits your use case:
 | On-chain settlement | none | Binance Pay facilitator | escrow contract (trustless) |
 | Report | quick quote table | full analysis | full analysis |
 | LLM | none (yfinance only) | kimi-k2.6 | kimi-k2.6 |
-| Time | ~1s | 40–120s | 5–15 min |
+| Time | ~1s | asynchronous | 5–15 min |
 | Rate limit | 10/24h per wallet | none | none |
 
 ## Quick start
@@ -96,8 +97,8 @@ node guard-mock.mjs
 # Terminal 3 — buyer (pick one)
 cd buyer-client
 SYMBOL=AAPL npm run x402:free    # free: 0 U, quick quote, ~1s
-npm run x402                      # paid: 1 U, full analysis, SSE stream
-npm run dev                       # paid: 1 U, full analysis, ERC-8183 trustless
+npm run x402:async               # paid: 1 U, durable async analysis
+npm run dev                      # paid: 1 U, full analysis, ERC-8183 trustless
 ```
 
 ## ERC-8183 E2E test flow
@@ -190,7 +191,7 @@ node guard-mock.mjs
 cd buyer-client
 
 SYMBOL=AAPL npm run x402:free   # free: 0 U, quick quote, ~1s, no LLM
-npm run x402                     # paid: 1 U, full analysis, SSE stream (~40–120s)
+npm run x402:async              # paid: 1 U, durable async analysis
 npm run dev                      # paid: 1 U, full analysis, ERC-8183 trustless (~5–15min)
 ```
 
@@ -207,7 +208,7 @@ agent-demo/
 ├── stockanalyst/           Seller agent
 │   ├── app/agent/
 │   │   ├── main.py         A2A entrypoint + x402 dual-port mode
-│   │   ├── x402_handler.py x402 routes: /price  /analyze  /free
+│   │   ├── x402_handler.py x402 routes: /price  /analyze/async  /jobs  /free
 │   │   ├── x402_verify.py  EIP-712 EIP-3009 verification (FIXED code, never LLM)
 │   │   ├── seller_core.py  ERC-8183 negotiate / notify_funded / fulfill
 │   │   ├── signing.py      Deterministic signing (never LLM tools)
@@ -217,7 +218,7 @@ agent-demo/
 └── buyer-client/           TypeScript buyer client
     ├── src/
     │   ├── x402free.ts     Free tier buyer  (npm run x402:free)
-    │   ├── x402.ts         Paid x402 buyer  (npm run x402)
+    │   ├── x402-async.ts   Paid x402 buyer  (npm run x402:async)
     │   ├── index.ts        ERC-8183 buyer   (npm run dev)
     │   ├── uomp.ts         UOMP memory layer
     │   ├── gateway.ts      Cloudflare Tunnel relay

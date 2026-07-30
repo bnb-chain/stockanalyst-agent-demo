@@ -234,6 +234,182 @@ bag deploy agent --force-deploy-broken-storage
 
 After deploy, `studio.toml` records `[deploy.platform]` with `agent_id` and `invoke_url`. Create an OAuth2 client from the platform console to get `client_id` and `client_secret`.
 
+### Configure private storage for asynchronous x402 jobs
+
+The asynchronous endpoint stores job state and personalized reports in S3.
+At the job's `expiresAt` timestamp, seven days after creation, authenticated
+polling stops and the API no longer issues or renews download URLs. A presigned
+URL minted before `expiresAt` remains independently usable until its own
+expiration, for at most 30 minutes. S3 Lifecycle separately marks each object
+eligible for expiration seven days after that object's `LastModified`
+timestamp; actual physical deletion is asynchronous and scheduled by AWS. This
+supported runbook requires a dedicated private x402 job bucket that has never
+had S3 Versioning enabled.
+
+Set operator-local variables without committing their values:
+
+```bash
+export AWS_REGION='us-east-1'
+export X402_JOB_S3_BUCKET='replace-with-private-bucket-name'
+export AGENTCORE_RUNTIME_ROLE_NAME='replace-with-runtime-role-name'
+export X402_JOB_TOKEN_SECRET="$(openssl rand -hex 32)"
+```
+
+The last command places only the generator expression in shell history. Its
+result is 64 hexadecimal characters representing 32 random bytes of entropy.
+Do not echo the value or run these commands with shell tracing enabled.
+
+Block every form of public access:
+
+```bash
+aws s3api put-public-access-block \
+  --bucket "$X402_JOB_S3_BUCKET" \
+  --public-access-block-configuration \
+  BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true
+```
+
+Verify that Versioning has never been enabled:
+
+```bash
+aws s3api get-bucket-versioning --bucket "$X402_JOB_S3_BUCKET"
+```
+
+Continue only when the response has no `Status` field (normally `{}`). Both
+`Enabled` and `Suspended` are rejected: suspension does not remove existing
+versions. With the rule below, a versioned current object may first become
+noncurrent after seven days and then remain for roughly another seven days;
+delete markers can also remain. That does not meet this runbook's retention
+intent.
+
+Create the Lifecycle file through `mktemp`, which places it outside the
+repository, with exactly:
+
+```bash
+export X402_JOB_LIFECYCLE_FILE="$(mktemp "${TMPDIR:-/tmp}/x402-job-lifecycle.json.XXXXXX")"
+cat > "$X402_JOB_LIFECYCLE_FILE" <<'JSON'
+{
+  "Rules": [{
+    "ID": "ExpireX402JobsAfterSevenDays",
+    "Status": "Enabled",
+    "Filter": { "Prefix": "x402-jobs/" },
+    "Expiration": { "Days": 7 },
+    "NoncurrentVersionExpiration": { "NoncurrentDays": 7 }
+  }]
+}
+JSON
+```
+
+`put-bucket-lifecycle-configuration` replaces the bucket's complete Lifecycle
+ruleset. For the required dedicated bucket, first confirm that no unrelated
+rules exist, then apply and verify the seven-day eligibility rule:
+
+```bash
+aws s3api get-bucket-lifecycle-configuration \
+  --bucket "$X402_JOB_S3_BUCKET"
+
+aws s3api put-bucket-lifecycle-configuration \
+  --bucket "$X402_JOB_S3_BUCKET" \
+  --lifecycle-configuration "file://$X402_JOB_LIFECYCLE_FILE"
+
+aws s3api get-public-access-block --bucket "$X402_JOB_S3_BUCKET"
+aws s3api get-bucket-lifecycle-configuration --bucket "$X402_JOB_S3_BUCKET"
+```
+
+`NoSuchLifecycleConfiguration` from the first command is the expected result
+for a new dedicated bucket.
+
+Whether the apply/verification commands succeed or fail, remove the temporary
+file and variable:
+
+```bash
+rm -f -- "$X402_JOB_LIFECYCLE_FILE"
+unset X402_JOB_LIFECYCLE_FILE
+```
+
+Bucket reuse is unsupported by these commands. Any exception requires a
+separately reviewed custom bucket policy, CloudFront exposure analysis,
+Versioning-aware Lifecycle design, and non-destructive ruleset update.
+
+Grant the AgentCore runtime role only object read/write access to this prefix.
+Create its policy file outside the repository:
+
+```bash
+export X402_JOB_IAM_POLICY_FILE="$(mktemp "${TMPDIR:-/tmp}/x402-job-iam-policy.json.XXXXXX")"
+cat > "$X402_JOB_IAM_POLICY_FILE" <<JSON
+{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Sid": "X402PrivateJobs",
+    "Effect": "Allow",
+    "Action": ["s3:GetObject", "s3:PutObject"],
+    "Resource": "arn:aws:s3:::${X402_JOB_S3_BUCKET}/x402-jobs/*"
+  }]
+}
+JSON
+```
+
+Attach and inspect the scoped inline policy:
+
+```bash
+aws iam put-role-policy \
+  --role-name "$AGENTCORE_RUNTIME_ROLE_NAME" \
+  --policy-name X402PrivateJobs \
+  --policy-document "file://$X402_JOB_IAM_POLICY_FILE"
+
+aws iam get-role-policy \
+  --role-name "$AGENTCORE_RUNTIME_ROLE_NAME" \
+  --policy-name X402PrivateJobs
+```
+
+Whether the IAM commands succeed or fail, remove the temporary file and
+variable:
+
+```bash
+rm -f -- "$X402_JOB_IAM_POLICY_FILE"
+unset X402_JOB_IAM_POLICY_FILE
+```
+
+Do not grant `s3:*`, bucket-wide object access, public-read ACLs, or wallet
+permissions. Install the runtime settings through `bag`; do not put the token
+secret in source, `studio.toml`, logs, or shell history:
+
+```bash
+cd stockanalyst/app/agent
+bag env set X402_JOB_S3_BUCKET "$X402_JOB_S3_BUCKET"
+bag env set X402_JOB_S3_PREFIX x402-jobs
+bag env set X402_JOB_TOKEN_SECRET "$X402_JOB_TOKEN_SECRET"
+bag env set X402_ASYNC_ACCEPT_NEW_JOBS 1
+bag deploy agent --force-deploy-broken-storage
+bag deploy info
+```
+
+This repository's existing deployment procedure uses the explicit `agent`
+target and `--force-deploy-broken-storage` storage workaround; use that
+repository-verified form for rollout and rollback.
+
+After deployment, verify async create, authenticated polling, report download,
+and resume. A successful job must return only a
+private presigned URL valid for at most 30 minutes. Confirm that polling at
+`expiresAt` returns expiry and cannot issue or renew a URL, while a URL minted
+before `expiresAt` remains independently usable only until that URL's own
+expiration. Confirm logs contain stable job IDs and error codes, but no payment
+proof, job token, portfolio, S3 key, or presigned URL.
+
+To pause or roll back creation without cutting off access to already-paid jobs:
+
+```bash
+cd stockanalyst/app/agent
+bag env set X402_ASYNC_ACCEPT_NEW_JOBS 0
+bag deploy agent --force-deploy-broken-storage
+```
+
+Keep the bucket, IAM prefix access, and `X402_JOB_TOKEN_SECRET` available
+through the latest outstanding job's `expiresAt` plus 30 minutes. Polling and
+URL issuance stop at `expiresAt`; the additional window preserves only
+presigned URLs minted beforehand until their independent expiration. Do not
+delete those resources as part of the creation rollback. Lifecycle deletion may
+occur later because AWS expiration processing is asynchronous.
+
 ### Configure optional API keys
 
 Add to `stockanalyst/.studio/.env.local` for richer analysis (agent works without them):
@@ -569,6 +745,169 @@ bag deploy agent --force-deploy-broken-storage
 ```
 
 部署完成后，`studio.toml` 记录 `[deploy.platform]`，包含 `agent_id` 和 `invoke_url`。从平台控制台创建 OAuth2 客户端，获取 `client_id` 和 `client_secret`。
+
+### 为异步 x402 任务配置私有存储
+
+异步接口把任务状态和个性化报告保存在 S3。任务创建 7 天到达 `expiresAt` 后，
+鉴权轮询停止，API 不再签发或续签下载 URL。`expiresAt` 之前已经签发的 presigned
+URL 仍可独立使用到其自身过期时间，最长 30 分钟。S3 Lifecycle 则按各对象的
+`LastModified` 时间计算，满 7 天后仅将对象标记为可过期；实际物理删除由 AWS
+异步调度。本操作手册只支持一个从未启用 S3 Versioning 的独立私有 x402 任务
+bucket。
+
+先在操作者本地设置变量，不要提交真实值：
+
+```bash
+export AWS_REGION='us-east-1'
+export X402_JOB_S3_BUCKET='replace-with-private-bucket-name'
+export AGENTCORE_RUNTIME_ROLE_NAME='replace-with-runtime-role-name'
+export X402_JOB_TOKEN_SECRET="$(openssl rand -hex 32)"
+```
+
+最后一条命令写入 shell 历史的只有生成表达式；结果是 64 个十六进制字符，包含
+32 个随机字节的熵。不要输出该值，也不要在开启 shell tracing 时执行这些命令。
+
+彻底阻止公开访问：
+
+```bash
+aws s3api put-public-access-block \
+  --bucket "$X402_JOB_S3_BUCKET" \
+  --public-access-block-configuration \
+  BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true
+```
+
+确认该 bucket 从未启用 Versioning：
+
+```bash
+aws s3api get-bucket-versioning --bucket "$X402_JOB_S3_BUCKET"
+```
+
+只有响应没有 `Status` 字段（通常为 `{}`）时才可继续。`Enabled` 和 `Suspended`
+都不符合要求：暂停 Versioning 不会删除历史版本。使用下方规则时，启用版本控制
+的当前对象可能在 7 天后才转成 noncurrent，再保留约 7 天，且 delete marker 也
+可能继续存在，因此不符合本操作手册的保留策略目标。
+
+通过 `mktemp` 在仓库外创建 Lifecycle 文件，内容必须为：
+
+```bash
+export X402_JOB_LIFECYCLE_FILE="$(mktemp "${TMPDIR:-/tmp}/x402-job-lifecycle.json.XXXXXX")"
+cat > "$X402_JOB_LIFECYCLE_FILE" <<'JSON'
+{
+  "Rules": [{
+    "ID": "ExpireX402JobsAfterSevenDays",
+    "Status": "Enabled",
+    "Filter": { "Prefix": "x402-jobs/" },
+    "Expiration": { "Days": 7 },
+    "NoncurrentVersionExpiration": { "NoncurrentDays": 7 }
+  }]
+}
+JSON
+```
+
+`put-bucket-lifecycle-configuration` 会替换 bucket 的完整 Lifecycle 规则集。
+对于要求使用的独立 bucket，先确认不存在无关规则，再应用并核验 7 天可过期
+规则：
+
+```bash
+aws s3api get-bucket-lifecycle-configuration \
+  --bucket "$X402_JOB_S3_BUCKET"
+
+aws s3api put-bucket-lifecycle-configuration \
+  --bucket "$X402_JOB_S3_BUCKET" \
+  --lifecycle-configuration "file://$X402_JOB_LIFECYCLE_FILE"
+
+aws s3api get-public-access-block --bucket "$X402_JOB_S3_BUCKET"
+aws s3api get-bucket-lifecycle-configuration --bucket "$X402_JOB_S3_BUCKET"
+```
+
+对于新建的独立 bucket，第一条命令返回 `NoSuchLifecycleConfiguration` 是预期
+结果。
+
+无论应用和核验命令成功还是失败，都应删除临时文件和变量：
+
+```bash
+rm -f -- "$X402_JOB_LIFECYCLE_FILE"
+unset X402_JOB_LIFECYCLE_FILE
+```
+
+这些命令不支持复用 bucket。任何例外都必须单独评审自定义 bucket policy、
+CloudFront 暴露面、Versioning 感知的 Lifecycle 设计和不会覆盖现有规则的更新
+流程。
+
+AgentCore runtime role 只能获得该前缀下对象的读写权限。在仓库外创建策略
+文件：
+
+```bash
+export X402_JOB_IAM_POLICY_FILE="$(mktemp "${TMPDIR:-/tmp}/x402-job-iam-policy.json.XXXXXX")"
+cat > "$X402_JOB_IAM_POLICY_FILE" <<JSON
+{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Sid": "X402PrivateJobs",
+    "Effect": "Allow",
+    "Action": ["s3:GetObject", "s3:PutObject"],
+    "Resource": "arn:aws:s3:::${X402_JOB_S3_BUCKET}/x402-jobs/*"
+  }]
+}
+JSON
+```
+
+绑定并检查最小权限策略：
+
+```bash
+aws iam put-role-policy \
+  --role-name "$AGENTCORE_RUNTIME_ROLE_NAME" \
+  --policy-name X402PrivateJobs \
+  --policy-document "file://$X402_JOB_IAM_POLICY_FILE"
+
+aws iam get-role-policy \
+  --role-name "$AGENTCORE_RUNTIME_ROLE_NAME" \
+  --policy-name X402PrivateJobs
+```
+
+无论 IAM 命令成功还是失败，都应删除临时文件和变量：
+
+```bash
+rm -f -- "$X402_JOB_IAM_POLICY_FILE"
+unset X402_JOB_IAM_POLICY_FILE
+```
+
+禁止授予 `s3:*`、bucket 全范围对象访问、public-read ACL 或任何钱包权限。运行时
+配置只能通过 `bag` 注入；不得把 token secret 写入源码、`studio.toml`、日志或
+shell 历史：
+
+```bash
+cd stockanalyst/app/agent
+bag env set X402_JOB_S3_BUCKET "$X402_JOB_S3_BUCKET"
+bag env set X402_JOB_S3_PREFIX x402-jobs
+bag env set X402_JOB_TOKEN_SECRET "$X402_JOB_TOKEN_SECRET"
+bag env set X402_ASYNC_ACCEPT_NEW_JOBS 1
+bag deploy agent --force-deploy-broken-storage
+bag deploy info
+```
+
+本仓库现有部署流程使用显式 `agent` target 和
+`--force-deploy-broken-storage` 存储兼容参数；上线和回滚都应使用这一经过仓库
+验证的形式。
+
+部署后验证异步创建、鉴权轮询、报告下载和恢复流程。成功任务
+只能返回最长有效 30 分钟的私有 presigned URL。确认轮询在 `expiresAt` 时返回
+过期且不能签发或续签 URL；`expiresAt` 前已经签发的 URL 只能独立使用到该 URL
+自身的过期时间。检查日志只能出现稳定 job ID 和错误码，不得包含付款凭证、job
+token、持仓、S3 key 或 presigned URL。
+
+暂停或回滚新任务创建时，必须保留已付款任务的访问能力：
+
+```bash
+cd stockanalyst/app/agent
+bag env set X402_ASYNC_ACCEPT_NEW_JOBS 0
+bag deploy agent --force-deploy-broken-storage
+```
+
+至少保留 bucket、IAM 前缀权限和 `X402_JOB_TOKEN_SECRET` 到所有任务中最晚的
+`expiresAt` 再加 30 分钟。轮询和 URL 签发在 `expiresAt` 停止；额外窗口只用于
+保证此前签发的 presigned URL 可使用到其独立过期时间。创建入口回滚时不得删除
+这些资源。由于 AWS 异步处理过期，Lifecycle 的物理删除可能更晚发生。
 
 ### 配置可选 API Key
 
