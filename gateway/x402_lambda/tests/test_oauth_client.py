@@ -1,8 +1,8 @@
 import json
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
-from oauth_client import OAuthClient, OAuthUnavailable
+from oauth_client import OAuthClient, OAuthUnavailable, _MAX_TOKEN_RESPONSE_BYTES, default_token_transport
 
 
 def secret_json(**overrides):
@@ -79,3 +79,35 @@ class OAuthClientTests(unittest.TestCase):
             client.authorization_header()
         self.assertEqual(str(captured.exception), "oauth_token_unavailable")
         self.assertNotIn("token-secret-body", str(captured.exception))
+
+    def test_rejects_oversized_token_response_before_json_parse(self):
+        client = OAuthClient(
+            Mock(return_value=secret_json()),
+            TokenTransport([{"status": 200, "headers": {"content-type": "application/json"}, "body": b"x" * (_MAX_TOKEN_RESPONSE_BYTES + 1)}]),
+            clock=lambda: 0,
+        )
+        with self.assertRaisesRegex(OAuthUnavailable, "oauth_token_unavailable"):
+            client.authorization_header()
+
+    def test_default_transport_uses_bounded_token_read(self):
+        response = _ReadResponse()
+        with patch("oauth_client.urlopen", return_value=response):
+            default_token_transport(
+                url="https://auth.example.test/oauth2/token", headers={}, body=b"", timeout_seconds=1
+            )
+        self.assertEqual(response.read_size, _MAX_TOKEN_RESPONSE_BYTES + 1)
+
+
+class _ReadResponse:
+    status = 200
+    headers = {}
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+    def read(self, size):
+        self.read_size = size
+        return b"{}"

@@ -11,6 +11,9 @@ from urllib.parse import urlencode, urlsplit
 from urllib.request import Request, urlopen
 
 
+_MAX_TOKEN_RESPONSE_BYTES = 64 * 1024
+
+
 class OAuthUnavailable(RuntimeError):
     def __init__(self, code: str = "oauth_token_unavailable") -> None:
         super().__init__(code)
@@ -79,7 +82,10 @@ class OAuthClient:
             )
             status = response.get("status") if isinstance(response, Mapping) else None
             raw_body = response.get("body") if isinstance(response, Mapping) else None
-            if type(status) is not int or not 200 <= status <= 299 or not isinstance(raw_body, bytes):
+            if (
+                type(status) is not int or not 200 <= status <= 299
+                or not isinstance(raw_body, bytes) or len(raw_body) > _MAX_TOKEN_RESPONSE_BYTES
+            ):
                 raise OAuthUnavailable()
             parsed = json.loads(raw_body.decode("utf-8"))
             token = parsed.get("access_token") if isinstance(parsed, dict) else None
@@ -106,7 +112,7 @@ def default_token_transport(*, url: str, headers: Mapping[str, str], body: bytes
             return {
                 "status": response.status,
                 "headers": dict(response.headers.items()),
-                "body": response.read(),
+                "body": response.read(_MAX_TOKEN_RESPONSE_BYTES + 1),
             }
     except HTTPError as exc:
         return {"status": exc.code, "headers": dict(exc.headers.items()) if exc.headers else {}, "body": b""}

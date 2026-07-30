@@ -112,3 +112,58 @@ class HandlerTests(unittest.TestCase):
             result = handler.lambda_handler(EVENT, CONTEXT)
         self.assertEqual(result["statusCode"], 503)
         self.assertEqual(json.loads(result["body"])["errorCode"], "service_unavailable")
+
+    def test_exact_task_four_environment_names_construct_and_dispatch(self):
+        environment = {
+            "X402_PUBLIC_BASE_URL": PUBLIC_BASE,
+            "AGENTCORE_INVOKE_URL": "https://agentcore.example.test/runtime",
+            "OAUTH_SECRET_ARN": "arn:aws:secretsmanager:region:account:secret:gateway",
+        }
+        with patch("handler.OAuthClient", _ConfiguredOAuth), patch("handler.AgentCoreClient", _ConfiguredAgentCore):
+            app = handler._application_from_environment(environment, lambda arn: lambda: "secret")
+        with patch.object(handler, "_application", app):
+            result = handler.lambda_handler(EVENT, CONTEXT)
+        self.assertEqual(result["statusCode"], 200)
+
+    def test_malformed_configured_public_base_is_safe_503(self):
+        environment = {
+            "X402_PUBLIC_BASE_URL": "http://not-https.example.test",
+            "AGENTCORE_INVOKE_URL": "https://agentcore.example.test/runtime",
+            "OAUTH_SECRET_ARN": "arn:aws:secretsmanager:region:account:secret:gateway",
+        }
+        with patch.object(handler, "_application", None), patch.dict(os.environ, environment, clear=True):
+            result = handler.lambda_handler(EVENT, CONTEXT)
+        self.assertEqual(result["statusCode"], 503)
+        self.assertEqual(json.loads(result["body"])["errorCode"], "service_unavailable")
+
+    def test_log_contains_only_safe_summary_fields(self):
+        event = {**EVENT, "httpMethod": "POST", "path": "/testnet/x402/analyze/async", "body": '{"secret":"body-value"}', "headers": {"X-Payment": "payment-value", "X-Job-Token": "job-value"}}
+        app = handler.GatewayApplication(PUBLIC_BASE, FakeOAuth(), FakeAgentCore(response_envelope(status=200)))
+        with patch.object(handler, "_application", app), self.assertLogs(handler.logger, "INFO") as captured:
+            handler.lambda_handler(event, CONTEXT)
+        self.assertEqual(len(captured.records), 1)
+        message = captured.records[0].getMessage()
+        self.assertEqual(set(json.loads(message)), {"requestId", "route", "status", "outcome", "durationMilliseconds"})
+        for secret in ("payment-value", "job-value", "body-value"):
+            self.assertNotIn(secret, message)
+
+
+class _ConfiguredOAuth:
+    def __init__(self, secret_reader, transport):
+        self._secret_reader = secret_reader
+
+    def authorization_header(self):
+        return "Bearer configured-token"
+
+
+class _ConfiguredAgentCore:
+    def __init__(self, runtime_url, authorization_header, transport):
+        self.runtime_url = runtime_url
+
+    def invoke(self, envelope, *, authorization_header=None):
+        return {
+            "requestId": envelope["requestId"],
+            "status": 200,
+            "headers": {"content-type": "application/json"},
+            "bodyBase64": "e30=",
+        }

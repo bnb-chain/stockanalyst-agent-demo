@@ -41,6 +41,7 @@ _RESPONSE_HEADERS = {
 }
 _HEADER_NAME = re.compile(r"[a-z0-9-]+\Z")
 _MAX_RESPONSE_BYTES = 2 * 1024 * 1024
+_MAX_AGENTCORE_RESPONSE_BYTES = 3 * 1024 * 1024
 
 
 class AgentCoreClient:
@@ -113,10 +114,15 @@ class AgentCoreClient:
         if not 200 <= status <= 299:
             raise InvalidAgentResponse("invalid_agent_response")
         raw_body = response.get("body")
-        if not isinstance(raw_body, bytes):
+        if not isinstance(raw_body, bytes) or len(raw_body) > _MAX_AGENTCORE_RESPONSE_BYTES:
             raise InvalidAgentResponse("invalid_agent_response")
         try:
             payload = json.loads(raw_body.decode("utf-8"))
+            if (
+                not isinstance(payload, Mapping) or payload.get("jsonrpc") != "2.0"
+                or payload.get("id") != request_id
+            ):
+                raise ValueError("invalid_jsonrpc_binding")
             result = payload["result"]
             parts = result["parts"]
         except (KeyError, TypeError, ValueError, UnicodeDecodeError) as exc:
@@ -160,7 +166,11 @@ def default_agentcore_transport(*, url: str, headers: Mapping[str, str], body: b
     request = Request(url, data=body, headers=dict(headers), method="POST")
     try:
         with urlopen(request, timeout=timeout_seconds) as response:  # nosec B310: constructor validates HTTPS URL
-            return {"status": response.status, "headers": dict(response.headers.items()), "body": response.read()}
+            return {
+                "status": response.status,
+                "headers": dict(response.headers.items()),
+                "body": response.read(_MAX_AGENTCORE_RESPONSE_BYTES + 1),
+            }
     except HTTPError as exc:
         # Deliberately discard remote body; it may contain internal details or credentials.
         return {"status": exc.code, "headers": dict(exc.headers.items()) if exc.headers else {}, "body": b""}

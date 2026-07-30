@@ -1,6 +1,7 @@
 import base64
 import json
 import unittest
+from unittest.mock import patch
 
 from agentcore_client import (
     AgentCoreClient,
@@ -9,6 +10,8 @@ from agentcore_client import (
     AgentInvocationUnavailable,
     AgentInvocationUnauthorized,
     InvalidAgentResponse,
+    _MAX_AGENTCORE_RESPONSE_BYTES,
+    default_agentcore_transport,
 )
 
 
@@ -33,13 +36,13 @@ def response_envelope(*, request_id=REQUEST_ID, status=402, headers=None, body=b
     }
 
 
-def a2a_response(envelope, *, status=200):
+def a2a_response(envelope, *, status=200, jsonrpc="2.0", response_id=REQUEST_ID):
     return {
         "status": status,
         "headers": {"content-type": "application/json"},
         "body": json.dumps({
-            "jsonrpc": "2.0",
-            "id": REQUEST_ID,
+            "jsonrpc": jsonrpc,
+            "id": response_id,
             "result": {
                 "kind": "message",
                 "messageId": "agent-message-1",
@@ -98,6 +101,21 @@ class AgentCoreClientTests(unittest.TestCase):
         with self.assertRaises(InvalidAgentResponse):
             client.invoke(ENVELOPE)
 
+    def test_rejects_jsonrpc_version_or_id_not_bound_to_request(self):
+        for jsonrpc, response_id in (("1.0", REQUEST_ID), ("2.0", "different-request"), (None, REQUEST_ID)):
+            with self.subTest(jsonrpc=jsonrpc, response_id=response_id), self.assertRaises(InvalidAgentResponse):
+                AgentCoreClient(
+                    "https://agentcore.example.test/runtime", lambda: "Bearer access-token",
+                    AgentTransport(a2a_response(response_envelope(), jsonrpc=jsonrpc, response_id=response_id)),
+                ).invoke(ENVELOPE)
+
+    def test_rejects_non_object_jsonrpc_response(self):
+        with self.assertRaises(InvalidAgentResponse):
+            AgentCoreClient(
+                "https://agentcore.example.test/runtime", lambda: "Bearer access-token",
+                AgentTransport({"status": 200, "headers": {"content-type": "application/json"}, "body": b"[]"}),
+            ).invoke(ENVELOPE)
+
     def test_maps_documented_upstream_statuses_without_body(self):
         expected = {401: AgentInvocationUnauthorized, 403: AgentInvocationUnauthorized, 429: AgentInvocationRateLimited, 500: AgentInvocationUnavailable}
         for status, error_type in expected.items():
@@ -114,3 +132,33 @@ class AgentCoreClientTests(unittest.TestCase):
                 "https://agentcore.example.test/runtime", lambda: "Bearer access-token",
                 AgentTransport(error=TimeoutError()),
             ).invoke(ENVELOPE)
+
+    def test_rejects_oversized_agentcore_response_before_json_parse(self):
+        with self.assertRaises(InvalidAgentResponse):
+            AgentCoreClient(
+                "https://agentcore.example.test/runtime", lambda: "Bearer access-token",
+                AgentTransport({"status": 200, "headers": {"content-type": "application/json"}, "body": b"x" * (_MAX_AGENTCORE_RESPONSE_BYTES + 1)}),
+            ).invoke(ENVELOPE)
+
+    def test_default_transport_uses_bounded_agentcore_read(self):
+        response = _ReadResponse()
+        with patch("agentcore_client.urlopen", return_value=response):
+            default_agentcore_transport(
+                url="https://agentcore.example.test/runtime", headers={}, body=b"", timeout_seconds=1
+            )
+        self.assertEqual(response.read_size, _MAX_AGENTCORE_RESPONSE_BYTES + 1)
+
+
+class _ReadResponse:
+    status = 200
+    headers = {}
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+    def read(self, size):
+        self.read_size = size
+        return b"{}"

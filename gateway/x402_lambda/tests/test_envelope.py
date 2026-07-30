@@ -87,21 +87,62 @@ class EnvelopeTests(unittest.TestCase):
         with self.assertRaisesRegex(GatewayRequestError, "route_not_allowed"):
             build_envelope(api_event(path="/x402/jobs/not-a-job"), public_base_url=PUBLIC_BASE)
 
-    def test_rejects_forbidden_caller_headers(self):
-        for name in ("Host", "Authorization", "X-Forwarded-For", "Connection"):
-            with self.subTest(name=name), self.assertRaisesRegex(
-                GatewayRequestError, "request_header_not_allowed"
-            ):
-                build_envelope(
-                    api_event(headers={name: "attacker-value", "X-Payment": "proof"}),
-                    public_base_url=PUBLIC_BASE,
-                )
+    def test_filters_real_api_gateway_infrastructure_headers(self):
+        event = api_event(headers={
+            "Host": "api.example.test",
+            "Authorization": "Bearer caller-token",
+            "X-Forwarded-For": "198.51.100.8",
+            "X-Forwarded-Port": "443",
+            "X-Forwarded-Proto": "https",
+            "Connection": "keep-alive",
+            "Accept": "application/json",
+            "X-Payment": "proof",
+        })
+        event["multiValueHeaders"] = {
+            "Host": ["api.example.test"],
+            "X-Forwarded-For": ["198.51.100.8"],
+            "Accept": ["application/json"],
+            "X-Payment": ["proof"],
+        }
+        envelope = build_envelope(event, public_base_url=PUBLIC_BASE)
+        self.assertEqual(envelope["headers"], {"accept": "application/json", "x-payment": "proof"})
 
-    def test_rejects_forbidden_multivalue_headers(self):
+    def test_rejects_unsafe_allowlist_multivalue_headers(self):
         event = api_event(headers={"X-Payment": "proof"})
-        event["multiValueHeaders"] = {"X-Forwarded-For": ["127.0.0.1"]}
+        event["multiValueHeaders"] = {"X-Payment": ["proof", "other-proof"]}
         with self.assertRaisesRegex(GatewayRequestError, "request_header_not_allowed"):
             build_envelope(event, public_base_url=PUBLIC_BASE)
+
+    def test_rejects_crlf_in_allowlisted_header(self):
+        with self.assertRaisesRegex(GatewayRequestError, "request_header_not_allowed"):
+            build_envelope(
+                api_event(headers={"X-Payment": "proof\r\ninjected"}),
+                public_base_url=PUBLIC_BASE,
+            )
+
+    def test_all_four_published_route_pairs_and_inverse_rejections(self):
+        routes = (
+            ("GET", "/x402/price", b""),
+            ("POST", "/x402/analyze/async", b'{"symbols":["AAPL"]}'),
+            ("GET", f"/x402/jobs/{JOB_ID}", b""),
+            ("POST", f"/x402/jobs/{JOB_ID}/resume", b'{"retry":true}'),
+        )
+        for method, path, body in routes:
+            with self.subTest(allowed=(method, path)):
+                self.assertEqual(
+                    build_envelope(api_event(method=method, path=path, body=body), public_base_url=PUBLIC_BASE)["path"],
+                    path,
+                )
+        for method, path in (
+            ("POST", "/x402/price"),
+            ("GET", "/x402/analyze/async"),
+            ("POST", f"/x402/jobs/{JOB_ID}"),
+            ("GET", f"/x402/jobs/{JOB_ID}/resume"),
+        ):
+            with self.subTest(rejected=(method, path)), self.assertRaisesRegex(
+                GatewayRequestError, "route_not_allowed"
+            ):
+                build_envelope(api_event(method=method, path=path), public_base_url=PUBLIC_BASE)
 
     def test_rejects_header_values_the_bridge_cannot_encode(self):
         with self.assertRaisesRegex(GatewayRequestError, "request_header_not_allowed"):

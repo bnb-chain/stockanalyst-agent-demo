@@ -10,10 +10,6 @@ from urllib.parse import urlsplit
 
 
 _ALLOWED_HEADERS = {"accept", "content-type", "x-payment", "x-job-token"}
-_FORBIDDEN_HEADERS = {
-    "host", "authorization", "connection", "keep-alive", "proxy-authenticate",
-    "proxy-authorization", "te", "trailer", "transfer-encoding", "upgrade",
-}
 _JOB_PATH = re.compile(r"/x402/jobs/x402_[0-9a-f]{32}(?:/resume)?\Z")
 _HEADER_NAME = re.compile(r"[a-z0-9-]+\Z")
 _MAX_BODY_BYTES = 256 * 1024
@@ -45,7 +41,7 @@ def build_envelope(event: Mapping[str, Any], *, public_base_url: str) -> dict[st
         "requestId": f"x402gw_{digest.hexdigest()}",
         "method": method,
         "path": path,
-        "publicBaseUrl": _validate_public_base(public_base_url),
+        "publicBaseUrl": validate_public_base(public_base_url),
         "headers": headers,
         "bodyBase64": base64.b64encode(body).decode("ascii"),
     }
@@ -124,6 +120,9 @@ def _allowed_headers(raw_headers: Any, multi_value_headers: Any) -> dict[str, st
     if not isinstance(multi_value_headers, Mapping):
         raise GatewayRequestError("invalid_request_headers")
     for raw_name, values in multi_value_headers.items():
+        name = _header_name(raw_name)
+        if name not in _ALLOWED_HEADERS:
+            continue
         if not isinstance(values, list) or len(values) != 1:
             raise GatewayRequestError("request_header_not_allowed")
         _record_header(headers, raw_name, values[0])
@@ -131,24 +130,30 @@ def _allowed_headers(raw_headers: Any, multi_value_headers: Any) -> dict[str, st
 
 
 def _record_header(headers: dict[str, str], raw_name: Any, value: Any) -> None:
-    if not isinstance(raw_name, str) or not isinstance(value, str):
-        raise GatewayRequestError("request_header_not_allowed")
-    name = raw_name.lower()
-    if not _HEADER_NAME.fullmatch(name) or "\r" in value or "\n" in value or "\x00" in value:
+    name = _header_name(raw_name)
+    if name not in _ALLOWED_HEADERS:
+        return
+    if not isinstance(value, str) or "\r" in value or "\n" in value or "\x00" in value:
         raise GatewayRequestError("request_header_not_allowed")
     try:
         value.encode("latin-1")
     except UnicodeEncodeError as exc:
         raise GatewayRequestError("request_header_not_allowed") from exc
-    if name in _FORBIDDEN_HEADERS or name.startswith("x-forwarded-") or name == "forwarded":
+    if name in headers and headers[name] != value:
         raise GatewayRequestError("request_header_not_allowed")
-    if name in _ALLOWED_HEADERS:
-        if name in headers and headers[name] != value:
-            raise GatewayRequestError("request_header_not_allowed")
-        headers[name] = value
+    headers[name] = value
 
 
-def _validate_public_base(value: str) -> str:
+def _header_name(raw_name: Any) -> str:
+    if not isinstance(raw_name, str):
+        raise GatewayRequestError("request_header_not_allowed")
+    name = raw_name.lower()
+    if not _HEADER_NAME.fullmatch(name):
+        raise GatewayRequestError("request_header_not_allowed")
+    return name
+
+
+def validate_public_base(value: str) -> str:
     if not isinstance(value, str) or not value or any(ord(char) <= 0x20 for char in value):
         raise GatewayRequestError("invalid_public_base_url")
     try:

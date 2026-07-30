@@ -17,7 +17,7 @@ from agentcore_client import (
     InvalidAgentResponse,
     default_agentcore_transport,
 )
-from envelope import GatewayRequestError, build_envelope
+from envelope import GatewayRequestError, build_envelope, validate_public_base
 from oauth_client import OAuthClient, OAuthUnavailable, default_token_transport
 
 
@@ -113,15 +113,16 @@ def _get_application() -> GatewayApplication:
 def _application_from_environment(
     environment: dict[str, str], secret_reader_factory: Callable[[str], Callable[[], str]],
 ) -> GatewayApplication:
-    public_base_url = environment.get("X402_GATEWAY_PUBLIC_BASE_URL", "")
-    runtime_url = environment.get("X402_AGENTCORE_RUNTIME_URL", environment.get("AGENTCORE_RUNTIME_URL", ""))
-    secret_arn = environment.get("X402_OAUTH_SECRET_ARN", "")
+    public_base_url = environment.get("X402_PUBLIC_BASE_URL", "")
+    runtime_url = environment.get("AGENTCORE_INVOKE_URL", "")
+    secret_arn = environment.get("OAUTH_SECRET_ARN", "")
     if not public_base_url or not runtime_url or not secret_arn:
         raise GatewayConfigurationError("gateway_configuration_missing")
-    oauth = OAuthClient(secret_reader_factory(secret_arn), default_token_transport)
     try:
+        public_base_url = validate_public_base(public_base_url)
+        oauth = OAuthClient(secret_reader_factory(secret_arn), default_token_transport)
         agentcore = AgentCoreClient(runtime_url, oauth.authorization_header, default_agentcore_transport)
-    except ValueError as exc:
+    except (GatewayRequestError, ValueError) as exc:
         raise GatewayConfigurationError("gateway_configuration_invalid") from exc
     return GatewayApplication(public_base_url, oauth, agentcore)
 
