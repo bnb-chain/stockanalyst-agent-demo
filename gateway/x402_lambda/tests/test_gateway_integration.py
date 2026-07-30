@@ -207,7 +207,8 @@ class GatewayIntegrationTests(unittest.TestCase):
         ))
 
         self.assertEqual(response["statusCode"], 402)
-        body = json.loads(base64.b64decode(response["body"]))
+        self.assertFalse(response["isBase64Encoded"])
+        body = json.loads(response["body"])
         self.assertEqual(body["error"], "Payment Required")
         self.assertEqual(
             body["paymentRequired"]["resource"],
@@ -224,7 +225,8 @@ class GatewayIntegrationTests(unittest.TestCase):
         ))
 
         self.assertEqual(response["statusCode"], 202)
-        body = json.loads(base64.b64decode(response["body"]))
+        self.assertFalse(response["isBase64Encoded"])
+        body = json.loads(response["body"])
         self.assertEqual(body["jobId"], JOB_ID)
         self.assertEqual(body["status"], "queued")
         self.assertEqual(self.job_service.create_calls, [("test-proof", {"symbols": ["AAPL"]})])

@@ -1,6 +1,7 @@
 """API Gateway REST proxy Lambda entrypoint for the internal x402 bridge."""
 from __future__ import annotations
 
+import base64
 import json
 import os
 import re
@@ -47,11 +48,15 @@ class GatewayApplication:
             route = f"{envelope['method']} {envelope['path']}"
             authorization_header = self._oauth.authorization_header()
             response = self._agentcore.invoke(envelope, authorization_header=authorization_header)
+            try:
+                body = base64.b64decode(response["bodyBase64"], validate=True).decode("utf-8")
+            except (ValueError, UnicodeDecodeError) as exc:
+                raise InvalidAgentResponse("invalid_utf8_response_body") from exc
             result = {
                 "statusCode": response["status"],
                 "headers": response["headers"],
-                "isBase64Encoded": True,
-                "body": response["bodyBase64"],
+                "isBase64Encoded": False,
+                "body": body,
             }
             self._log(request_id, route, result["statusCode"], "success", started)
             return result

@@ -23,12 +23,11 @@ def resource_section(text: str, logical_id: str, next_logical_id: str) -> str:
 
 
 class X402LambdaGatewayTemplateTests(unittest.TestCase):
-    def test_rest_api_decodes_base64_encoded_json_responses(self) -> None:
+    def test_rest_api_does_not_enable_binary_json_media_type(self) -> None:
         text = TEMPLATE.read_text()
         api = resource_section(text, "X402Api", "X402Adapter")
 
-        self.assertIn("BinaryMediaTypes:\n        - application/json", api)
-        self.assertEqual(text.count("BinaryMediaTypes:"), 1)
+        self.assertNotIn("BinaryMediaTypes:", api)
 
     def test_rest_api_has_only_the_four_published_routes(self) -> None:
         text = TEMPLATE.read_text()

@@ -85,7 +85,20 @@ class HandlerTests(unittest.TestCase):
         )
         self.assertEqual(result["statusCode"], 402)
         self.assertEqual(result["headers"]["x-payment-required"], '{"x402Version":2}')
-        self.assertTrue(result["isBase64Encoded"])
+        self.assertFalse(result["isBase64Encoded"])
+        self.assertEqual(
+            json.loads(result["body"]),
+            json.loads(base64.b64decode(response_envelope()["bodyBase64"])),
+        )
+
+    def test_rejects_non_utf8_upstream_body(self):
+        response = response_envelope()
+        response["bodyBase64"] = base64.b64encode(b"\xff").decode("ascii")
+
+        result = self.invoke(FakeOAuth(), FakeAgentCore(response))
+
+        self.assertEqual(result["statusCode"], 502)
+        self.assertEqual(json.loads(result["body"]), {"errorCode": "invalid_upstream_response"})
 
     def test_derives_exact_public_base_from_trusted_rest_context(self):
         agentcore = FakeAgentCore(response_envelope(status=200))
