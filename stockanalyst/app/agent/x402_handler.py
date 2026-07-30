@@ -1,41 +1,15 @@
-"""x402 HTTP payment channel with SSE streaming delivery.
+"""x402 HTTP payment channel with durable asynchronous delivery.
 
-Adds three routes alongside the existing A2A server (pure ASGI middleware —
-no extra framework, no new heavy deps):
+Adds paid asynchronous job routes and the free quick-quote route alongside the
+existing A2A server (pure ASGI middleware — no extra framework or heavy deps):
 
-  GET  /x402/price              → 200 JSON: current price + asset info (no payment)
-  GET  /x402/analyze?symbols=.. → 402 JSON + X-Payment-Required header (challenge)
-  POST /x402/analyze            → with X-Payment header → 200 SSE stream
-
-Request body (POST, JSON):
-  {
-    "symbols": ["AAPL", "NVDA"],          # required — list or comma-string
-    "analysis_type": "comprehensive"       # optional (default: "comprehensive")
-  }
-
-SSE event stream format (one event per line-pair):
-  event: progress
-  data: {"stage": "collecting", "tool": "get_stock_quote", "message": "Running get_stock_quote..."}
-
-  event: progress
-  data: {"stage": "generating", "message": "Rendering final report..."}
-
-  event: report
-  data: {"content": "# EQUITY RESEARCH...", "format": "markdown"}
-
-  event: error
-  data: {"message": "..."}
-
-  event: done
-  data: {}
+  GET  /x402/price                → current price and asset information
+  POST /x402/analyze/async        → settle payment and return a durable job
+  GET  /x402/jobs/{jobId}         → authenticated job status and download URL
+  POST /x402/jobs/{jobId}/resume  → authenticated recovery
+  GET|POST /x402/free             → zero-price quick quote over SSE
 
 Payment verification is FIXED CODE in x402_verify.py — never LLM-callable.
-The stream_work callable is the ADK runner generator from main.py (also not LLM-priced;
-it runs fixed code to collect data then calls the LLM for text only).
-
-For dual-channel operation: ERC-8183 (trustless escrow, on-chain settlement) runs
-alongside x402 (simpler Binance Pay flow, off-chain, lower friction for quick buys).
-Both channels share the same LLM analysis pipeline.
 """
 from __future__ import annotations
 
@@ -45,15 +19,29 @@ import hmac
 import json
 import logging
 import os
+import re
 import time
 import uuid
 from collections.abc import AsyncGenerator, Callable
-from typing import Any
 from urllib.parse import parse_qs
 
 import httpx
 
 from competition_reporting import report_competition_call
+if __package__:
+    from .x402_job_service import (
+        JobView,
+        SettlementIndeterminate,
+        X402JobError,
+        X402JobService,
+    )
+else:
+    from x402_job_service import (
+        JobView,
+        SettlementIndeterminate,
+        X402JobError,
+        X402JobService,
+    )
 from x402_verify import (
     CHAIN_ID,
     FREE_TIER_LIMIT,
@@ -64,10 +52,21 @@ from x402_verify import (
     build_free_payment_challenge,
     build_payment_challenge,
     verify_free_payment_proof,
-    verify_payment_proof,
 )
 
 logger = logging.getLogger("seller-agent.x402")
+
+_ASYNC_BODY_MAX_BYTES = 256 * 1024
+_JOB_PATH_RE = re.compile(r"/x402/jobs/(x402_[0-9a-f]{32})(/resume)?\Z")
+
+
+class BodyTooLarge(ValueError):
+    pass
+
+
+class RequestDisconnected(ValueError):
+    pass
+
 
 # ── Settlement configuration (priority: B402 > generic facilitator > demo) ─────
 
@@ -101,7 +100,7 @@ elif X402_DEMO_MODE:
 else:
     logger.warning(
         "x402: SECURITY — no settlement backend configured. "
-        "The paid /x402/analyze endpoint will REJECT all requests until one is set. "
+        "The paid /x402/analyze/async endpoint will REJECT all requests until one is set. "
         "For production:    export B402_CLIENT_ID=<id> B402_SECRET=<secret>. "
         "For local testing: export X402_DEMO_MODE=1."
     )
@@ -182,7 +181,11 @@ async def _settle_b402(payload: dict) -> tuple[bool, str]:
         headers = _b402_headers(payload)
         async with httpx.AsyncClient(timeout=30.0) as client:
             resp = await client.post(url, json=payload, headers=headers)
+            if resp.status_code >= 500:
+                raise SettlementIndeterminate()
             data = resp.json()
+        if not isinstance(data, dict):
+            raise SettlementIndeterminate()
         if data.get("status") == "SUCCESS" and data.get("code") == "000000":
             txhash = str((data.get("data") or {}).get("transactionHash") or "")
             logger.info("x402 B402 settled: txHash=%s", txhash)
@@ -195,9 +198,11 @@ async def _settle_b402(payload: dict) -> tuple[bool, str]:
         )
         logger.warning("x402 B402 rejected: %s | response=%s", reason, data)
         return False, reason
+    except SettlementIndeterminate:
+        raise
     except Exception as exc:
         logger.exception("x402 B402 call failed")
-        return False, str(exc)
+        raise SettlementIndeterminate() from exc
 
 
 async def _settle_generic(payload: dict) -> tuple[bool, str]:
@@ -209,7 +214,11 @@ async def _settle_generic(payload: dict) -> tuple[bool, str]:
                 json=payload,
                 headers={"Content-Type": "application/json"},
             )
+            if resp.status_code >= 500:
+                raise SettlementIndeterminate()
             data = resp.json()
+        if not isinstance(data, dict):
+            raise SettlementIndeterminate()
         if data.get("success"):
             txhash = str(data.get("transaction") or "")
             logger.info("x402 facilitator settled: txHash=%s", txhash)
@@ -217,9 +226,11 @@ async def _settle_generic(payload: dict) -> tuple[bool, str]:
         reason = str(data.get("errorReason") or data.get("error") or "facilitator rejected")
         logger.warning("x402 facilitator rejected: %s", reason)
         return False, reason
+    except SettlementIndeterminate:
+        raise
     except Exception as exc:
         logger.exception("x402 facilitator call failed")
-        return False, str(exc)
+        raise SettlementIndeterminate() from exc
 
 
 class X402Handler:
@@ -231,53 +242,109 @@ class X402Handler:
 
     Args:
         app: Inner ASGI application (A2A + existing routes).
-        stream_work: Async generator factory — called as
-            ``stream_work(prompt, session_id, symbols)`` and yields
-            ``(event_name: str, data: dict)`` tuples. Defined in main.py
-            (has access to the ADK runner + report parser/renderer); never
-            imported here to avoid circular imports.
-        generator: Agent identity string logged in SSE delivery metadata.
+        free_stream_work: Async generator used only by the free quick-quote
+            endpoint.
+        job_service: Durable paid-analysis service.
     """
 
     def __init__(
         self,
         app,
         *,
-        stream_work: Callable[..., AsyncGenerator[tuple[str, dict], None]],
-        generator: str,
         free_stream_work: Callable[..., AsyncGenerator[tuple[str, dict], None]] | None = None,
+        job_service: X402JobService | None = None,
     ) -> None:
         self._inner = app
-        self._stream_work = stream_work
-        self._generator = generator
         self._free_stream_work = free_stream_work
+        self._job_service = job_service
 
     async def __call__(self, scope, receive, send) -> None:
         if scope["type"] != "http" or not scope.get("path", "").startswith("/x402"):
             await self._inner(scope, receive, send)
             return
 
-        path = scope["path"].rstrip("/")
+        raw_path = scope["path"]
+        path = raw_path.rstrip("/")
         method = (scope.get("method") or "GET").upper()
+        job_match = _JOB_PATH_RE.fullmatch(raw_path)
 
         if path == "/x402/price":
             await self._handle_price(scope, send)
-        elif path == "/x402/analyze" and method == "GET":
-            await self._handle_challenge(scope, send)
-        elif path == "/x402/analyze" and method == "POST":
-            await self._handle_analyze(scope, receive, send)
         elif path == "/x402/free" and method == "GET":
             await self._handle_free_challenge(scope, send)
         elif path == "/x402/free" and method == "POST":
             await self._handle_free(scope, receive, send)
+        elif raw_path == "/x402/analyze/async" and method == "POST":
+            if self._job_service is None:
+                await _send_json(
+                    send,
+                    404,
+                    {"error": "not found"},
+                    extra_headers=_async_response_headers(),
+                )
+            else:
+                await self._handle_async_analyze(scope, receive, send)
+        elif (
+            job_match
+            and method == "GET"
+            and job_match.group(2) is None
+        ):
+            if self._job_service is None:
+                await _send_json(
+                    send,
+                    404,
+                    {"error": "not found"},
+                    extra_headers=_async_response_headers(
+                        token_authenticated=True
+                    ),
+                )
+            else:
+                await self._handle_job_get(
+                    scope,
+                    send,
+                    job_match.group(1),
+                )
+        elif (
+            job_match
+            and method == "POST"
+            and job_match.group(2) == "/resume"
+        ):
+            if self._job_service is None:
+                await _send_json(
+                    send,
+                    404,
+                    {"error": "not found"},
+                    extra_headers=_async_response_headers(
+                        token_authenticated=True
+                    ),
+                )
+            else:
+                await self._handle_job_resume(
+                    scope,
+                    send,
+                    job_match.group(1),
+                )
         else:
-            await _send_json(send, 404, {"error": "not found", "x402_routes": [
-                "GET  /x402/price",
-                "GET  /x402/analyze?symbols=AAPL,NVDA",
-                "POST /x402/analyze  (+ X-Payment header)  → paid, 1.0 U, full report",
-                "GET  /x402/free?symbol=AAPL",
-                "POST /x402/free     (+ X-Payment header)  → free, 0 U, quick quote",
-            ]})
+            async_headers = None
+            if raw_path == "/x402/analyze/async":
+                async_headers = _async_response_headers()
+            elif raw_path.startswith("/x402/jobs/"):
+                async_headers = _async_response_headers(
+                    token_authenticated=True
+                )
+            await _send_json(
+                send,
+                404,
+                {"error": "not found", "x402_routes": [
+                    "GET  /x402/price",
+                    "POST /x402/analyze/async  (+ X-Payment header)  → paid, asynchronous report",
+                    "GET  /x402/jobs/{jobId}  (+ X-Job-Token header)",
+                    "POST /x402/jobs/{jobId}/resume  (+ X-Job-Token header)",
+                    "GET  /x402/free?symbol=AAPL",
+                    "POST /x402/free     (+ X-Payment header)  → free, 0 U, quick quote",
+                ]},
+                extra_headers=async_headers,
+            )
 
     # ── Route handlers ─────────────────────────────────────────────────────────
 
@@ -298,176 +365,147 @@ class X402Handler:
             "facilitator":  FACILITATOR_URL or "(demo mode — no on-chain settlement)",
         })
 
-    async def _handle_challenge(self, scope, send) -> None:
-        """GET /x402/analyze?symbols=... — return 402 payment challenge."""
-        qs = parse_qs((scope.get("query_string") or b"").decode())
-        symbols_raw = (qs.get("symbols") or [""])[0]
-        symbols = _parse_symbols(symbols_raw)
-        host = _host(scope)
-        challenge = build_payment_challenge(symbols, host)
-        challenge_json = json.dumps(challenge).encode()
-        await send({
-            "type": "http.response.start",
-            "status": 402,
-            "headers": [
-                (b"x-payment-required", challenge_json),
-                (b"content-type", b"application/json"),
-            ],
-        })
-        body = json.dumps({
-            "error": "Payment Required",
-            "description": "Include a valid X-Payment header to access this resource.",
-            "paymentRequired": challenge,
-        }).encode()
-        await send({"type": "http.response.body", "body": body, "more_body": False})
-
-    async def _handle_analyze(self, scope, receive, send) -> None:
-        """POST /x402/analyze — verify payment, stream SSE report."""
-        # Read request body
-        chunks: list[bytes] = []
-        while True:
-            msg = await receive()
-            if msg["type"] == "http.request":
-                chunks.append(msg.get("body") or b"")
-                if not msg.get("more_body"):
-                    break
-
+    async def _handle_async_analyze(self, scope, receive, send) -> None:
+        """POST /x402/analyze/async — settle and return a durable job handle."""
         try:
-            req: dict[str, Any] = json.loads(b"".join(chunks)) if chunks else {}
-        except json.JSONDecodeError:
-            await _send_json(send, 400, {"error": "invalid JSON body"})
+            req = await _read_json_body(receive)
+        except BodyTooLarge:
+            await _send_json(
+                send,
+                413,
+                {"errorCode": "request_too_large"},
+                extra_headers=_async_response_headers(),
+            )
+            return
+        except RequestDisconnected:
+            return
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            await _send_json(
+                send,
+                400,
+                {"errorCode": "invalid_request"},
+                extra_headers=_async_response_headers(),
+            )
+            return
+        if not isinstance(req, dict):
+            await _send_json(
+                send,
+                400,
+                {"errorCode": "invalid_request"},
+                extra_headers=_async_response_headers(),
+            )
             return
 
-        # Parse symbols
-        symbols = _parse_symbols(req.get("symbols") or "")
-        if not symbols:
-            await _send_json(send, 400, {
-                "error": "symbols is required",
-                "example": '{"symbols": ["AAPL", "NVDA"]}',
-            })
-            return
-
-        headers_dict: dict[bytes, bytes] = dict(scope.get("headers") or [])
-        payment_header = (headers_dict.get(b"x-payment") or b"").decode().strip()
-
-        # No payment header → return 402 challenge
+        payment_header = _header(scope, b"x-payment")
         if not payment_header:
+            symbols = _parse_symbols(req.get("symbols") or "")
             host = _host(scope)
             challenge = build_payment_challenge(symbols, host)
             challenge_json = json.dumps(challenge).encode()
-            await send({
-                "type": "http.response.start",
-                "status": 402,
-                "headers": [
+            await _send_json(
+                send,
+                402,
+                {
+                    "error": "Payment Required",
+                    "description": (
+                        "Retry this request with a valid X-Payment header."
+                    ),
+                    "paymentRequired": challenge,
+                },
+                extra_headers=[
                     (b"x-payment-required", challenge_json),
-                    (b"content-type", b"application/json"),
+                    *_async_response_headers(),
                 ],
-            })
-            body = json.dumps({
-                "error": "Payment Required",
-                "description": "Retry this request with a valid X-Payment header.",
-                "paymentRequired": challenge,
-            }).encode()
-            await send({"type": "http.response.body", "body": body, "more_body": False})
+            )
             return
-
-        # Step 1: verify EIP-712 signature locally (fast, no I/O)
-        ok, err = verify_payment_proof(payment_header)
-        if not ok:
-            logger.warning("x402 payment rejected for %s: %s", symbols, err)
-            await _send_json(send, 402, {
-                "error": "Payment verification failed",
-                "detail": err,
-            })
-            return
-
-        # Step 2: settle via Binance Pay facilitator (on-chain transfer)
-        ok, txhash_or_err = await _settle_via_facilitator(payment_header)
-        if not ok:
-            logger.warning("x402 facilitator settlement failed for %s: %s", symbols, txhash_or_err)
-            await _send_json(send, 402, {
-                "error": "Payment settlement failed",
-                "detail": txhash_or_err,
-            })
-            return
-
-        logger.info("x402 payment verified — streaming analysis for %s", symbols)
-        if txhash_or_err != "demo":
-            try:
-                from_addr, nonce = _payment_identity(payment_header)
-                await report_competition_call(
-                    event_id=f"b402:{CHAIN_ID}:{from_addr}:{nonce}",
-                    address=from_addr,
-                    called_at=int(time.time() * 1000),
-                )
-            except ValueError:
-                logger.exception("x402 verified payment identity extraction failed")
-            except Exception:
-                logger.exception("x402 competition accounting failed")
-        analysis_type = str(req.get("analysis_type") or "comprehensive")
-        portfolio = req.get("portfolio") or []
-        risk_profile = req.get("risk_profile") or {}
-        await self._stream_sse(send, symbols, analysis_type, portfolio=portfolio, risk_profile=risk_profile)
-
-    async def _stream_sse(
-        self, send, symbols: list[str], analysis_type: str,
-        portfolio: list | None = None, risk_profile: dict | None = None,
-    ) -> None:
-        """Stream SSE events: progress → report → done."""
-        from seller_core import _build_stock_analysis_prompt
-
-        # Unique session id per delivery (avoids ADK session collision with ERC-8183 jobs)
-        session_id = f"x402-{hashlib.sha256(f'{symbols}:{time.time()}'.encode()).hexdigest()[:12]}"
-
-        # Build prompt (same pipeline as ERC-8183, including UOMP portfolio context)
-        task_json = json.dumps({
-            "task": f"Analyze {', '.join(symbols)}",
-            "terms": {"symbols": symbols, "analysis_type": analysis_type},
-        })
-        prompt, effective_symbols = _build_stock_analysis_prompt(
-            task_json,
-            portfolio=portfolio or [],
-            risk_profile=risk_profile or {},
-        )
-
-        # Start SSE response
-        await send({
-            "type": "http.response.start",
-            "status": 200,
-            "headers": [
-                (b"content-type", b"text/event-stream; charset=utf-8"),
-                (b"cache-control", b"no-cache"),
-                (b"x-accel-buffering", b"no"),
-                (b"transfer-encoding", b"chunked"),
-            ],
-        })
-
-        async def _emit(event: str, data: dict) -> None:
-            frame = f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
-            await send({
-                "type": "http.response.body",
-                "body": frame.encode("utf-8"),
-                "more_body": True,
-            })
 
         try:
-            await _emit("progress", {
-                "stage": "starting",
-                "symbols": effective_symbols or symbols,
-                "message": f"Starting analysis for {', '.join(effective_symbols or symbols)}...",
-            })
+            result = await self._job_service.create_job(payment_header, req)
+        except X402JobError as exc:
+            await _send_job_error(send, exc, token_authenticated=False)
+            return
+        except Exception:
+            logger.warning("x402 asynchronous job service unavailable")
+            await _send_service_unavailable(
+                send,
+                token_authenticated=False,
+            )
+            return
 
-            async for event_name, data in self._stream_work(
-                prompt, session_id, effective_symbols or symbols
-            ):
-                await _emit(event_name, data)
+        status_url = f"/x402/jobs/{result.job_id}"
+        await _send_json(
+            send,
+            202,
+            {
+                "jobId": result.job_id,
+                "jobToken": result.job_token,
+                "status": result.status,
+                "statusUrl": status_url,
+                "expiresAt": result.expires_at,
+            },
+            extra_headers=[
+                (b"location", status_url.encode()),
+                (b"retry-after", b"10"),
+                *_async_response_headers(),
+            ],
+        )
 
-        except Exception as exc:
-            logger.exception("x402 SSE delivery failed for %s", symbols)
-            await _emit("error", {"message": str(exc)})
+    async def _handle_job_get(self, scope, send, job_id: str) -> None:
+        """GET /x402/jobs/{jobId} — return an authenticated job view."""
+        token = _header(scope, b"x-job-token")
+        try:
+            view = await self._job_service.get_job(job_id, token)
+        except X402JobError as exc:
+            await _send_job_error(send, exc, token_authenticated=True)
+            return
+        except Exception:
+            logger.warning("x402 asynchronous job service unavailable")
+            await _send_service_unavailable(
+                send,
+                token_authenticated=True,
+            )
+            return
 
-        # End stream
-        await send({"type": "http.response.body", "body": b"", "more_body": False})
+        headers = _async_response_headers(
+            token_authenticated=True,
+            extra_headers=(
+                [(b"retry-after", b"10")]
+                if view.status in {"queued", "running"}
+                else None
+            ),
+        )
+        await _send_json(
+            send,
+            200,
+            _job_view_body(view),
+            extra_headers=headers,
+        )
+
+    async def _handle_job_resume(self, scope, send, job_id: str) -> None:
+        """POST /x402/jobs/{jobId}/resume — resume eligible failed work."""
+        token = _header(scope, b"x-job-token")
+        try:
+            view = await self._job_service.resume_job(job_id, token)
+        except X402JobError as exc:
+            await _send_job_error(send, exc, token_authenticated=True)
+            return
+        except Exception:
+            logger.warning("x402 asynchronous job service unavailable")
+            await _send_service_unavailable(
+                send,
+                token_authenticated=True,
+            )
+            return
+
+        await _send_json(
+            send,
+            202,
+            _job_view_body(view),
+            extra_headers=_async_response_headers(
+                token_authenticated=True,
+                extra_headers=[(b"retry-after", b"10")],
+            ),
+        )
 
     async def _handle_free_challenge(self, scope, send) -> None:
         """GET /x402/free?symbol=AAPL — return 402 free tier challenge (0 U)."""
@@ -616,6 +654,147 @@ class X402Handler:
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
+async def _read_json_body(
+    receive,
+    *,
+    max_bytes: int = _ASYNC_BODY_MAX_BYTES,
+) -> Any:
+    chunks: list[bytes] = []
+    total = 0
+    while True:
+        message = await receive()
+        if message["type"] == "http.disconnect":
+            raise RequestDisconnected
+        if message["type"] != "http.request":
+            continue
+        chunk = message.get("body") or b""
+        total += len(chunk)
+        if total > max_bytes:
+            raise BodyTooLarge
+        chunks.append(chunk)
+        if not message.get("more_body"):
+            break
+    return json.loads(b"".join(chunks)) if chunks else {}
+
+
+def _header(scope, name: bytes) -> str:
+    expected = name.lower()
+    for header_name, value in scope.get("headers") or []:
+        if header_name.lower() == expected:
+            return value.decode("utf-8", errors="ignore").strip()
+    return ""
+
+
+def _job_view_body(view: JobView) -> dict[str, Any]:
+    body: dict[str, Any] = {
+        "jobId": view.job_id,
+        "status": view.status,
+        "expiresAt": view.expires_at,
+    }
+    if view.error_code is not None:
+        body["errorCode"] = view.error_code
+        body["retryable"] = bool(view.retryable)
+    if view.download_url is not None:
+        body["downloadUrl"] = view.download_url
+        body["downloadUrlExpiresAt"] = view.download_url_expires_at
+    return body
+
+
+def _async_response_headers(
+    *,
+    token_authenticated: bool = False,
+    extra_headers: list[tuple[bytes, bytes]] | None = None,
+) -> list[tuple[bytes, bytes]]:
+    headers = [(b"cache-control", b"private, no-store")]
+    if token_authenticated:
+        headers.append((b"vary", b"X-Job-Token"))
+    if extra_headers:
+        headers.extend(extra_headers)
+    return headers
+
+
+async def _send_job_error(
+    send,
+    error: X402JobError,
+    *,
+    token_authenticated: bool,
+) -> None:
+    code = error.code
+    headers = _async_response_headers(
+        token_authenticated=token_authenticated
+    )
+    if code == "job_not_found":
+        await _send_json(
+            send,
+            404,
+            {"errorCode": "job_not_found"},
+            extra_headers=headers,
+        )
+    elif code == "job_expired":
+        await _send_json(
+            send,
+            410,
+            {"errorCode": "job_expired"},
+            extra_headers=headers,
+        )
+    elif code in {"job_conflict", "attempts_exhausted"}:
+        await _send_json(
+            send,
+            409,
+            {"errorCode": code},
+            extra_headers=headers,
+        )
+    elif code == "invalid_request":
+        await _send_json(
+            send,
+            400,
+            {"errorCode": "invalid_request"},
+            extra_headers=headers,
+        )
+    elif code == "payment_rejected":
+        await _send_json(
+            send,
+            402,
+            {"errorCode": "payment_rejected"},
+            extra_headers=headers,
+        )
+    elif code in {
+        "async_jobs_paused",
+        "job_state_unavailable",
+        "payment_unavailable",
+        "settlement_pending",
+    }:
+        await _send_json(
+            send,
+            503,
+            {"errorCode": code, "retryable": True},
+            extra_headers=headers,
+        )
+    else:
+        await _send_service_unavailable(
+            send,
+            token_authenticated=token_authenticated,
+        )
+
+
+async def _send_service_unavailable(
+    send,
+    *,
+    token_authenticated: bool,
+) -> None:
+    await _send_json(
+        send,
+        503,
+        {
+            "errorCode": "job_service_unavailable",
+            "retryable": True,
+        },
+        extra_headers=_async_response_headers(
+            token_authenticated=token_authenticated
+        ),
+    )
+
+
 def _payment_identity(proof_header: str) -> tuple[str, str]:
     """Extract canonical wallet and nonce after proof verification succeeded."""
     try:
@@ -647,14 +826,23 @@ def _host(scope) -> str:
     return (headers.get(b"host") or b"localhost:9000").decode()
 
 
-async def _send_json(send, status: int, data: dict) -> None:
+async def _send_json(
+    send,
+    status: int,
+    data: dict,
+    *,
+    extra_headers: list[tuple[bytes, bytes]] | None = None,
+) -> None:
     body = json.dumps(data, ensure_ascii=False).encode()
+    headers = [
+        (b"content-type", b"application/json"),
+        (b"content-length", str(len(body)).encode()),
+    ]
+    if extra_headers:
+        headers.extend(extra_headers)
     await send({
         "type": "http.response.start",
         "status": status,
-        "headers": [
-            (b"content-type", b"application/json"),
-            (b"content-length", str(len(body)).encode()),
-        ],
+        "headers": headers,
     })
     await send({"type": "http.response.body", "body": body, "more_body": False})

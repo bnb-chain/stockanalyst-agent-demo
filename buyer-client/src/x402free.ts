@@ -10,7 +10,7 @@
  *   SYMBOL=NVDA npm run x402:free  # override symbol
  *   SYMBOL=AAPL,TSLA npm run x402:free  # first symbol used
  *
- * Setup: same .env as x402.ts — KEYSTORE_PATH, WALLET_PASSWORD, X402_ENDPOINT
+ * Setup: same .env as x402-async.ts — KEYSTORE_PATH, WALLET_PASSWORD, X402_ENDPOINT
  */
 
 import { readFileSync } from "fs";
@@ -212,7 +212,7 @@ async function main(): Promise<void> {
 
   console.log("\n" + "═".repeat(60));
   console.log("  ✓ FREE TIER COMPLETE — 0 U · 1 signature · ~1s");
-  console.log("  Full analysis (paid): npm run x402");
+  console.log("  Full analysis (paid): npm run x402:async");
   console.log("═".repeat(60) + "\n");
 }
 

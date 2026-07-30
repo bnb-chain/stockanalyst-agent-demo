@@ -41,7 +41,8 @@ import json
 import logging
 import os
 import sys
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Mapping
+from typing import Any
 
 from bnbagent_studio_core.wallet import (
     ensure_keystore_materialized,
@@ -126,6 +127,78 @@ def _load_runtime_secrets() -> None:
 
 _load_runtime_secrets()
 install_s3_storage_from_env()
+
+from bnbagent_studio_core.erc8183.client import get_8183_client
+
+from competition_reporting import report_competition_call
+from x402_handler import X402Handler, _settle_via_facilitator
+from x402_job_service import (
+    X402JobError,
+    X402JobService,
+    load_job_token_secret,
+)
+from x402_job_store import X402JobStore
+from x402_verify import U_TOKEN_BSC_TESTNET, VerifiedPayment
+
+
+def build_x402_job_service(
+    env: Mapping[str, str],
+    *,
+    stream_work,
+    s3_client: Any | None = None,
+) -> X402JobService | None:
+    """Build the optional asynchronous x402 runtime from complete config."""
+    bucket = env.get("X402_JOB_S3_BUCKET", "").strip()
+    secret = env.get("X402_JOB_TOKEN_SECRET", "")
+    if not bucket and not secret:
+        return None
+    if not bucket or not secret:
+        raise X402JobError(
+            "X402_JOB_S3_BUCKET and X402_JOB_TOKEN_SECRET must be set together"
+        )
+
+    store = X402JobStore.from_env(env, s3_client=s3_client)
+    accept_new_jobs = (
+        env.get("X402_ASYNC_ACCEPT_NEW_JOBS", "1").strip() != "0"
+    )
+
+    async def authorization_used(payment: VerifiedPayment) -> bool:
+        client = get_8183_client()
+        authorizer = client.w3.to_checksum_address(payment.from_address)
+        abi = [
+            {
+                "inputs": [
+                    {"name": "authorizer", "type": "address"},
+                    {"name": "nonce", "type": "bytes32"},
+                ],
+                "name": "authorizationState",
+                "outputs": [{"name": "", "type": "bool"}],
+                "stateMutability": "view",
+                "type": "function",
+            }
+        ]
+        token = client.w3.eth.contract(
+            address=U_TOKEN_BSC_TESTNET,
+            abi=abi,
+        )
+        return bool(
+            await asyncio.to_thread(
+                token.functions.authorizationState(
+                    authorizer,
+                    payment.nonce_bytes,
+                ).call
+            )
+        )
+
+    return X402JobService(
+        store=store,
+        token_secret=load_job_token_secret(env),
+        settle=_settle_via_facilitator,
+        authorization_used=authorization_used,
+        report=report_competition_call,
+        stream_work=stream_work,
+        accept_new_jobs=accept_new_jobs,
+    )
 
 # --- Paymaster patch -----------------------------------------------------------
 # MegaFuel paymaster (bsc-testnet default) accepts transactions but never
@@ -293,11 +366,10 @@ async def _stream_runner(
     session_id: str,
     symbols: list[str] | None = None,
 ) -> AsyncGenerator[tuple[str, dict], None]:
-    """Async generator for SSE streaming: yields (event_name, data) tuples.
+    """Generate progress and report events for durable x402 jobs.
 
-    Used by the x402 channel (X402Handler) to push live progress events and
-    the final rendered report over a single HTTP connection. Not used by the
-    ERC-8183 A2A path (which delivers async via submit_result on-chain).
+    Used by the asynchronous x402 worker to produce the final report. Not used
+    by the ERC-8183 A2A path, which delivers through submit_result on-chain.
 
     Yields:
       ("progress", {"stage": "collecting", "tool": <name>, "message": ...})
@@ -307,10 +379,8 @@ async def _stream_runner(
       ("done",     {})
 
     The ADK runner is executed in a background task feeding an asyncio.Queue.
-    Every HEARTBEAT_S seconds of silence we yield a "thinking" progress event
-    so the SSE connection stays alive during the long final-generation phase
-    (Kimi K2.6 can take 3–10 min to emit the full structured JSON).
-    Without this, Node.js undici's bodyTimeout kills the stream with "terminated".
+    Every HEARTBEAT_S seconds of silence a "thinking" event is emitted so the
+    job worker can continue recording progress during long generation phases.
     """
     HEARTBEAT_S = 15
 
@@ -446,7 +516,7 @@ def _format_free_report(symbol: str, quote: dict) -> str:
         (
             "> **Full analysis** (RSI / MACD / Bollinger Bands, options sentiment, "
             "insider activity, portfolio rebalancing) "
-            "→ **Paid tier (1.0 U)** via `POST /x402/analyze`"
+            "→ **Paid tier (1.0 U)** via `POST /x402/analyze/async`"
         ),
     ]
     return "\n".join(lines)
@@ -475,6 +545,12 @@ async def _stream_free(symbol: str) -> AsyncGenerator[tuple[str, dict], None]:
     yield "done", {}
 
 
+x402_jobs = build_x402_job_service(
+    os.environ,
+    stream_work=_stream_runner,
+)
+
+
 def _default_network() -> str:
     """studio.toml ``[network].default`` (best-effort; used by the funded sweep)."""
     try:
@@ -496,6 +572,12 @@ executor = SellerAgentExecutor(
 agent_card = build_agent_card()
 
 
+def _runtime_is_busy(executor, jobs: X402JobService | None) -> bool:
+    return executor.is_busy() or (
+        jobs is not None and jobs.is_busy()
+    )
+
+
 def _ping_status():
     """GET /ping status fed to AgentCore: HEALTHY_BUSY while a background delivery
     is in flight, else HEALTHY.
@@ -506,7 +588,11 @@ def _ping_status():
     lands (bounded by the session max-lifetime; ≤8h)."""
     from bedrock_agentcore.runtime.models import PingStatus
 
-    return PingStatus.HEALTHY_BUSY if executor.is_busy() else PingStatus.HEALTHY
+    return (
+        PingStatus.HEALTHY_BUSY
+        if _runtime_is_busy(executor, x402_jobs)
+        else PingStatus.HEALTHY
+    )
 
 
 # --- JSON-RPC error hardening -------------------------------------------------
@@ -589,8 +675,6 @@ if __name__ == "__main__":
     import uvicorn
     from bedrock_agentcore.runtime import build_a2a_app
 
-    from x402_handler import X402Handler
-
     app = build_a2a_app(executor, agent_card, ping_handler=_ping_status)
     app = _strip_error_input(app)
 
@@ -642,9 +726,8 @@ if __name__ == "__main__":
 
         _x402_standalone = X402Handler(
             _x402_404,
-            stream_work=_stream_runner,
-            generator=GENERATOR,
             free_stream_work=_stream_free,
+            job_service=x402_jobs,
         )
 
         async def _serve_both():
@@ -663,8 +746,7 @@ if __name__ == "__main__":
         # AgentCore is not present locally, so x402 is reachable at localhost:9000/x402/*.
         _combined = X402Handler(
             _a2a_app,
-            stream_work=_stream_runner,
-            generator=GENERATOR,
             free_stream_work=_stream_free,
+            job_service=x402_jobs,
         )
         uvicorn.run(_combined, host=bind_host, port=a2a_port, log_level="info")

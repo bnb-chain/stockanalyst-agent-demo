@@ -1,14 +1,14 @@
 # Stock Analysis Agent — Buyer Client
 
-TypeScript buyer client for the [Stock Analysis Agent](../stockanalyst/README.md). Supports three tiers — pick the one that fits your use case:
+TypeScript buyer client for the [Stock Analysis Agent](../stockanalyst/README.md). Supports these flows:
 
 | Tier | Command | Cost | Settlement | Report | Speed |
 |------|---------|------|------------|--------|-------|
 | **x402 Free** | `npm run x402:free` | 0 U | none | quick quote table | ~1s |
-| **x402 Paid** (Binance Pay) | `npm run x402` | 1.0 U | Binance Pay facilitator | full analysis | 40–120s |
+| **x402 Paid Async** | `npm run x402:async` | 1.0 U | Binance Pay facilitator | private polling + download | create returns quickly |
 | **ERC-8183** (on-chain escrow) | `npm run dev` | 1.0 U | trustless escrow | full analysis | 5–15 min |
 
-The free tier proves wallet identity via a 0-U EIP-712 signature and is rate-limited to 10 requests per wallet per 24 hours. Both paid tiers read the buyer's portfolio from a local **UOMP Memory Guard** and produce the same HTML + PDF report.
+The free tier proves wallet identity via a 0-U EIP-712 signature and is rate-limited to 10 requests per wallet per 24 hours. Both full-analysis flows read the buyer's portfolio from a local **UOMP Memory Guard** and produce the same HTML + PDF report.
 
 ---
 
@@ -24,15 +24,15 @@ The free tier proves wallet identity via a 0-U EIP-712 signature and is rate-lim
 │            ▼                                                       │
 │     buyer-client (Node.js)                                         │
 │            │                                                       │
-│    ┌───────┴──────────┐                                            │
-│    │                  │                                            │
-│  x402 flow      ERC-8183 flow                                      │
-│    │                  │                                            │
-│ 1 POST /x402/analyze  │  A2A negotiate → createJob → fund (5 txs)  │
-│   X-Payment: <proof>  │  notify_funded → poll chain → settle        │
-│    │                  │                                            │
-│    └──── SSE stream ──┘                                            │
-│                  │                                                 │
+│    ┌────────────┴───────────┐                                      │
+│    │                        │                                      │
+│  x402 async           ERC-8183 flow                                │
+│    │                        │                                      │
+│  POST /x402/analyze/async   │  A2A negotiate → createJob → fund    │
+│  receive jobId + token      │  notify_funded → poll chain → settle │
+│  poll → private download    │                                      │
+│    └────────────┬───────────┘                                      │
+│                 │                                                  │
 │           saveReport()                                             │
 │           stock-analysis-<id>.html  +  .pdf                        │
 │                                                                    │
@@ -137,6 +137,8 @@ PROVIDER_ADDRESS=0x1FF095E1C5Cf4bC72a3DC54be17B6cf85043Fb67
 
 # ── x402 (local agent, no auth needed) ───────────────────────────
 X402_ENDPOINT=http://localhost:9000        # default — set only to override
+# Optional async-client polling deadline; default is 30 minutes.
+X402_POLL_TIMEOUT_MS=1800000
 
 # ── UOMP Memory Guard ─────────────────────────────────────────────
 UOMP_GUARD_URL=http://127.0.0.1:9374
@@ -145,8 +147,8 @@ UOMP_GUARD_TOKEN=your_guard_jwt_token
 
 > **Note:** `X402_ENDPOINT` and `AGENT_ENDPOINT` are separate.
 > `AGENT_ENDPOINT` is the deployed A2A path (requires Cognito auth) used by `npm run dev`.
-> `X402_ENDPOINT` is the bare local agent URL used by `npm run x402` — it defaults to
-> `http://localhost:9000` so you only need to add it to `.env` if you change the port.
+> `X402_ENDPOINT` is the bare agent URL used by `npm run x402:async` and
+> `npm run x402:free` — it defaults to `http://localhost:9000`.
 
 ### AWS AgentCore runtime
 
@@ -224,76 +226,57 @@ Expected output:
 │ | Beta           | 1.10                        |
 │ | 52W Range      | USD 201.50 – USD 334.99     |
 │
-│ > Full analysis → Paid tier (1.0 U) via POST /x402/analyze
+│ > Full analysis → Paid tier (1.0 U) via POST /x402/analyze/async
 
   ✓ FREE TIER COMPLETE — 0 U · 1 signature · ~1s
 ```
 
-## Quick start — x402 paid tier (1.0 U, SSE stream)
+## Quick start — x402 paid async
 
-One EIP-712 EIP-3009 signature, one HTTP POST, SSE stream back. No gas, no polling.
+This flow completes payment quickly, stores a private job receipt, and polls
+while the report runs in the background:
 
-**Terminal 1 — start the agent locally:**
 ```bash
-cd ../stockanalyst/app/agent
-python main.py
-```
-
-**Terminal 2 — seed the UOMP Guard, then run the buyer:**
-```bash
-cd ..
-node guard-mock.mjs      # seed portfolio + risk profile into Guard
-
 cd buyer-client
-npm run x402
+npm run x402:async
 ```
 
-Expected output:
-```
-Decrypting keystore...
+The receipt is stored at `.agent-data/x402-job-receipt.json` with owner-only
+permissions (`0600`). It contains only the job ID, private job token, status
+path, and expiry. If the process or network is interrupted, run the same command
+again to continue the existing job without another payment. The receipt is
+deleted only after the Markdown has been downloaded and the HTML report has
+been saved successfully.
 
-────────────────────────────────────────────────────────────
-  Step 1: Load UOMP user context (portfolio + risk profile)
-────────────────────────────────────────────────────────────
-  ✓ Symbols:  AAPL, NVDA
-  ✓ Holdings: 2 positions
-  ✓ Risk:     moderate / 12mo
+Before the first payment POST, the CLI atomically stores the exact signed proof
+and request in `.agent-data/x402-pending-create.json` at mode `0600`. Ambiguous
+network or service failures retry that same proof with bounded backoff, including
+after a process restart, so the client does not create a second payment
+authorization. The pending record is removed only after the four-field job
+receipt has been durably written and an authenticated job-status read shows
+that the server has left `settling` (or the job has expired). If settlement
+ownership is lost, the client retains and resubmits that exact proof after the
+stale-settlement interval; it never signs a replacement proof for the existing
+job. Before persisting the receipt, the client durably binds the pending proof,
+request, and job ID with a versioned HMAC-SHA256 keyed by the private job token.
+Restart verifies that complete binding in constant time before any recovery or
+cleanup request. Cleanup first atomically quarantines the pending file and
+deletes it only after its full identity and binding match, so a concurrently
+replaced file is never overwritten or removed.
 
-════════════════════════════════════════════════════════════
-  Stock Analysis Agent — x402 Buyer
-  x402 endpoint: http://localhost:9000
-  Buyer:         0x1FF0…Fb67
-  Symbols:       AAPL, NVDA
-  Payment:       x402 v2 / EIP-712 EIP-3009 (Binance Pay facilitator)
-  Delivery:      SSE stream (no polling needed)
-════════════════════════════════════════════════════════════
+Only one async CLI may run at a time. `.agent-data/x402-async.lock` is acquired
+before signing or submitting payment and concurrent invocations fail fast.
+Normal completion, `SIGINT`, and `SIGTERM` remove the lock only when it is still
+owned by that process. `SIGKILL`, a runtime crash, or a host failure can leave a
+stale lock because no cleanup handler can run. In that case, first verify that
+no async client process is running, then manually remove
+`.agent-data/x402-async.lock`; the pending payment proof is already stored
+separately for safe recovery.
 
-────────────────────────────────────────────────────────────
-  Step 2: Sign x402 v2 payment authorization (EIP-712 EIP-3009)
-────────────────────────────────────────────────────────────
-  ✓ EIP-712 proof signed (TransferWithAuthorization)
-  ✓ Paying:   1.0 U → 0x1ff0…fb67
-  ✓ Valid for: 10 minutes
-
-────────────────────────────────────────────────────────────
-  Step 3: POST /x402/analyze → streaming SSE report
-────────────────────────────────────────────────────────────
-  ⟳  get_stock_quote
-  ⟳  get_technical_signals
-  ⟳  get_options_sentiment
-  ⟳  get_insider_activity
-  ⟳  get_news_sentiment
-  ⟳  get_stock_quote          ← second symbol
-  ·  Generating analysis.....
-  ✎  Rendering report...
-  ✓ Report received (21 840 chars)
-
-────────────────────────────────────────────────────────────
-  Step 4: Save report as HTML + PDF
-────────────────────────────────────────────────────────────
-  ✓ HTML  stock-analysis-x402-xxxxxx.html
-  ✓ PDF   stock-analysis-x402-xxxxxx.pdf
-```
+The report stays in private AWS S3 storage. Its presigned download URL is valid
+for 30 minutes and is refreshed automatically when necessary; the URL and job
+token are never printed. Downloads require HTTPS, a recognized AWS S3 hostname,
+and no redirects. The client rejects report bodies larger than 2 MiB.
 
 ---
 
@@ -345,7 +328,9 @@ bag erc8183 settle <job_id>
 ```
 src/
 ├── x402free.ts     — free tier buyer    (npm run x402:free)  — 0 U, ~1s, no LLM
-├── x402.ts         — paid x402 buyer   (npm run x402)       — 1 U, SSE, EIP-712
+├── x402-async.ts   — durable paid buyer (npm run x402:async) — private job polling
+├── x402-async-client.ts — typed async create/poll/resume/download client
+├── x402-payment.ts — shared side-effect-free EIP-3009 proof builder
 ├── index.ts        — ERC-8183 buyer    (npm run dev)        — 1 U, on-chain escrow
 ├── erc8183.ts      — on-chain job lifecycle: createJob → fund → settle
 ├── negotiate.ts    — A2A JSON-RPC negotiate with OAuth2 support
@@ -375,20 +360,20 @@ Buyer                              Agent (localhost:9000)
   │◀── event: done     ────────────────────│
 ```
 
-### x402 paid tier — Binance Pay facilitator (1.0 U)
+### x402 paid async — Binance Pay facilitator (1.0 U)
 
 ```
 Buyer                              Agent (localhost:9000)
   │                                        │
-  │  POST /x402/analyze                    │
+  │  POST /x402/analyze/async              │
   │  {"symbols": ["AAPL","NVDA"], ...}     │
   │  X-Payment: base64(1-U proof)  ───────▶│
-  │                                        │  verify_payment_proof()  ← fixed code
+  │                                        │  validate_payment_proof() ← fixed code
   │                                        │  Binance Pay facilitator → on-chain tx
-  │◀── event: progress ────────────────────│  per tool-call progress
-  │◀── event: progress (thinking·····) ───│  SSE heartbeat (keeps connection alive)
-  │◀── event: report   ────────────────────│  full markdown report
-  │◀── event: done     ────────────────────│
+  │◀── 202 jobId + private jobToken ───────│
+  │  GET /x402/jobs/{jobId} ──────────────▶│  background analysis
+  │◀── queued / running / succeeded ───────│
+  │  GET private presigned S3 URL ────────▶│  full markdown report
 ```
 
 Both tiers use **x402 v2 / EIP-712 EIP-3009 (TransferWithAuthorization)**. The client signs structured typed data; no `eth_sign` / `personal_sign` involved:
@@ -425,10 +410,9 @@ The agent verifies: EIP-712 signature recovers to `from`, `to` == seller wallet,
 # Get price / challenge
 curl http://localhost:9000/x402/price
 curl "http://localhost:9000/x402/free?symbol=AAPL"
-curl "http://localhost:9000/x402/analyze?symbols=AAPL,NVDA"
 
-# Stream analysis (generate proof with the script in x402_verify.py docstring)
-curl -N -X POST http://localhost:9000/x402/analyze \
+# Create paid async analysis (generate a proof with x402-payment.ts)
+curl -X POST http://localhost:9000/x402/analyze/async \
   -H "Content-Type: application/json" \
   -H "X-Payment: <base64-proof>" \
   -d '{"symbols": ["AAPL", "NVDA"]}'
@@ -465,12 +449,14 @@ Buyer                      BSC Testnet contracts         Agent (cloud)
 
 To call the agent from your own code, here are the minimal integration points:
 
-### x402 (simplest — any language/framework)
+### x402 async (simplest — any language/framework)
 
 1. **GET** `http://<agent>:9000/x402/price` → read `payTo`, `maxAmountRequired`, `network`
-2. Sign the canonical message with the buyer's wallet (EIP-191 personal_sign)
-3. **POST** `http://<agent>:9000/x402/analyze` with `X-Payment: <base64-proof>` and `{"symbols": [...]}` body
-4. Consume the `text/event-stream` response, parse `event:` / `data:` pairs
+2. Sign the EIP-712 EIP-3009 authorization with the buyer wallet.
+3. **POST** `/x402/analyze/async` with `X-Payment` and the analysis request.
+4. Persist the returned `jobId`, `jobToken`, status path, and expiry.
+5. Poll the status path with `X-Job-Token`; resume when instructed.
+6. Download the report from the returned private presigned URL.
 
 ### ERC-8183 (TypeScript SDK)
 

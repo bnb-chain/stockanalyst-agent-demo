@@ -9,7 +9,7 @@
     "test": "npm run build && node --test dist/*.test.js",
     "start": "node --env-file=.env dist/index.js",
     "dev": "npx tsx --env-file=.env src/index.ts",
-    "x402": "npx tsx --env-file=.env src/x402.ts",
+    "x402:async": "npx tsx --env-file=.env src/x402-async.ts",
     "x402:free": "npx tsx --env-file=.env src/x402free.ts"
   },
   "dependencies": {
