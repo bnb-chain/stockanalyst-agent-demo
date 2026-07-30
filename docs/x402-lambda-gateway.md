@@ -185,8 +185,7 @@ Deploy the Agent with `bag deploy` only. Do not use raw AgentCore deployment
 commands: `bag deploy` preserves the wallet/secret deployment workflow.
 
 ```bash
-cd stockanalyst/app/agent
-bag deploy
+(cd stockanalyst/app/agent && bag deploy)
 ```
 
 Package CloudFormation into a temporary template, then deploy that packaged
@@ -276,6 +275,8 @@ import os
 import sys
 
 challenge = json.load(open(sys.argv[1], encoding="utf-8"))
+if challenge.get("error") != "Payment Required":
+    raise SystemExit("payment challenge did not contain the expected payment-required marker")
 resource = challenge["paymentRequired"]["resource"]
 expected = f'{os.environ["X402_ENDPOINT"]}/x402/analyze/async'
 if resource != expected:
@@ -301,8 +302,7 @@ proof, private key, password, job token, OAuth token, or secret.
 ```bash
 set -eu
 test "${X402_PAYMENT_APPROVED:-}" = 'yes'
-cd buyer-client
-X402_ENDPOINT="$X402_ENDPOINT" npm run x402:async
+(cd buyer-client && X402_ENDPOINT="$X402_ENDPOINT" npm run x402:async)
 ```
 
 ## Rollback and retention
@@ -313,9 +313,9 @@ Rollback preserves already accepted jobs before public ingress is withdrawn:
    Existing job-status and resume paths must remain available.
 
    ```bash
-   cd stockanalyst/app/agent
-   bag env set X402_ASYNC_ACCEPT_NEW_JOBS 0
-   bag deploy
+   (cd stockanalyst/app/agent && \
+     bag env set X402_ASYNC_ACCEPT_NEW_JOBS 0 && \
+     bag deploy)
    ```
 
 2. Verify accepted jobs can still be retrieved with their private job tokens.
