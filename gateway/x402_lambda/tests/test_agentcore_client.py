@@ -62,12 +62,14 @@ class AgentTransport:
         self.last_url = None
         self.last_headers = None
         self.last_body = None
+        self.last_timeout_seconds = None
         self.calls = []
 
     def __call__(self, *, url, headers, body, timeout_seconds):
         self.last_url = url
         self.last_headers = dict(headers)
         self.last_body = body
+        self.last_timeout_seconds = timeout_seconds
         self.calls.append({
             "headers": dict(headers),
             "body": body,
@@ -78,6 +80,16 @@ class AgentTransport:
 
 
 class AgentCoreClientTests(unittest.TestCase):
+    def test_default_transport_timeout_is_twenty_five_seconds(self):
+        transport = AgentTransport(a2a_response(response_envelope()))
+        AgentCoreClient(
+            "https://agentcore.example.test/runtime",
+            lambda: "Bearer access-token",
+            transport,
+        ).invoke(ENVELOPE)
+
+        self.assertEqual(transport.last_timeout_seconds, 25.0)
+
     def test_invocation_is_valid_a2a_data_part(self):
         transport = AgentTransport(a2a_response(response_envelope()))
         client = AgentCoreClient(

@@ -133,7 +133,7 @@ class FakeAgentCoreTransport:
         session_id = headers.get("X-Amzn-Bedrock-AgentCore-Runtime-Session-Id", "")
         if re.fullmatch(r"x402-gateway-session-[0-9a-f]{32}", session_id) is None:
             raise AssertionError("invalid AgentCore session ID")
-        if timeout_seconds != 10.0:
+        if timeout_seconds != 25.0:
             raise AssertionError("unexpected AgentCore timeout")
 
     @staticmethod

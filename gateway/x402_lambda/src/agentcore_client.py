@@ -52,7 +52,7 @@ class AgentCoreClient:
         authorization_header: Callable[[], str],
         transport: Callable[..., Mapping[str, Any]],
         *,
-        timeout_seconds: float = 10.0,
+        timeout_seconds: float = 25.0,
     ) -> None:
         if not _https_url(runtime_url):
             raise ValueError("invalid_agentcore_runtime_url")
