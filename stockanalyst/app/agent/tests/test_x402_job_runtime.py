@@ -87,17 +87,36 @@ class X402JobRuntimeTests(unittest.IsolatedAsyncioTestCase):
         class FakeSecretsManager:
             def get_secret_value(self, *, SecretId: str) -> dict[str, str]:
                 calls.append(SecretId)
-                if SecretId == "runtime-secret":
-                    return {"SecretString": '{"OPENAI_API_KEY":"existing-key"}'}
                 if SecretId == "job-token-secret":
                     return {"SecretString": "j" * 64}
                 raise AssertionError(SecretId)
 
         fake_boto3 = SimpleNamespace(client=lambda service: FakeSecretsManager())
         load_runtime_secrets = _load_runtime_secrets_function()
+        environment = {"X402_JOB_TOKEN_SECRET_ID": "job-token-secret"}
+
+        with (
+            patch.dict(os.environ, environment, clear=True),
+            patch.dict(sys.modules, {"boto3": fake_boto3}),
+        ):
+            load_runtime_secrets()
+
+            self.assertEqual(os.environ["X402_JOB_TOKEN_SECRET"], "j" * 64)
+
+        self.assertEqual(calls, ["job-token-secret"])
+
+    def test_runtime_does_not_override_existing_job_token(self) -> None:
+        class FakeSecretsManager:
+            def get_secret_value(self, *, SecretId: str) -> dict[str, str]:
+                if SecretId != "job-token-secret":
+                    raise AssertionError(SecretId)
+                return {"SecretString": "new-token"}
+
+        fake_boto3 = SimpleNamespace(client=lambda service: FakeSecretsManager())
+        load_runtime_secrets = _load_runtime_secrets_function()
         environment = {
-            "BNBAGENT_RUNTIME_SECRET_ID": "runtime-secret",
             "X402_JOB_TOKEN_SECRET_ID": "job-token-secret",
+            "X402_JOB_TOKEN_SECRET": "existing-token",
         }
 
         with (
@@ -106,10 +125,10 @@ class X402JobRuntimeTests(unittest.IsolatedAsyncioTestCase):
         ):
             load_runtime_secrets()
 
-            self.assertEqual(os.environ["OPENAI_API_KEY"], "existing-key")
-            self.assertEqual(os.environ["X402_JOB_TOKEN_SECRET"], "j" * 64)
-
-        self.assertEqual(calls, ["runtime-secret", "job-token-secret"])
+            self.assertEqual(
+                os.environ["X402_JOB_TOKEN_SECRET"],
+                "existing-token",
+            )
 
     def test_partial_configuration_fails_startup(self) -> None:
         build = _load_runtime_functions()["build_x402_job_service"]
@@ -248,6 +267,12 @@ class X402JobRuntimeTests(unittest.IsolatedAsyncioTestCase):
     def test_main_constructs_one_service_and_injects_one_x402_handler(
         self,
     ) -> None:
+        main_text = MAIN_PATH.read_text(encoding="utf-8")
+        self.assertLess(
+            main_text.index("\n_load_runtime_secrets()\n"),
+            main_text.index("\nx402_jobs = build_x402_job_service(\n"),
+        )
+
         tree = ast.parse(MAIN_PATH.read_text(encoding="utf-8"))
         service_builds = [
             node
