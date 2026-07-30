@@ -56,6 +56,23 @@ class VerifiedPaymentTests(unittest.TestCase):
     def setUp(self) -> None:
         verify._used_nonces.clear()
 
+    def test_seller_wallet_comes_from_studio_wallet_config(self) -> None:
+        active_seller = "0xd10BdDC20E4DC42A1a19a9653e994991e25b8153"
+
+        resolved = verify._resolve_seller_wallet(
+            {},
+            lambda: {"wallet": {"address": active_seller}},
+        )
+
+        self.assertEqual(resolved, active_seller)
+
+    def test_invalid_seller_wallet_fails_closed(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, "seller wallet"):
+            verify._resolve_seller_wallet(
+                {},
+                lambda: {"wallet": {"address": "not-an-address"}},
+            )
+
     def test_pure_validation_does_not_consume_nonce(self) -> None:
         proof = signed_proof()
         first, reason = verify.validate_payment_proof(proof, now=NOW)
@@ -116,15 +133,15 @@ class VerifiedPaymentTests(unittest.TestCase):
         self.assertIsNone(payment)
         self.assertEqual(reason, "authorization expired")
 
-    def test_payment_challenge_targets_async_route(self) -> None:
+    def test_payment_challenge_uses_exact_https_resource_url(self) -> None:
         challenge = verify.build_payment_challenge(
             ["AAPL"],
-            "agent.example",
+            "https://api.example.test/testnet/x402/analyze/async",
         )
 
         self.assertEqual(
             challenge["resource"],
-            "http://agent.example/x402/analyze/async",
+            "https://api.example.test/testnet/x402/analyze/async",
         )
 
     def test_expired_recovery_still_rejects_an_invalid_signature(self) -> None:

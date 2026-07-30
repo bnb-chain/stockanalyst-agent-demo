@@ -179,7 +179,7 @@ async def _settle_b402(payload: dict) -> tuple[bool, str]:
     url = f"{B402_BASE_URL}/papi/v2/b402/settle"
     try:
         headers = _b402_headers(payload)
-        async with httpx.AsyncClient(timeout=30.0) as client:
+        async with httpx.AsyncClient(timeout=20.0) as client:
             resp = await client.post(url, json=payload, headers=headers)
             if resp.status_code >= 500:
                 raise SettlementIndeterminate()
@@ -208,7 +208,7 @@ async def _settle_b402(payload: dict) -> tuple[bool, str]:
 async def _settle_generic(payload: dict) -> tuple[bool, str]:
     """POST to a generic x402 facilitator (no HMAC auth)."""
     try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
+        async with httpx.AsyncClient(timeout=20.0) as client:
             resp = await client.post(
                 f"{FACILITATOR_URL}/settle",
                 json=payload,
@@ -399,8 +399,10 @@ class X402Handler:
         payment_header = _header(scope, b"x-payment")
         if not payment_header:
             symbols = _parse_symbols(req.get("symbols") or "")
-            host = _host(scope)
-            challenge = build_payment_challenge(symbols, host)
+            challenge = build_payment_challenge(
+                symbols,
+                _public_resource(scope, "/x402/analyze/async"),
+            )
             challenge_json = json.dumps(challenge).encode()
             await _send_json(
                 send,
@@ -824,6 +826,14 @@ def _parse_symbols(raw) -> list[str]:
 def _host(scope) -> str:
     headers: dict[bytes, bytes] = dict(scope.get("headers") or [])
     return (headers.get(b"host") or b"localhost:9000").decode()
+
+
+def _public_resource(scope: dict, path: str) -> str:
+    trusted = str(scope.get("x402_public_base_url") or "").rstrip("/")
+    if trusted:
+        return f"{trusted}{path}"
+    scheme = str(scope.get("scheme") or "http")
+    return f"{scheme}://{_host(scope)}{path}"
 
 
 async def _send_json(

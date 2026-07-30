@@ -26,11 +26,11 @@ import {
 } from "./x402-async-client.js";
 import {
   BSC_TESTNET_CHAIN_ID,
-  SELLER_WALLET,
   U_TOKEN_ADDRESS,
   U_TOKEN_DOMAIN_NAME,
   U_TOKEN_DOMAIN_VERSION,
   buildPaymentProof,
+  resolveX402SellerWallet,
 } from "./x402-payment.js";
 import {
   acquireExclusiveCliLock,
@@ -118,10 +118,40 @@ function proofExpiringAt(validBeforeSeconds: number): string {
   })).toString("base64");
 }
 
+function decodeProof(proof: string): {
+  payload: { authorization: { to: string } };
+} {
+  return JSON.parse(Buffer.from(proof, "base64").toString("utf8")) as {
+    payload: { authorization: { to: string } };
+  };
+}
+
+test("requires an explicit x402 seller wallet", () => {
+  assert.throws(
+    () => resolveX402SellerWallet({}),
+    /X402_SELLER_WALLET/,
+  );
+});
+
+test("signs the authorization to the configured seller wallet", async () => {
+  const seller = "0xd10BdDC20E4DC42A1a19a9653e994991e25b8153";
+  const proof = decodeProof(
+    await buildPaymentProof(
+      new Wallet(Wallet.createRandom().privateKey),
+      undefined,
+      undefined,
+      seller,
+    ),
+  );
+
+  assert.equal(proof.payload.authorization.to, seller.toLowerCase());
+});
+
 test("buildPaymentProof preserves the paid EIP-3009 wire format", async () => {
+  const seller = "0xd10BdDC20E4DC42A1a19a9653e994991e25b8153";
   const wallet = new Wallet(Wallet.createRandom().privateKey);
   const proof = JSON.parse(
-    Buffer.from(await buildPaymentProof(wallet, "42", 300), "base64").toString("utf8"),
+    Buffer.from(await buildPaymentProof(wallet, "42", 300, seller), "base64").toString("utf8"),
   ) as {
     x402Version: number;
     scheme: string;
@@ -143,7 +173,7 @@ test("buildPaymentProof preserves the paid EIP-3009 wire format", async () => {
   assert.equal(proof.scheme, "exact");
   assert.equal(proof.network, `eip155:${BSC_TESTNET_CHAIN_ID}`);
   assert.equal(proof.payload.authorization.from, wallet.address.toLowerCase());
-  assert.equal(proof.payload.authorization.to, SELLER_WALLET);
+  assert.equal(proof.payload.authorization.to, seller.toLowerCase());
   assert.equal(proof.payload.authorization.value, "42");
   assert.equal(proof.payload.authorization.validAfter, "0");
   assert.match(proof.payload.authorization.nonce, /^0x[0-9a-f]{64}$/);

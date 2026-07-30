@@ -42,7 +42,7 @@ To generate a test proof (Python):
   import eth_abi, secrets
 
   PRIV = "0x<private-key>"
-  SELLER = "0x1ff095e1c5cf4bc72a3dc54be17b6cf85043fb67"
+  SELLER = "0x<seller-wallet>"
   TOKEN  = "0xc70B8741B8B07A6d61E54fd4B20f22Fa648E5565"
   acct = Account.from_key(PRIV)
 
@@ -71,7 +71,9 @@ import base64
 import json
 import logging
 import os
+import re
 import time
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -95,7 +97,31 @@ try:
 except Exception:
     _log.debug("eth_account smoke recover failed as expected", exc_info=True)
 
-SELLER_WALLET       = "0x1FF095E1C5Cf4bC72a3DC54be17B6cf85043Fb67"
+_EVM_ADDRESS = re.compile(r"0x[0-9a-fA-F]{40}\Z")
+
+
+def _resolve_seller_wallet(
+    env: Mapping[str, str] = os.environ,
+    studio_loader: Callable[[], Mapping[str, Any] | None] | None = None,
+) -> str:
+    explicit = env.get("X402_SELLER_WALLET", "").strip()
+    if explicit:
+        raw = explicit
+    else:
+        try:
+            if studio_loader is None:
+                from bnbagent_studio_core import config
+                studio_loader = config.load_studio_toml
+            studio = studio_loader() or {}
+            raw = str((studio.get("wallet") or {}).get("address") or "").strip()
+        except Exception as exc:
+            raise RuntimeError("x402 seller wallet configuration unavailable") from exc
+    if not _EVM_ADDRESS.fullmatch(raw):
+        raise RuntimeError("x402 seller wallet must be a 0x-prefixed EVM address")
+    return raw
+
+
+SELLER_WALLET       = _resolve_seller_wallet()
 U_TOKEN_BSC_TESTNET = "0xc70B8741B8B07A6d61E54fd4B20f22Fa648E5565"
 PRICE_WEI           = 10**18         # 1.0 U
 MIN_PRICE_WEI       = 5 * 10**17    # 0.5 U
@@ -196,7 +222,10 @@ def _eip712_digest(
 
 # ── Public API ─────────────────────────────────────────────────────────────────
 
-def build_payment_challenge(symbols: list[str], host: str = "localhost:9000") -> dict:
+def build_payment_challenge(
+    symbols: list[str],
+    resource_url: str = "http://localhost:9000/x402/analyze/async",
+) -> dict:
     """Return x402 v2 standard payment challenge (HTTP 402 body / X-Payment-Required header)."""
     return {
         "x402Version": 2,
@@ -220,7 +249,7 @@ def build_payment_challenge(symbols: list[str], host: str = "localhost:9000") ->
             }
         ],
         "error":    "Payment Required",
-        "resource": f"http://{host}/x402/analyze/async",
+        "resource": resource_url,
     }
 
 

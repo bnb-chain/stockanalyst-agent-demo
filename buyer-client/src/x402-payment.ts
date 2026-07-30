@@ -1,12 +1,23 @@
 import { randomBytes } from "node:crypto";
-import type { Wallet } from "ethers";
+import { getAddress, type Wallet } from "ethers";
 
 // These values must match stockanalyst/app/agent/x402_verify.py.
-export const SELLER_WALLET = "0x1ff095e1c5cf4bc72a3dc54be17b6cf85043fb67";
 export const U_TOKEN_ADDRESS = "0xc70B8741B8B07A6d61E54fd4B20f22Fa648E5565";
 export const U_TOKEN_DOMAIN_NAME = process.env["U_TOKEN_DOMAIN_NAME"] ?? "U";
 export const U_TOKEN_DOMAIN_VERSION = process.env["U_TOKEN_DOMAIN_VERSION"] ?? "1";
 export const BSC_TESTNET_CHAIN_ID = 97;
+
+export function resolveX402SellerWallet(
+  env: Readonly<Record<string, string | undefined>> = process.env,
+): string {
+  const raw = env["X402_SELLER_WALLET"]?.trim();
+  if (!raw) throw new Error("X402_SELLER_WALLET is required");
+  try {
+    return getAddress(raw).toLowerCase();
+  } catch {
+    throw new Error("X402_SELLER_WALLET must be a valid EVM address");
+  }
+}
 
 /**
  * Build and EIP-712 sign an x402 v2 TransferWithAuthorization proof.
@@ -18,13 +29,15 @@ export async function buildPaymentProof(
   wallet: Wallet,
   priceWei: string = "1000000000000000000",
   ttlSeconds: number = 600,
+  sellerWallet: string = resolveX402SellerWallet(),
 ): Promise<string> {
   const now = Math.floor(Date.now() / 1000);
   const nonce = `0x${randomBytes(32).toString("hex")}`;
+  const recipient = getAddress(sellerWallet).toLowerCase();
 
   const authorization = {
     from: wallet.address.toLowerCase(),
-    to: SELLER_WALLET,
+    to: recipient,
     value: priceWei,
     validAfter: "0",
     validBefore: String(now + ttlSeconds),

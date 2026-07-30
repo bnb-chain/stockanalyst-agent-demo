@@ -18,19 +18,20 @@ import { resolve, dirname } from "path";
 import { fileURLToPath } from "url";
 import { Wallet } from "ethers";
 import { randomBytes } from "crypto";
+import {
+  BSC_TESTNET_CHAIN_ID,
+  U_TOKEN_ADDRESS,
+  U_TOKEN_DOMAIN_NAME,
+  U_TOKEN_DOMAIN_VERSION,
+  resolveX402SellerWallet,
+} from "./x402-payment.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
 // ── Config ────────────────────────────────────────────────────────────────────
-const KEYSTORE_PATH   = process.env["KEYSTORE_PATH"]   ?? "../stockanalyst/.studio/wallets/0x1FF095E1C5Cf4bC72a3DC54be17B6cf85043Fb67.json";
+const KEYSTORE_PATH   = process.env["KEYSTORE_PATH"]   ?? "";
 const WALLET_PASSWORD = process.env["WALLET_PASSWORD"] ?? "";
 const AGENT_ENDPOINT  = process.env["X402_ENDPOINT"]   ?? "http://localhost:9000";
-
-const SELLER_WALLET          = "0x1ff095e1c5cf4bc72a3dc54be17b6cf85043fb67";
-const U_TOKEN_ADDRESS        = "0xc70B8741B8B07A6d61E54fd4B20f22Fa648E5565";
-const U_TOKEN_DOMAIN_NAME    = process.env["U_TOKEN_DOMAIN_NAME"]    ?? "U";
-const U_TOKEN_DOMAIN_VERSION = process.env["U_TOKEN_DOMAIN_VERSION"] ?? "1";
-const BSC_TESTNET_CHAIN_ID   = 97;
 
 // Symbol: first CLI argument, or SYMBOL env var
 const rawSymbol = process.argv[2] || process.env["SYMBOL"] || "";
@@ -44,13 +45,17 @@ function hr(label: string): void {
 
 // ── 0-U EIP-712 proof ─────────────────────────────────────────────────────────
 
-async function buildFreeProof(wallet: Wallet, ttlSeconds = 600): Promise<string> {
+async function buildFreeProof(
+  wallet: Wallet,
+  sellerWallet: string,
+  ttlSeconds = 600,
+): Promise<string> {
   const now   = Math.floor(Date.now() / 1000);
   const nonce = "0x" + randomBytes(32).toString("hex");
 
   const authorization = {
     from:        wallet.address.toLowerCase(),
-    to:          SELLER_WALLET,
+    to:          sellerWallet,
     value:       "0",                           // ← 0 U (identity proof only)
     validAfter:  "0",
     validBefore: String(now + ttlSeconds),
@@ -180,6 +185,10 @@ async function main(): Promise<void> {
     console.error("       or pass it as an argument: npm run x402:free AAPL");
     process.exit(1);
   }
+  if (!KEYSTORE_PATH) {
+    throw new Error("KEYSTORE_PATH is required");
+  }
+  const sellerWallet = resolveX402SellerWallet();
 
   const keystorePath = resolve(__dirname, "..", KEYSTORE_PATH);
   const keystoreJson = readFileSync(keystorePath, "utf8");
@@ -190,13 +199,14 @@ async function main(): Promise<void> {
   console.log("  x402 Free Tier — Quick Quote");
   console.log(`  Endpoint: ${AGENT_ENDPOINT}`);
   console.log(`  Wallet:   ${wallet.address}`);
+  console.log(`  Seller:   ${sellerWallet}`);
   console.log(`  Symbol:   ${SYMBOL}`);
   console.log(`  Payment:  0 U (wallet identity proof only)`);
   console.log(`  Limit:    10 requests / 24 h per wallet`);
   console.log("═".repeat(60));
 
   hr("Step 1: Sign 0-U EIP-712 identity proof");
-  const proof = await buildFreeProof(wallet);
+  const proof = await buildFreeProof(wallet, sellerWallet);
   console.log("  ✓ EIP-712 proof signed (value = 0 U)");
 
   hr(`Step 2: POST /x402/free → ${SYMBOL} quick quote`);

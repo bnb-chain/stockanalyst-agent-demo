@@ -36,6 +36,7 @@ async def call_handler(
     headers: dict[str, str] | None = None,
     json_body: dict | None = None,
     body_chunks: list[bytes] | None = None,
+    scope_overrides: dict | None = None,
 ) -> Response:
     sent: list[dict] = []
     if body_chunks is None:
@@ -59,20 +60,19 @@ async def call_handler(
     async def send(message: dict) -> None:
         sent.append(message)
 
-    await handler(
-        {
-            "type": "http",
-            "method": method,
-            "path": path,
-            "query_string": b"",
-            "headers": [
-                (name.encode(), value.encode())
-                for name, value in (headers or {}).items()
-            ],
-        },
-        receive,
-        send,
-    )
+    scope = {
+        "type": "http",
+        "method": method,
+        "path": path,
+        "query_string": b"",
+        "headers": [
+            (name.encode(), value.encode())
+            for name, value in (headers or {}).items()
+        ],
+    }
+    if scope_overrides:
+        scope.update(scope_overrides)
+    await handler(scope, receive, send)
     start = next(item for item in sent if item["type"] == "http.response.start")
     response_body = b"".join(
         item.get("body", b"")
@@ -193,6 +193,25 @@ class X402AsyncHandlerTests(unittest.IsolatedAsyncioTestCase):
         self.assert_private_no_store(response, token_authenticated=False)
         self.assertIn("x-payment-required", response.headers)
         service.create_job.assert_not_awaited()
+
+    async def test_async_challenge_uses_trusted_public_resource_url(self) -> None:
+        service = AsyncMock()
+
+        response = await call_handler(
+            make_handler(service),
+            method="POST",
+            path="/x402/analyze/async",
+            json_body={"symbols": ["AAPL"]},
+            scope_overrides={
+                "x402_public_base_url": "https://api.example.test/testnet",
+            },
+        )
+
+        self.assertEqual(response.status, 402)
+        self.assertEqual(
+            response.json["paymentRequired"]["resource"],
+            "https://api.example.test/testnet/x402/analyze/async",
+        )
 
     async def test_async_create_rejects_invalid_json(self) -> None:
         service = AsyncMock()

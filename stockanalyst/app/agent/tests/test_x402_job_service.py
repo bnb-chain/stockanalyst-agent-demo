@@ -9,6 +9,9 @@ from dataclasses import replace
 from typing import Any
 from unittest.mock import ANY, AsyncMock, patch
 
+import httpx
+
+from x402_handler import _settle_generic
 from x402_job_service import (
     CreateJobResult,
     JobIdentityCollision,
@@ -1370,6 +1373,53 @@ class X402JobSettlementTests(unittest.IsolatedAsyncioTestCase):
         stored = next(iter(store.jobs.values())).record
         self.assertEqual(stored["status"], "settling")
         self.assertEqual(stored["paymentStatus"], "settling")
+
+    async def test_facilitator_transport_timeout_keeps_settling_record(
+        self,
+    ) -> None:
+        store = MemoryJobStore()
+        original_client = httpx.AsyncClient
+
+        def timeout_transport(request: httpx.Request) -> httpx.Response:
+            raise httpx.ReadTimeout("timed out", request=request)
+
+        transport = httpx.MockTransport(timeout_transport)
+        timeouts: list[float] = []
+
+        def client_with_timeout_transport(
+            *args: Any,
+            **kwargs: Any,
+        ) -> httpx.AsyncClient:
+            timeouts.append(float(kwargs["timeout"]))
+            return original_client(*args, transport=transport, **kwargs)
+
+        async def settle(_proof_header: str) -> tuple[bool, str]:
+            return await _settle_generic({})
+
+        service = make_service(store=store, settle=settle)
+        with (
+            patch(
+                "x402_handler.FACILITATOR_URL",
+                "https://facilitator.example.test",
+            ),
+            patch(
+                "x402_handler.httpx.AsyncClient",
+                side_effect=client_with_timeout_transport,
+            ),
+            patch(
+                "x402_job_service.validate_payment_proof",
+                return_value=(verified_payment(), ""),
+            ),
+            self.assertRaises(X402JobError) as raised,
+        ):
+            await service.create_job(PROOF, REQUEST)
+
+        self.assertEqual(raised.exception.code, "settlement_pending")
+        self.assertTrue(raised.exception.retryable)
+        stored = next(iter(store.jobs.values())).record
+        self.assertEqual(stored["status"], "settling")
+        self.assertEqual(stored["paymentStatus"], "settling")
+        self.assertEqual(timeouts, [20.0])
 
 
 class X402JobExecutionTests(unittest.IsolatedAsyncioTestCase):
