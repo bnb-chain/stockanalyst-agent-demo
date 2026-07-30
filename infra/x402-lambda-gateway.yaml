@@ -43,28 +43,28 @@ Resources:
                 type: aws_proxy
                 httpMethod: POST
                 uri: !Sub
-                  "arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${X402Adapter.Arn}/invocations"
+                  "arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${X402Adapter.Arn}:live/invocations"
           /x402/analyze/async:
             post:
               x-amazon-apigateway-integration:
                 type: aws_proxy
                 httpMethod: POST
                 uri: !Sub
-                  "arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${X402Adapter.Arn}/invocations"
+                  "arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${X402Adapter.Arn}:live/invocations"
           /x402/jobs/{jobId}:
             get:
               x-amazon-apigateway-integration:
                 type: aws_proxy
                 httpMethod: POST
                 uri: !Sub
-                  "arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${X402Adapter.Arn}/invocations"
+                  "arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${X402Adapter.Arn}:live/invocations"
           /x402/jobs/{jobId}/resume:
             post:
               x-amazon-apigateway-integration:
                 type: aws_proxy
                 httpMethod: POST
                 uri: !Sub
-                  "arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${X402Adapter.Arn}/invocations"
+                  "arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${X402Adapter.Arn}:live/invocations"
       AccessLogSetting:
         DestinationArn: !GetAtt X402ApiAccessLogGroup.Arn
         Format: >-
@@ -103,9 +103,10 @@ Resources:
 
   X402ApiInvokePermission:
     Type: AWS::Lambda::Permission
+    DependsOn: X402AdapterAliaslive
     Properties:
       Action: lambda:InvokeFunction
-      FunctionName: !Ref X402Adapter
+      FunctionName: !Sub "${X402Adapter.Arn}:live"
       Principal: apigateway.amazonaws.com
       SourceArn: !Sub
         "arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${X402Api}/${StageName}/*"

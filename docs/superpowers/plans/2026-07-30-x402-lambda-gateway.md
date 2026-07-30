@@ -897,13 +897,13 @@ git commit -m "feat: add x402 Lambda adapter"
 - Produces: stack output `X402GatewayBaseUrl`.
 
 **Approved infrastructure correction (2026-07-30):** This supersedes the
-earlier sample's Lambda public-base environment and SAM `Events` wiring. The
+earlier sample's Lambda public-base environment and implicit SAM route wiring. The
 REST API owns an explicit OpenAPI definition containing the four fixed
 method/path integrations and references the Lambda; an explicit
 `AWS::Lambda::Permission` authorizes invocation. No Lambda property or
 environment references `X402Api`, removing the API-to-Lambda dependency while
 the output may still reference the API. WAF keeps the `/x402/` IP rate rule and
-count-only AWS common rules, but has no body-size rule: WAF cannot accurately
+count-only AWS common rules, but has no exact-body-limit rule: WAF cannot accurately
 represent the application's exact 256 KiB body limit. Lambda and Agent retain
 that validation. Use `LoggingConfig.LogFormat: Text` so the safe stdout JSON
 record is a root CloudWatch log event.
@@ -984,6 +984,14 @@ Resources:
       StageName: !Ref StageName
       EndpointConfiguration: REGIONAL
       TracingEnabled: true
+      DefinitionBody:
+        openapi: 3.0.1
+        info: {title: x402 gateway, version: "1.0"}
+        paths:
+          /x402/price: {get: {x-amazon-apigateway-integration: {type: aws_proxy, httpMethod: POST, uri: !Sub "arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${X402Adapter.Arn}:live/invocations"}}}
+          /x402/analyze/async: {post: {x-amazon-apigateway-integration: {type: aws_proxy, httpMethod: POST, uri: !Sub "arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${X402Adapter.Arn}:live/invocations"}}}
+          /x402/jobs/{jobId}: {get: {x-amazon-apigateway-integration: {type: aws_proxy, httpMethod: POST, uri: !Sub "arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${X402Adapter.Arn}:live/invocations"}}}
+          /x402/jobs/{jobId}/resume: {post: {x-amazon-apigateway-integration: {type: aws_proxy, httpMethod: POST, uri: !Sub "arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${X402Adapter.Arn}:live/invocations"}}}
       AccessLogSetting:
         DestinationArn: !GetAtt X402ApiAccessLogGroup.Arn
         Format: >-
@@ -1008,42 +1016,26 @@ Resources:
       MemorySize: 256
       ReservedConcurrentExecutions: !Ref ReservedConcurrency
       Tracing: Active
+      LoggingConfig:
+        LogFormat: Text
       Environment:
         Variables:
           AGENTCORE_INVOKE_URL: !Ref AgentCoreInvokeUrl
           OAUTH_SECRET_ARN: !Ref OAuthSecretArn
-          X402_PUBLIC_BASE_URL: !Sub
-            "https://${X402Api}.execute-api.${AWS::Region}.${AWS::URLSuffix}/${StageName}"
       Policies:
         - Statement:
             - Effect: Allow
               Action: secretsmanager:GetSecretValue
               Resource: !Ref OAuthSecretArn
-      Events:
-        Price:
-          Type: Api
-          Properties:
-            RestApiId: !Ref X402Api
-            Path: /x402/price
-            Method: GET
-        Create:
-          Type: Api
-          Properties:
-            RestApiId: !Ref X402Api
-            Path: /x402/analyze/async
-            Method: POST
-        Status:
-          Type: Api
-          Properties:
-            RestApiId: !Ref X402Api
-            Path: /x402/jobs/{jobId}
-            Method: GET
-        Resume:
-          Type: Api
-          Properties:
-            RestApiId: !Ref X402Api
-            Path: /x402/jobs/{jobId}/resume
-            Method: POST
+
+  X402ApiInvokePermission:
+    Type: AWS::Lambda::Permission
+    DependsOn: X402AdapterAliaslive
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Sub "${X402Adapter.Arn}:live"
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${X402Api}/${StageName}/*"
 ```
 
 Complete the template with these exact security resources and associations:
@@ -1102,25 +1094,8 @@ Complete the template with these exact security resources and associations:
             CloudWatchMetricsEnabled: true
             MetricName: x402-rate-limit
             SampledRequestsEnabled: false
-        - Name: RejectOversizedBody
-          Priority: 1
-          Action: {Block: {}}
-          Statement:
-            SizeConstraintStatement:
-              ComparisonOperator: GT
-              Size: 262144
-              FieldToMatch:
-                Body:
-                  OversizeHandling: MATCH
-              TextTransformations:
-                - Priority: 0
-                  Type: NONE
-          VisibilityConfig:
-            CloudWatchMetricsEnabled: true
-            MetricName: x402-body-size
-            SampledRequestsEnabled: false
         - Name: AwsCommonRulesObserveOnly
-          Priority: 2
+          Priority: 1
           OverrideAction: {Count: {}}
           Statement:
             ManagedRuleGroupStatement:
@@ -1201,6 +1176,9 @@ SAM generates the logical stage resource `X402ApiStage` for the explicitly
 named `X402Api`; assert that `sam validate`/packaging resolves this dependency.
 Keep Lambda outside a VPC. It needs normal managed internet egress to Cognito
 and the AgentCore public endpoint and never calls B402.
+
+The exact 256 KiB request limit is deliberately enforced by Lambda and the
+Agent, not WAF: WAF body inspection cannot truthfully implement that threshold.
 
 API Gateway execution data tracing stays disabled. The access log format is
 fixed to request ID, route, status, latency, and integration status; it contains

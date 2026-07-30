@@ -134,6 +134,15 @@ class X402LambdaGatewayTemplateTests(unittest.TestCase):
         self.assertIn("X402GatewayBaseUrl:", text)
         self.assertIn("https://${X402Api}.execute-api.${AWS::Region}.${AWS::URLSuffix}/${StageName}", text)
 
+    def test_all_integrations_and_permission_target_the_live_alias(self) -> None:
+        text = TEMPLATE.read_text()
+
+        self.assertEqual(text.count("${X402Adapter.Arn}:live/invocations"), 4)
+        self.assertNotIn("${X402Adapter.Arn}/invocations", text)
+        permission = resource_section(text, "X402ApiInvokePermission", "X402ApiAccessLogGroup")
+        self.assertIn("DependsOn: X402AdapterAliaslive", permission)
+        self.assertIn("FunctionName: !Sub \"${X402Adapter.Arn}:live\"", permission)
+
 
 if __name__ == "__main__":
     unittest.main()
