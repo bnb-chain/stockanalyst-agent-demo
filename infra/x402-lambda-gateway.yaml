@@ -34,6 +34,8 @@ Resources:
       StageName: !Ref StageName
       EndpointConfiguration: REGIONAL
       TracingEnabled: true
+      BinaryMediaTypes:
+        - application/json
       DefinitionBody:
         openapi: 3.0.1
         info:
