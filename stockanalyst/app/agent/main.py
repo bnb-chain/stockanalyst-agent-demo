@@ -116,13 +116,19 @@ GENERATOR = _generator_tag()
 # populated the environment — `setdefault` never overrides an already-present var.
 def _load_runtime_secrets() -> None:
     secret_id = os.environ.get("BNBAGENT_RUNTIME_SECRET_ID")
-    if not secret_id:
+    job_token_secret_id = os.environ.get("X402_JOB_TOKEN_SECRET_ID")
+    if not secret_id and not job_token_secret_id:
         return
     import boto3
 
-    resp = boto3.client("secretsmanager").get_secret_value(SecretId=secret_id)
-    for key, value in json.loads(resp["SecretString"]).items():
-        os.environ.setdefault(key, str(value))
+    secrets_manager = boto3.client("secretsmanager")
+    if secret_id:
+        resp = secrets_manager.get_secret_value(SecretId=secret_id)
+        for key, value in json.loads(resp["SecretString"]).items():
+            os.environ.setdefault(key, str(value))
+    if job_token_secret_id:
+        resp = secrets_manager.get_secret_value(SecretId=job_token_secret_id)
+        os.environ.setdefault("X402_JOB_TOKEN_SECRET", resp["SecretString"])
 
 
 _load_runtime_secrets()
