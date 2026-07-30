@@ -100,7 +100,7 @@ cleanup_gateway_oauth_provisioning() {
       --client-id "$CREATED_CLIENT_ID" >/dev/null 2>&1 || :
   fi
 }
-trap 'status=$?; cleanup_gateway_oauth_provisioning "$status"; exit "$status"' EXIT
+trap 'exit_code=$?; cleanup_gateway_oauth_provisioning "$exit_code"; exit "$exit_code"' EXIT
 
 # Read-only Cognito-name preflight. A paginated result fails closed.
 aws cognito-idp list-user-pool-clients \
@@ -207,7 +207,7 @@ cleanup_packaged_template() {
   rm -f -- "$X402_PACKAGED_TEMPLATE"
   return "$original_status"
 }
-trap 'status=$?; cleanup_packaged_template "$status"; exit "$status"' EXIT
+trap 'exit_code=$?; cleanup_packaged_template "$exit_code"; exit "$exit_code"' EXIT
 aws cloudformation package \
   --region "$AWS_REGION" \
   --template-file infra/x402-lambda-gateway.yaml \
@@ -260,7 +260,7 @@ cleanup_no_spend_files() {
   rm -f -- "$PRICE_BODY_FILE" "$CHALLENGE_BODY_FILE"
   return "$original_status"
 }
-trap 'status=$?; cleanup_no_spend_files "$status"; exit "$status"' EXIT
+trap 'exit_code=$?; cleanup_no_spend_files "$exit_code"; exit "$exit_code"' EXIT
 price_status="$(curl --silent --show-error --output "$PRICE_BODY_FILE" --write-out '%{http_code}' \
   "$X402_ENDPOINT/x402/price")"
 test "$price_status" = '200'
