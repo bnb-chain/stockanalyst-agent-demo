@@ -42,7 +42,7 @@ from a2a.utils import get_data_parts, new_agent_parts_message
 from a2a.utils.errors import ServerError
 
 from seller_core import SellerCore
-from x402_envelope import dispatch_x402_envelope
+from x402_envelope import _validate_public_base_url, dispatch_x402_envelope
 
 logger = logging.getLogger("seller-agent.a2a")
 
@@ -70,7 +70,11 @@ class SellerAgentExecutor(SellerCore, AgentExecutor):
     ) -> None:
         super().__init__(*args, **kwargs)
         self._x402_app = x402_app
-        self._x402_public_base_url = x402_public_base_url.rstrip("/")
+        self._x402_public_base_url = (
+            _validate_public_base_url(x402_public_base_url)
+            if x402_public_base_url
+            else ""
+        )
 
     # -- A2A entrypoints -------------------------------------------------------
     async def execute(self, context: RequestContext, event_queue: EventQueue) -> None:

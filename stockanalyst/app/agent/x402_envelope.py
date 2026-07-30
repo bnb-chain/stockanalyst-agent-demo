@@ -5,6 +5,7 @@ import base64
 import re
 from dataclasses import dataclass
 from typing import Any
+from urllib.parse import urlsplit
 
 
 class EnvelopeError(ValueError):
@@ -19,6 +20,7 @@ _ROUTES = {
 }
 _JOB_ROUTE = re.compile(r"/x402/jobs/x402_[0-9a-f]{32}(?:/resume)?\Z")
 _HEADER_NAME = re.compile(r"[a-z0-9-]+\Z")
+_REQUEST_ID = re.compile(r"x402gw_[0-9a-f]{64}\Z")
 _REQUEST_HEADERS = {"accept", "content-type", "x-payment", "x-job-token"}
 _RESPONSE_HEADERS = {
     "content-type",
@@ -95,17 +97,16 @@ def _validate_request(
 ) -> _Request:
     if not isinstance(envelope, dict) or set(envelope) != _ENVELOPE_FIELDS:
         raise EnvelopeError("invalid_envelope")
-    if envelope["version"] != "envelope-v1":
+    if type(envelope["version"]) is not int or envelope["version"] != 1:
         raise EnvelopeError("invalid_envelope_version")
 
     request_id = envelope["requestId"]
-    if not isinstance(request_id, str) or not request_id:
+    if not isinstance(request_id, str) or not _REQUEST_ID.fullmatch(request_id):
         raise EnvelopeError("invalid_request_id")
 
-    public_base_url = envelope["publicBaseUrl"]
-    if not isinstance(public_base_url, str):
-        raise EnvelopeError("invalid_public_base_url")
-    if public_base_url.rstrip("/") != expected_public_base_url.rstrip("/"):
+    expected_base_url = _validate_public_base_url(expected_public_base_url)
+    public_base_url = _validate_public_base_url(envelope["publicBaseUrl"])
+    if public_base_url != expected_base_url:
         raise EnvelopeError("public_base_mismatch")
 
     method = envelope["method"]
@@ -115,13 +116,17 @@ def _validate_request(
     if not _is_allowed_route(method, path):
         raise EnvelopeError("route_not_allowed")
 
+    body = _decode_request_body(envelope["bodyBase64"])
+    if method == "GET" and body:
+        raise EnvelopeError("get_request_body_not_allowed")
+
     return _Request(
         request_id=request_id,
         method=method,
         path=path,
         headers=_validate_request_headers(envelope["headers"]),
-        body=_decode_request_body(envelope["bodyBase64"]),
-        public_base_url=public_base_url.rstrip("/"),
+        body=body,
+        public_base_url=public_base_url,
     )
 
 
@@ -133,6 +138,30 @@ def _is_allowed_route(method: str, path: str) -> bool:
     return (method == "GET" and not path.endswith("/resume")) or (
         method == "POST" and path.endswith("/resume")
     )
+
+
+def _validate_public_base_url(value: Any) -> str:
+    if not isinstance(value, str) or not value:
+        raise EnvelopeError("invalid_public_base_url")
+    if any(ord(char) <= 0x20 for char in value):
+        raise EnvelopeError("invalid_public_base_url")
+    try:
+        parsed = urlsplit(value)
+        port = parsed.port
+    except ValueError as exc:
+        raise EnvelopeError("invalid_public_base_url") from exc
+    if (
+        parsed.scheme != "https"
+        or not parsed.netloc
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+        or (port is not None and not 1 <= port <= 65535)
+    ):
+        raise EnvelopeError("invalid_public_base_url")
+    return value.rstrip("/")
 
 
 def _validate_request_headers(headers: Any) -> list[tuple[bytes, bytes]]:

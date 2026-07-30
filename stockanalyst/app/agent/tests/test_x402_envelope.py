@@ -7,14 +7,15 @@ from unittest.mock import AsyncMock
 from x402_envelope import EnvelopeError, dispatch_x402_envelope
 
 
-PUBLIC_BASE = "https://gateway.example.test/x402"
+PUBLIC_BASE = "https://gateway.example.test/stages/testnet"
 JOB_ID = "x402_" + "a" * 32
+REQUEST_ID = "x402gw_" + "a" * 64
 
 
 def request_envelope(**overrides) -> dict:
     envelope = {
-        "version": "envelope-v1",
-        "requestId": "request-123",
+        "version": 1,
+        "requestId": REQUEST_ID,
         "method": "GET",
         "path": "/x402/price",
         "headers": {"accept": "application/json"},
@@ -63,6 +64,41 @@ async def streaming_app(scope, receive, send) -> None:
 
 
 class X402EnvelopeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_dispatch_accepts_integer_envelope_version_only(self) -> None:
+        result = await dispatch_x402_envelope(
+            recording_app,
+            request_envelope(version=1),
+            expected_public_base_url=PUBLIC_BASE,
+        )
+        self.assertEqual(result["status"], 200)
+
+        for version in ("1", "envelope-v1", True, 1.0, 2):
+            with self.subTest(version=version), self.assertRaisesRegex(
+                EnvelopeError, "invalid_envelope_version"
+            ):
+                await dispatch_x402_envelope(
+                    recording_app,
+                    request_envelope(version=version),
+                    expected_public_base_url=PUBLIC_BASE,
+                )
+
+    async def test_dispatch_requires_bounded_gateway_request_id(self) -> None:
+        for request_id in (
+            "request-123",
+            "x402gw_" + "A" * 64,
+            "x402gw_" + "a" * 63,
+            "x402gw_" + "a" * 65,
+            "x402gw_" + "a" * 10_000,
+        ):
+            with self.subTest(request_id_length=len(request_id)), self.assertRaisesRegex(
+                EnvelopeError, "invalid_request_id"
+            ):
+                await dispatch_x402_envelope(
+                    recording_app,
+                    request_envelope(requestId=request_id),
+                    expected_public_base_url=PUBLIC_BASE,
+                )
+
     async def test_dispatch_preserves_402_response(self) -> None:
         envelope = request_envelope(method="POST", path="/x402/analyze/async")
 
@@ -133,6 +169,52 @@ class X402EnvelopeTests(unittest.IsolatedAsyncioTestCase):
                     expected_public_base_url=PUBLIC_BASE,
                 )
                 self.assertEqual(result["status"], 200)
+
+    async def test_dispatch_rejects_nonempty_get_bodies(self) -> None:
+        for path in ("/x402/price", f"/x402/jobs/{JOB_ID}"):
+            with self.subTest(path=path), self.assertRaisesRegex(
+                EnvelopeError, "get_request_body_not_allowed"
+            ):
+                await dispatch_x402_envelope(
+                    recording_app,
+                    request_envelope(
+                        path=path,
+                        bodyBase64=base64.b64encode(b"unexpected").decode(),
+                    ),
+                    expected_public_base_url=PUBLIC_BASE,
+                )
+
+    async def test_dispatch_validates_https_public_base_urls(self) -> None:
+        valid_stage_base = "https://gateway.example.test/prod/v1"
+        result = await dispatch_x402_envelope(
+            recording_app,
+            request_envelope(publicBaseUrl=valid_stage_base),
+            expected_public_base_url=valid_stage_base,
+        )
+        self.assertEqual(result["status"], 200)
+
+        for invalid_base in (
+            "http://gateway.example.test/prod",
+            "https://user:pass@gateway.example.test/prod",
+            "https://gateway.example.test/prod?stage=1",
+            "https://gateway.example.test/prod#fragment",
+        ):
+            with self.subTest(source="configured", base=invalid_base), self.assertRaisesRegex(
+                EnvelopeError, "invalid_public_base_url"
+            ):
+                await dispatch_x402_envelope(
+                    recording_app,
+                    request_envelope(),
+                    expected_public_base_url=invalid_base,
+                )
+            with self.subTest(source="supplied", base=invalid_base), self.assertRaisesRegex(
+                EnvelopeError, "invalid_public_base_url"
+            ):
+                await dispatch_x402_envelope(
+                    recording_app,
+                    request_envelope(publicBaseUrl=invalid_base),
+                    expected_public_base_url=PUBLIC_BASE,
+                )
 
     async def test_dispatch_rejects_non_lowercase_or_unsafe_request_headers(self) -> None:
         for headers in (
@@ -210,6 +292,18 @@ class X402EnvelopeTests(unittest.IsolatedAsyncioTestCase):
 
 
 class X402EnvelopeExecutorTests(unittest.IsolatedAsyncioTestCase):
+    async def test_executor_rejects_invalid_public_base_at_startup(self) -> None:
+        from executor import SellerAgentExecutor
+
+        with self.assertRaisesRegex(EnvelopeError, "invalid_public_base_url"):
+            SellerAgentExecutor(
+                run_work=AsyncMock(),
+                generator="stockanalyst",
+                network="bsc-testnet",
+                x402_app=payment_required_app,
+                x402_public_base_url="http://gateway.example.test/stages/testnet",
+            )
+
     async def test_hidden_envelope_skill_dispatches_without_llm(self) -> None:
         from executor import SellerAgentExecutor
 
