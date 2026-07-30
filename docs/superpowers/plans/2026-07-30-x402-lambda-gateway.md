@@ -645,6 +645,17 @@ git commit -m "feat: bridge x402 HTTP through AgentCore A2A"
 - Consumes: API Gateway REST proxy event; OAuth secret ARN; AgentCore invocation URL.
 - Produces: `handler.lambda_handler(event, context) -> dict`; A2A envelope calls.
 
+**Approved boundary correction (2026-07-30):** Lambda derives the envelope
+`publicBaseUrl` from trusted REST `requestContext.domainName` plus
+`requestContext.stage`, requiring the generated execute-api hostname shape, a
+safe stage, and HTTPS construction. Missing or malformed context maps to the
+safe configuration `503`; caller `Host` and `X-Forwarded-*` never influence
+the value. `build_envelope(public_base_url=...)` remains unchanged, but Lambda
+configuration now consumes only `AGENTCORE_INVOKE_URL` and `OAUTH_SECRET_ARN`.
+The Agent continues to compare the envelope value with its separately
+configured `X402_GATEWAY_PUBLIC_BASE_URL`. Lambda safe logging is one stdout
+root JSON record with exactly request ID, route, status, outcome, and duration.
+
 - [ ] **Step 1: Write failing route and envelope tests**
 
 Test exact method/path validation:
@@ -884,6 +895,18 @@ git commit -m "feat: add x402 Lambda adapter"
 **Interfaces:**
 - Consumes: packaged Lambda source; existing OAuth secret ARN; AgentCore invoke URL.
 - Produces: stack output `X402GatewayBaseUrl`.
+
+**Approved infrastructure correction (2026-07-30):** This supersedes the
+earlier sample's Lambda public-base environment and SAM `Events` wiring. The
+REST API owns an explicit OpenAPI definition containing the four fixed
+method/path integrations and references the Lambda; an explicit
+`AWS::Lambda::Permission` authorizes invocation. No Lambda property or
+environment references `X402Api`, removing the API-to-Lambda dependency while
+the output may still reference the API. WAF keeps the `/x402/` IP rate rule and
+count-only AWS common rules, but has no body-size rule: WAF cannot accurately
+represent the application's exact 256 KiB body limit. Lambda and Agent retain
+that validation. Use `LoggingConfig.LogFormat: Text` so the safe stdout JSON
+record is a root CloudWatch log event.
 
 - [ ] **Step 1: Write failing static infrastructure tests**
 

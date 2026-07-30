@@ -2,10 +2,10 @@
 from __future__ import annotations
 
 import json
-import logging
 import os
+import re
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from typing import Any
 
 from agentcore_client import (
@@ -20,9 +20,11 @@ from agentcore_client import (
 from envelope import GatewayRequestError, build_envelope, validate_public_base
 from oauth_client import OAuthClient, OAuthUnavailable, default_token_transport
 
-
-logger = logging.getLogger(__name__)
 _application: "GatewayApplication | None" = None
+_EXECUTE_API_DOMAIN = re.compile(
+    r"[a-z0-9]{10}\.execute-api\.[a-z0-9-]+\.amazonaws\.com(?:\.cn)?\Z"
+)
+_STAGE_NAME = re.compile(r"[a-z0-9-]+\Z")
 
 
 class GatewayConfigurationError(RuntimeError):
@@ -31,8 +33,7 @@ class GatewayConfigurationError(RuntimeError):
 
 class GatewayApplication:
     """Stateless request coordinator; only its OAuth client may warm-cache safely."""
-    def __init__(self, public_base_url: str, oauth: Any, agentcore: Any) -> None:
-        self._public_base_url = public_base_url
+    def __init__(self, oauth: Any, agentcore: Any) -> None:
         self._oauth = oauth
         self._agentcore = agentcore
 
@@ -41,7 +42,7 @@ class GatewayApplication:
         request_id: str | None = None
         route: str | None = None
         try:
-            envelope = build_envelope(event, public_base_url=self._public_base_url)
+            envelope = build_envelope(event, public_base_url=_trusted_public_base(event))
             request_id = envelope["requestId"]
             route = f"{envelope['method']} {envelope['path']}"
             authorization_header = self._oauth.authorization_header()
@@ -77,7 +78,7 @@ class GatewayApplication:
 
     @staticmethod
     def _log(request_id: str | None, route: str | None, status: int, outcome: str, started: float) -> None:
-        logger.info(json.dumps({
+        print(json.dumps({
             "requestId": request_id,
             "route": route,
             "status": status,
@@ -93,7 +94,7 @@ def lambda_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
         return _get_application().handle(event)
     except GatewayConfigurationError:
         result = _safe_error(503, "service_unavailable", retryable=True)
-        logger.info(json.dumps({
+        print(json.dumps({
             "requestId": None,
             "route": None,
             "status": result["statusCode"],
@@ -113,18 +114,36 @@ def _get_application() -> GatewayApplication:
 def _application_from_environment(
     environment: dict[str, str], secret_reader_factory: Callable[[str], Callable[[], str]],
 ) -> GatewayApplication:
-    public_base_url = environment.get("X402_PUBLIC_BASE_URL", "")
     runtime_url = environment.get("AGENTCORE_INVOKE_URL", "")
     secret_arn = environment.get("OAUTH_SECRET_ARN", "")
-    if not public_base_url or not runtime_url or not secret_arn:
+    if not runtime_url or not secret_arn:
         raise GatewayConfigurationError("gateway_configuration_missing")
     try:
-        public_base_url = validate_public_base(public_base_url)
         oauth = OAuthClient(secret_reader_factory(secret_arn), default_token_transport)
         agentcore = AgentCoreClient(runtime_url, oauth.authorization_header, default_agentcore_transport)
-    except (GatewayRequestError, ValueError) as exc:
+    except ValueError as exc:
         raise GatewayConfigurationError("gateway_configuration_invalid") from exc
-    return GatewayApplication(public_base_url, oauth, agentcore)
+    return GatewayApplication(oauth, agentcore)
+
+
+def _trusted_public_base(event: Mapping[str, Any]) -> str:
+    """Build the public origin from API Gateway's REST context, never caller headers."""
+    request_context = event.get("requestContext")
+    if not isinstance(request_context, Mapping):
+        raise GatewayConfigurationError("gateway_request_context_missing")
+    domain_name = request_context.get("domainName")
+    stage = request_context.get("stage")
+    if (
+        not isinstance(domain_name, str)
+        or not isinstance(stage, str)
+        or not _EXECUTE_API_DOMAIN.fullmatch(domain_name)
+        or not _STAGE_NAME.fullmatch(stage)
+    ):
+        raise GatewayConfigurationError("gateway_request_context_invalid")
+    try:
+        return validate_public_base(f"https://{domain_name}/{stage}")
+    except GatewayRequestError as exc:
+        raise GatewayConfigurationError("gateway_request_context_invalid") from exc
 
 
 def _secrets_manager_reader(secret_arn: str) -> Callable[[], str]:
