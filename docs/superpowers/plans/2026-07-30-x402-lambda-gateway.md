@@ -913,14 +913,20 @@ record is a root CloudWatch log event.
 Create tests that read the template text and assert:
 
 ```python
-def test_template_has_only_four_api_events(self) -> None:
+def test_template_has_only_the_four_live_alias_openapi_routes(self) -> None:
     text = TEMPLATE.read_text()
-    self.assertIn("Path: /x402/price", text)
-    self.assertIn("Path: /x402/analyze/async", text)
-    self.assertIn("Path: /x402/jobs/{jobId}", text)
-    self.assertIn("Path: /x402/jobs/{jobId}/resume", text)
+    for method, path in (
+        ("get", "/x402/price"),
+        ("post", "/x402/analyze/async"),
+        ("get", "/x402/jobs/{jobId}"),
+        ("post", "/x402/jobs/{jobId}/resume"),
+    ):
+        self.assertRegex(text, rf"(?ms)^          {re.escape(path)}:\n            {method}:")
+    self.assertEqual(text.count("x-amazon-apigateway-integration:"), 4)
+    self.assertEqual(text.count("${X402Adapter.Arn}:live/invocations"), 4)
+    self.assertNotIn("${X402Adapter.Arn}/invocations", text)
     self.assertNotIn("{proxy+}", text)
-    self.assertNotIn("Path: /x402/free", text)
+    self.assertNotIn("/x402/free", text)
 
 def test_lambda_secret_policy_is_resource_scoped(self) -> None:
     text = TEMPLATE.read_text()
