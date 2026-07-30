@@ -135,8 +135,9 @@ AGENT_CLIENT_SECRET=<cognito-secret>
 DELIVERY_MODE=ipfs
 PROVIDER_ADDRESS=0x1FF095E1C5Cf4bC72a3DC54be17B6cf85043Fb67
 
-# ── x402 (local agent, no auth needed) ───────────────────────────
-X402_ENDPOINT=http://localhost:9000        # default — set only to override
+# ── x402 (API Gateway in testnet; local agent may use localhost) ─
+X402_ENDPOINT=https://<api-id>.execute-api.us-east-1.amazonaws.com/testnet
+X402_SELLER_WALLET=0xd10BdDC20E4DC42A1a19a9653e994991e25b8153
 # Optional async-client polling deadline; default is 30 minutes.
 X402_POLL_TIMEOUT_MS=1800000
 
@@ -147,8 +148,11 @@ UOMP_GUARD_TOKEN=your_guard_jwt_token
 
 > **Note:** `X402_ENDPOINT` and `AGENT_ENDPOINT` are separate.
 > `AGENT_ENDPOINT` is the deployed A2A path (requires Cognito auth) used by `npm run dev`.
-> `X402_ENDPOINT` is the bare agent URL used by `npm run x402:async` and
-> `npm run x402:free` — it defaults to `http://localhost:9000`.
+> `X402_ENDPOINT` is the API Gateway base URL for the deployed x402 gateway,
+> never the raw AgentCore invocation URL. Local development may instead use
+> `http://localhost:9000`. Only the four paid asynchronous routes are public:
+> price, create, private job status, and private resume; the free route is not
+> exposed through this gateway.
 
 ### AWS AgentCore runtime
 
