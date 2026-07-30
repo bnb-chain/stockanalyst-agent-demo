@@ -551,6 +551,26 @@ x402_jobs = build_x402_job_service(
 )
 
 
+async def _x402_not_found(scope, receive, send):
+    await send({
+        "type": "http.response.start",
+        "status": 404,
+        "headers": [(b"content-type", b"application/json")],
+    })
+    await send({
+        "type": "http.response.body",
+        "body": b'{"error":"not found"}',
+        "more_body": False,
+    })
+
+
+x402_app = X402Handler(
+    _x402_not_found,
+    free_stream_work=_stream_free,
+    job_service=x402_jobs,
+)
+
+
 def _default_network() -> str:
     """studio.toml ``[network].default`` (best-effort; used by the funded sweep)."""
     try:
@@ -567,7 +587,13 @@ def _default_network() -> str:
 # card + JSON-RPC message/send on 0.0.0.0:9000, adds GET /ping, and overwrites
 # the card url with the deployed runtime URL ($AGENTCORE_RUNTIME_URL).
 executor = SellerAgentExecutor(
-    run_work=_run_llm, generator=GENERATOR, network=_default_network()
+    run_work=_run_llm,
+    generator=GENERATOR,
+    network=_default_network(),
+    x402_app=x402_app,
+    x402_public_base_url=os.environ.get(
+        "X402_GATEWAY_PUBLIC_BASE_URL", ""
+    ),
 )
 agent_card = build_agent_card()
 
@@ -719,20 +745,11 @@ if __name__ == "__main__":
         #
         # In local dev X402_PORT is NOT set; the combined single-port mode below is used instead.
 
-        async def _x402_404(scope, receive, send):
-            await send({"type": "http.response.start", "status": 404,
-                        "headers": [(b"content-type", b"application/json")]})
-            await send({"type": "http.response.body", "body": b'{"error":"not found"}'})
-
-        _x402_standalone = X402Handler(
-            _x402_404,
-            free_stream_work=_stream_free,
-            job_service=x402_jobs,
-        )
-
         async def _serve_both():
             a2a_cfg  = uvicorn.Config(_a2a_app,         host=bind_host, port=a2a_port,  log_level="info")
-            x402_cfg = uvicorn.Config(_x402_standalone, host=bind_host, port=x402_port, log_level="info")
+            x402_cfg = uvicorn.Config(
+                x402_app, host=bind_host, port=x402_port, log_level="info"
+            )
             await asyncio.gather(
                 uvicorn.Server(a2a_cfg).serve(),
                 uvicorn.Server(x402_cfg).serve(),
@@ -744,9 +761,10 @@ if __name__ == "__main__":
         # --- Single-port mode (local dev / bag dev) ---
         # x402 routes and A2A routes share port 9000 via ASGI middleware layering.
         # AgentCore is not present locally, so x402 is reachable at localhost:9000/x402/*.
-        _combined = X402Handler(
-            _a2a_app,
-            free_stream_work=_stream_free,
-            job_service=x402_jobs,
-        )
+        async def _combined(scope, receive, send):
+            if scope["type"] == "http" and scope.get("path", "").startswith("/x402"):
+                await x402_app(scope, receive, send)
+                return
+            await _a2a_app(scope, receive, send)
+
         uvicorn.run(_combined, host=bind_host, port=a2a_port, log_level="info")

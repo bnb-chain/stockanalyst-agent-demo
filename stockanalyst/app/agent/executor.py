@@ -42,6 +42,7 @@ from a2a.utils import get_data_parts, new_agent_parts_message
 from a2a.utils.errors import ServerError
 
 from seller_core import SellerCore
+from x402_envelope import dispatch_x402_envelope
 
 logger = logging.getLogger("seller-agent.a2a")
 
@@ -60,29 +61,23 @@ class SellerAgentExecutor(SellerCore, AgentExecutor):
     prose never triggers an LLM call or a paid action.
     """
 
+    def __init__(
+        self,
+        *args,
+        x402_app=None,
+        x402_public_base_url: str = "",
+        **kwargs,
+    ) -> None:
+        super().__init__(*args, **kwargs)
+        self._x402_app = x402_app
+        self._x402_public_base_url = x402_public_base_url.rstrip("/")
+
     # -- A2A entrypoints -------------------------------------------------------
     async def execute(self, context: RequestContext, event_queue: EventQueue) -> None:
         data = self._inbound(context)
         skill = data.get("skill")
         try:
-            if skill == "negotiate":
-                result = await self.negotiate(data)
-            elif skill == "notify_funded":
-                result = await self.notify_funded(data)
-            else:
-                # Includes a plain text message (no DataPart → skill is None):
-                # the seller has no free-form skill, so prose is rejected here.
-                result = {
-                    "error": f"unknown skill: {skill!r}",
-                    "skills": self._skills(),
-                }
-                if skill is None:
-                    # Most common cause: the caller put the JSON envelope in a
-                    # "text" part. Structured skill calls must ride in a DataPart.
-                    result["hint"] = (
-                        'send the skill envelope as an A2A data part: '
-                        'parts:[{"kind":"data","data":{"skill":"negotiate",...}}]'
-                    )
+            result = await self.dispatch_skill(data)
         except Exception as e:
             # A genuine internal fault is surfaced as a JSON-RPC error, NOT masked
             # as a successful result. A *plain* exception would hang/500 the caller
@@ -97,6 +92,41 @@ class SellerAgentExecutor(SellerCore, AgentExecutor):
                 error=InternalError(message=f"{type(e).__name__}: {e}")
             ) from e
         await self._reply(event_queue, context, result)
+
+    async def dispatch_skill(self, data: dict[str, Any]) -> dict[str, Any]:
+        """Dispatch a structured A2A data part without advertising internal routes.
+
+        The envelope bridge is intentionally internal and omitted from `_skills`.
+        """
+        skill = data.get("skill")
+        if skill == "x402_http_envelope":
+            if self._x402_app is None or not self._x402_public_base_url:
+                raise RuntimeError("x402 envelope bridge is not configured")
+            return await dispatch_x402_envelope(
+                self._x402_app,
+                data.get("envelope"),
+                expected_public_base_url=self._x402_public_base_url,
+            )
+        if skill == "negotiate":
+            return await self.negotiate(data)
+        if skill == "notify_funded":
+            return await self.notify_funded(data)
+        return self._unknown_skill(skill)
+
+    def _unknown_skill(self, skill: Any) -> dict[str, Any]:
+        # Includes a plain text message (no DataPart → skill is None): the seller
+        # has no free-form skill, so prose is rejected here.
+        result = {
+            "error": f"unknown skill: {skill!r}",
+            "skills": self._skills(),
+        }
+        if skill is None:
+            # Most common cause: the caller put the JSON envelope in a text part.
+            result["hint"] = (
+                'send the skill envelope as an A2A data part: '
+                'parts:[{"kind":"data","data":{"skill":"negotiate",...}}]'
+            )
+        return result
 
     async def cancel(self, context: RequestContext, event_queue: EventQueue) -> None:
         # negotiate is synchronous; notify_funded acks then delivers on-chain in

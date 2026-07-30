@@ -196,7 +196,7 @@ class X402JobRuntimeTests(unittest.IsolatedAsyncioTestCase):
             )
         )
 
-    def test_main_constructs_one_service_and_shares_it_with_both_handlers(
+    def test_main_constructs_one_service_and_injects_one_x402_handler(
         self,
     ) -> None:
         tree = ast.parse(MAIN_PATH.read_text(encoding="utf-8"))
@@ -221,7 +221,7 @@ class X402JobRuntimeTests(unittest.IsolatedAsyncioTestCase):
         ]
 
         self.assertEqual(len(service_builds), 1)
-        self.assertEqual(len(handlers), 2)
+        self.assertEqual(len(handlers), 1)
         for handler in handlers:
             job_service = next(
                 keyword.value
