@@ -66,54 +66,118 @@ This preflight has no payment or data-plane charge.
 
 ## Create the gateway OAuth secret
 
-Create a dedicated confidential Cognito app client with its own generated
-secret and the minimum client-credentials scope. Assign the returned values to
-shell variables while tracing is disabled; do not use `--output` in a way that
-prints the client secret.
+Create a dedicated confidential Cognito app client with the minimum
+client-credentials scope. This flow first performs read-only, exact-name
+collision checks. Stop if either resource exists: never reuse, overwrite, or
+delete a pre-existing client or secret. The client secret and full Cognito
+response never enter shell variables or command arguments. They are held only
+in 0600 temporary files long enough to create the Secrets Manager value.
 
 ```bash
 export AWS_PROFILE=dev
 set -eu
 set +x
+umask 077
 export AWS_REGION=us-east-1
 export COGNITO_USER_POOL_ID='<user-pool-id>'
-export GATEWAY_CLIENT_JSON="$(aws cognito-idp create-user-pool-client \
-  --region "$AWS_REGION" \
-  --user-pool-id "$COGNITO_USER_POOL_ID" \
-  --client-name 'stockanalyst-x402-gateway' \
-  --generate-secret \
-  --allowed-o-auth-flows client_credentials \
-  --allowed-o-auth-scopes '<resource-server-identifier>/<scope>' \
-  --allowed-o-auth-flows-user-pool-client \
-  --output json)"
-export GATEWAY_CLIENT_ID="$(python3 -c 'import json,os; print(json.loads(os.environ["GATEWAY_CLIENT_JSON"])["UserPoolClient"]["ClientId"])')"
-export GATEWAY_CLIENT_SECRET="$(python3 -c 'import json,os; print(json.loads(os.environ["GATEWAY_CLIENT_JSON"])["UserPoolClient"]["ClientSecret"])')"
-```
-
-Before running the next block, replace the placeholder token URL with the
-Cognito domain issued for this user pool. The variable assignment suppresses
-the secret from normal output; keep `set +x` in effect.
-
-```bash
-export AWS_PROFILE=dev
-set -eu
-set +x
-export AWS_REGION=us-east-1
+export GATEWAY_CLIENT_NAME='stockanalyst-x402-gateway'
+export OAUTH_SECRET_NAME='stockanalyst/x402-gateway/oauth'
 export COGNITO_TOKEN_URL='https://<domain>.auth.us-east-1.amazoncognito.com/oauth2/token'
 export COGNITO_SCOPE='<resource-server-identifier>/<scope>'
-GATEWAY_OAUTH_SECRET="$(python3 -c 'import json,os; print(json.dumps({"client_id":os.environ["GATEWAY_CLIENT_ID"],"client_secret":os.environ["GATEWAY_CLIENT_SECRET"],"token_url":os.environ["COGNITO_TOKEN_URL"],"scope":os.environ["COGNITO_SCOPE"]},separators=(",",":")))')"
+CLIENT_LIST_FILE="$(mktemp "${TMPDIR:-/tmp}/x402-cognito-client-list.XXXXXX")"
+CLIENT_RESPONSE_FILE="$(mktemp "${TMPDIR:-/tmp}/x402-cognito-client-response.XXXXXX")"
+OAUTH_SECRET_FILE="$(mktemp "${TMPDIR:-/tmp}/x402-oauth-secret.XXXXXX")"
+SECRET_PROBE_ERROR_FILE="$(mktemp "${TMPDIR:-/tmp}/x402-secret-probe.XXXXXX")"
+chmod 600 "$CLIENT_LIST_FILE" "$CLIENT_RESPONSE_FILE" "$OAUTH_SECRET_FILE" "$SECRET_PROBE_ERROR_FILE"
+CREATED_CLIENT_ID=''
+cleanup_gateway_oauth_provisioning() {
+  original_status="$1"
+  rm -f -- "$CLIENT_LIST_FILE" "$CLIENT_RESPONSE_FILE" "$OAUTH_SECRET_FILE" "$SECRET_PROBE_ERROR_FILE"
+  if test "$original_status" -ne 0 && test -n "$CREATED_CLIENT_ID"; then
+    aws cognito-idp delete-user-pool-client \
+      --region "$AWS_REGION" \
+      --user-pool-id "$COGNITO_USER_POOL_ID" \
+      --client-id "$CREATED_CLIENT_ID" >/dev/null 2>&1 || :
+  fi
+}
+trap 'status=$?; cleanup_gateway_oauth_provisioning "$status"; exit "$status"' EXIT
+
+# Read-only Cognito-name preflight. A paginated result fails closed.
+aws cognito-idp list-user-pool-clients \
+  --region "$AWS_REGION" \
+  --user-pool-id "$COGNITO_USER_POOL_ID" \
+  --max-results 60 > "$CLIENT_LIST_FILE"
+python3 - "$CLIENT_LIST_FILE" "$GATEWAY_CLIENT_NAME" <<'PY'
+import json
+import sys
+
+clients = json.load(open(sys.argv[1], encoding="utf-8"))
+if clients.get("NextToken"):
+    raise SystemExit("Cognito client preflight is paginated; stop and resolve the name collision manually")
+if any(item.get("ClientName") == sys.argv[2] for item in clients.get("UserPoolClients", [])):
+    raise SystemExit("Cognito client name already exists; stop without changing it")
+PY
+
+# Read-only Secrets Manager preflight. Only ResourceNotFound may proceed.
+if aws secretsmanager describe-secret \
+  --region "$AWS_REGION" \
+  --secret-id "$OAUTH_SECRET_NAME" \
+  --query ARN --output text >/dev/null 2>"$SECRET_PROBE_ERROR_FILE"; then
+  printf '%s\n' 'Gateway OAuth secret already exists; stop without changing it' >&2
+  exit 1
+fi
+if ! rg -q 'ResourceNotFoundException' "$SECRET_PROBE_ERROR_FILE"; then
+  printf '%s\n' 'Could not safely determine whether the gateway OAuth secret exists; stop' >&2
+  exit 1
+fi
+
+# Only the new ID is retained. The create response's secret is not printed.
+CREATED_CLIENT_ID="$(aws cognito-idp create-user-pool-client \
+  --region "$AWS_REGION" \
+  --user-pool-id "$COGNITO_USER_POOL_ID" \
+  --client-name "$GATEWAY_CLIENT_NAME" \
+  --generate-secret \
+  --allowed-o-auth-flows client_credentials \
+  --allowed-o-auth-scopes "$COGNITO_SCOPE" \
+  --allowed-o-auth-flows-user-pool-client \
+  --query 'UserPoolClient.ClientId' --output text)"
+test -n "$CREATED_CLIENT_ID" && test "$CREATED_CLIENT_ID" != 'None'
+aws cognito-idp describe-user-pool-client \
+  --region "$AWS_REGION" \
+  --user-pool-id "$COGNITO_USER_POOL_ID" \
+  --client-id "$CREATED_CLIENT_ID" > "$CLIENT_RESPONSE_FILE"
+python3 - "$CLIENT_RESPONSE_FILE" "$OAUTH_SECRET_FILE" "$COGNITO_TOKEN_URL" "$COGNITO_SCOPE" <<'PY'
+import json
+import sys
+
+response_path, secret_path, token_url, scope = sys.argv[1:]
+response = json.load(open(response_path, encoding="utf-8"))
+client = response["UserPoolClient"]
+with open(secret_path, "w", encoding="utf-8") as secret_file:
+    json.dump({
+        "client_id": client["ClientId"],
+        "client_secret": client["ClientSecret"],
+        "token_url": token_url,
+        "scope": scope,
+    }, secret_file, separators=(",", ":"))
+PY
+chmod 600 "$OAUTH_SECRET_FILE"
 export OAUTH_SECRET_ARN="$(aws secretsmanager create-secret \
   --region "$AWS_REGION" \
-  --name 'stockanalyst/x402-gateway/oauth' \
-  --secret-string "$GATEWAY_OAUTH_SECRET" \
+  --name "$OAUTH_SECRET_NAME" \
+  --secret-string "file://$OAUTH_SECRET_FILE" \
   --query ARN --output text)"
-unset GATEWAY_OAUTH_SECRET GATEWAY_CLIENT_JSON GATEWAY_CLIENT_SECRET
+test -n "$OAUTH_SECRET_ARN" && test "$OAUTH_SECRET_ARN" != 'None'
+CREATED_CLIENT_ID=''
+cleanup_gateway_oauth_provisioning 0
+trap - EXIT
 ```
 
-Record the ARN in protected operator configuration. Do not put it, a client
-secret, or a token in source control. If an existing dedicated client and
-secret are being reused, retrieve only their identifiers into shell variables
-with tracing disabled; never print `SecretString`.
+If the secret creation fails, the EXIT trap removes every temporary file and
+deletes only the just-created, undistributed Cognito client, retaining the
+original failure status. It never deletes a resource found by the collision
+preflight. Record the resulting ARN in protected operator configuration; do not
+put it, a client secret, or a token in source control.
 
 ## Deploy the Agent and gateway
 
@@ -136,7 +200,15 @@ export AWS_REGION=us-east-1
 export X402_STACK_NAME='stockanalyst-x402-testnet'
 export X402_ARTIFACT_BUCKET='<private-artifact-bucket>'
 export AGENTCORE_INVOKE_URL='https://bedrock-agentcore.<region>.amazonaws.com/<runtime-invocation-path>'
-export X402_PACKAGED_TEMPLATE="$(mktemp "${TMPDIR:-/tmp}/x402-gateway-packaged.XXXXXX.yaml")"
+umask 077
+X402_PACKAGED_TEMPLATE="$(mktemp "${TMPDIR:-/tmp}/x402-gateway-packaged.XXXXXX")"
+chmod 600 "$X402_PACKAGED_TEMPLATE"
+cleanup_packaged_template() {
+  original_status="$1"
+  rm -f -- "$X402_PACKAGED_TEMPLATE"
+  return "$original_status"
+}
+trap 'status=$?; cleanup_packaged_template "$status"; exit "$status"' EXIT
 aws cloudformation package \
   --region "$AWS_REGION" \
   --template-file infra/x402-lambda-gateway.yaml \
@@ -151,7 +223,8 @@ aws cloudformation deploy \
     StageName=testnet \
     AgentCoreInvokeUrl="$AGENTCORE_INVOKE_URL" \
     OAuthSecretArn="$OAUTH_SECRET_ARN"
-rm -f -- "$X402_PACKAGED_TEMPLATE"
+cleanup_packaged_template 0
+trap - EXIT
 unset X402_PACKAGED_TEMPLATE
 ```
 
@@ -179,10 +252,37 @@ challenge only; neither includes `X-Payment` or creates a paid job.
 
 ```bash
 set -eu
-curl --fail-with-body "$X402_ENDPOINT/x402/price"
-curl --fail-with-body -X POST "$X402_ENDPOINT/x402/analyze/async" \
+umask 077
+PRICE_BODY_FILE="$(mktemp "${TMPDIR:-/tmp}/x402-price-body.XXXXXX")"
+CHALLENGE_BODY_FILE="$(mktemp "${TMPDIR:-/tmp}/x402-challenge-body.XXXXXX")"
+chmod 600 "$PRICE_BODY_FILE" "$CHALLENGE_BODY_FILE"
+cleanup_no_spend_files() {
+  original_status="$1"
+  rm -f -- "$PRICE_BODY_FILE" "$CHALLENGE_BODY_FILE"
+  return "$original_status"
+}
+trap 'status=$?; cleanup_no_spend_files "$status"; exit "$status"' EXIT
+price_status="$(curl --silent --show-error --output "$PRICE_BODY_FILE" --write-out '%{http_code}' \
+  "$X402_ENDPOINT/x402/price")"
+test "$price_status" = '200'
+challenge_status="$(curl --silent --show-error --output "$CHALLENGE_BODY_FILE" --write-out '%{http_code}' \
+  -X POST "$X402_ENDPOINT/x402/analyze/async" \
   -H 'content-type: application/json' \
-  --data '{"symbols":["AAPL"]}'
+  --data '{"symbols":["AAPL"]}')"
+test "$challenge_status" = '402'
+X402_ENDPOINT="$X402_ENDPOINT" python3 - "$CHALLENGE_BODY_FILE" <<'PY'
+import json
+import os
+import sys
+
+challenge = json.load(open(sys.argv[1], encoding="utf-8"))
+resource = challenge["paymentRequired"]["resource"]
+expected = f'{os.environ["X402_ENDPOINT"]}/x402/analyze/async'
+if resource != expected:
+    raise SystemExit("payment challenge resource did not match the gateway endpoint")
+PY
+cleanup_no_spend_files 0
+trap - EXIT
 ```
 
 The first response is `200`; the second is `402 Payment Required` with the

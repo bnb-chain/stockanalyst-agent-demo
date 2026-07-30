@@ -37,14 +37,14 @@ def api_event(
 ) -> dict[str, Any]:
     """Create the relevant complete shape of an API Gateway REST proxy event."""
     return {
-        "resource": "/{proxy+}",
-        "path": f"/{STAGE}{path}",
+        "resource": path,
+        "path": path,
         "httpMethod": method,
         "headers": headers or {"Accept": "application/json"},
         "multiValueHeaders": {},
         "queryStringParameters": None,
         "multiValueQueryStringParameters": None,
-        "pathParameters": {"proxy": path.removeprefix("/")},
+        "pathParameters": None,
         "stageVariables": None,
         "requestContext": {
             "accountId": "123456789012",
@@ -55,7 +55,7 @@ def api_event(
             "path": f"/{STAGE}{path}",
             "protocol": "HTTP/1.1",
             "requestId": "gateway-request-id",
-            "resourcePath": "/{proxy+}",
+            "resourcePath": path,
             "stage": STAGE,
         },
         "body": body.decode("utf-8") if body is not None else None,
@@ -127,6 +127,14 @@ class FakeAgentCoreTransport:
             raise AssertionError("missing fake OAuth authorization")
         if headers.get("Content-Type") != "application/json":
             raise AssertionError("unexpected AgentCore content type")
+        if headers.get("Accept") != "application/json":
+            raise AssertionError("unexpected AgentCore accept header")
+        session_id = headers.get("X-Amzn-Bedrock-AgentCore-Runtime-Session-Id", "")
+        if not (
+            session_id.startswith("x402-gateway-session-x402gw_")
+            and len(session_id) == len("x402-gateway-session-") + len("x402gw_") + 64
+        ):
+            raise AssertionError("invalid AgentCore session ID")
         if timeout_seconds != 10.0:
             raise AssertionError("unexpected AgentCore timeout")
 
@@ -142,6 +150,8 @@ class FakeAgentCoreTransport:
             or message.get("role") != "user"
             or not isinstance(parts, list)
             or len(parts) != 1
+            or not isinstance(parts[0], dict)
+            or parts[0].get("kind") != "data"
         ):
             raise AssertionError("invalid A2A message shape")
         data = parts[0].get("data") if isinstance(parts[0], dict) else None
@@ -171,6 +181,25 @@ class GatewayIntegrationTests(unittest.TestCase):
     def invoke(self, event: dict[str, Any]) -> dict[str, Any]:
         with patch.object(handler, "_application", self.application):
             return handler.lambda_handler(event, CONTEXT)
+
+    def test_api_event_matches_explicit_rest_route_shape(self) -> None:
+        event = api_event(
+            method="POST",
+            path="/x402/analyze/async",
+            body=b'{"symbols":["AAPL"]}',
+        )
+
+        self.assertEqual(event["resource"], "/x402/analyze/async")
+        self.assertEqual(event["path"], "/x402/analyze/async")
+        self.assertIsNone(event["pathParameters"])
+        self.assertEqual(
+            event["requestContext"]["resourcePath"],
+            "/x402/analyze/async",
+        )
+        self.assertEqual(
+            event["requestContext"]["path"],
+            "/testnet/x402/analyze/async",
+        )
 
     def test_missing_payment_round_trip_returns_real_402(self) -> None:
         response = self.invoke(api_event(
