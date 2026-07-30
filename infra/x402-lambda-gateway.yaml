@@ -19,9 +19,12 @@ Parameters:
     MinValue: 100
   ReservedConcurrency:
     Type: Number
-    Default: 10
-    MinValue: 1
+    Default: 0
+    MinValue: 0
     MaxValue: 100
+
+Conditions:
+  UseReservedConcurrency: !Not [!Equals [!Ref ReservedConcurrency, 0]]
 
 Resources:
   X402Api:
@@ -87,7 +90,7 @@ Resources:
       AutoPublishAlias: live
       Timeout: 28
       MemorySize: 256
-      ReservedConcurrentExecutions: !Ref ReservedConcurrency
+      ReservedConcurrentExecutions: !If [UseReservedConcurrency, !Ref ReservedConcurrency, !Ref "AWS::NoValue"]
       Tracing: Active
       LoggingConfig:
         LogFormat: Text

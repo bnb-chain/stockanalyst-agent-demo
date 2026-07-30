@@ -49,7 +49,10 @@ class X402LambdaGatewayTemplateTests(unittest.TestCase):
         self.assertIn("CodeUri: ../gateway/x402_lambda/src", adapter)
         self.assertIn("AutoPublishAlias: live", adapter)
         self.assertIn("Timeout: 28", adapter)
-        self.assertIn("ReservedConcurrentExecutions: !Ref ReservedConcurrency", adapter)
+        self.assertIn(
+            'ReservedConcurrentExecutions: !If [UseReservedConcurrency, !Ref ReservedConcurrency, !Ref "AWS::NoValue"]',
+            adapter,
+        )
         self.assertIn("Tracing: Active", adapter)
         self.assertIn("LoggingConfig:\n        LogFormat: Text", adapter)
         self.assertNotIn("VpcConfig:", adapter)
@@ -63,6 +66,26 @@ class X402LambdaGatewayTemplateTests(unittest.TestCase):
         self.assertIsNotNone(environment)
         names = re.findall(r"^\s{10}([A-Z0-9_]+):", environment.group("variables"), re.MULTILINE)
         self.assertEqual(names, ["AGENTCORE_INVOKE_URL", "OAUTH_SECRET_ARN"])
+
+    def test_reserved_concurrency_is_optional_and_defaults_off(self) -> None:
+        text = TEMPLATE.read_text()
+        adapter = resource_section(text, "X402Adapter", "X402ApiInvokePermission")
+        parameter = re.search(
+            r"(?ms)^  ReservedConcurrency:\n(?P<section>(?:    .*\n)+)",
+            text,
+        )
+
+        self.assertIsNotNone(parameter)
+        self.assertIn("Default: 0", parameter.group("section"))
+        self.assertIn("MinValue: 0", parameter.group("section"))
+        self.assertIn(
+            "UseReservedConcurrency: !Not [!Equals [!Ref ReservedConcurrency, 0]]",
+            text,
+        )
+        self.assertIn(
+            'ReservedConcurrentExecutions: !If [UseReservedConcurrency, !Ref ReservedConcurrency, !Ref "AWS::NoValue"]',
+            adapter,
+        )
 
     def test_lambda_secret_policy_is_one_resource_scoped_action(self) -> None:
         text = TEMPLATE.read_text()
