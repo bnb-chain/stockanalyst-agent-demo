@@ -4,6 +4,7 @@ from __future__ import annotations
 import base64
 import json
 import re
+import secrets
 import socket
 from collections.abc import Callable, Mapping
 from typing import Any
@@ -77,7 +78,7 @@ class AgentCoreClient:
                 "parts": [{"kind": "data", "data": {"skill": "x402_http_envelope", "envelope": dict(envelope)}}],
             }},
         }, separators=(",", ":")).encode("utf-8")
-        session_id = f"x402-gateway-session-{request_id}"
+        session_id = f"x402-gateway-session-{secrets.token_hex(16)}"
         try:
             response = self._transport(
                 url=self._runtime_url,

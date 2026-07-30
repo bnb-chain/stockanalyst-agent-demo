@@ -5,6 +5,7 @@ import asyncio
 import base64
 import json
 import os
+import re
 import unittest
 from typing import Any
 from unittest.mock import patch
@@ -130,10 +131,7 @@ class FakeAgentCoreTransport:
         if headers.get("Accept") != "application/json":
             raise AssertionError("unexpected AgentCore accept header")
         session_id = headers.get("X-Amzn-Bedrock-AgentCore-Runtime-Session-Id", "")
-        if not (
-            session_id.startswith("x402-gateway-session-x402gw_")
-            and len(session_id) == len("x402-gateway-session-") + len("x402gw_") + 64
-        ):
+        if re.fullmatch(r"x402-gateway-session-[0-9a-f]{32}", session_id) is None:
             raise AssertionError("invalid AgentCore session ID")
         if timeout_seconds != 10.0:
             raise AssertionError("unexpected AgentCore timeout")

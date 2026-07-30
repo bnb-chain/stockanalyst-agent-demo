@@ -62,11 +62,16 @@ class AgentTransport:
         self.last_url = None
         self.last_headers = None
         self.last_body = None
+        self.calls = []
 
     def __call__(self, *, url, headers, body, timeout_seconds):
         self.last_url = url
         self.last_headers = dict(headers)
         self.last_body = body
+        self.calls.append({
+            "headers": dict(headers),
+            "body": body,
+        })
         if self.error:
             raise self.error
         return self.response
@@ -84,14 +89,47 @@ class AgentCoreClientTests(unittest.TestCase):
         self.assertEqual(data, {"skill": "x402_http_envelope", "envelope": ENVELOPE})
         self.assertEqual(transport.last_headers["Authorization"], "Bearer access-token")
         self.assertEqual(transport.last_headers["Content-Type"], "application/json")
-        self.assertEqual(
+        self.assertRegex(
             transport.last_headers["X-Amzn-Bedrock-AgentCore-Runtime-Session-Id"],
-            f"x402-gateway-session-{REQUEST_ID}",
-        )
-        self.assertGreaterEqual(
-            len(transport.last_headers["X-Amzn-Bedrock-AgentCore-Runtime-Session-Id"]), 33
+            r"\Ax402-gateway-session-[0-9a-f]{32}\Z",
         )
         self.assertEqual(response, response_envelope())
+
+    def test_identical_requests_use_fresh_sessions_but_keep_request_binding(self):
+        transport = AgentTransport(a2a_response(response_envelope()))
+        client = AgentCoreClient(
+            "https://agentcore.example.test/runtime",
+            lambda: "Bearer access-token",
+            transport,
+        )
+
+        with patch(
+            "agentcore_client.secrets.token_hex",
+            side_effect=["a" * 32, "b" * 32],
+        ):
+            client.invoke(ENVELOPE)
+            client.invoke(ENVELOPE)
+
+        session_ids = [
+            call["headers"]["X-Amzn-Bedrock-AgentCore-Runtime-Session-Id"]
+            for call in transport.calls
+        ]
+        self.assertEqual(session_ids, [
+            f"x402-gateway-session-{'a' * 32}",
+            f"x402-gateway-session-{'b' * 32}",
+        ])
+        self.assertNotEqual(session_ids[0], session_ids[1])
+        requests = [json.loads(call["body"]) for call in transport.calls]
+        self.assertEqual(requests[0], requests[1])
+        self.assertEqual(requests[0]["id"], REQUEST_ID)
+        self.assertEqual(
+            requests[0]["params"]["message"]["messageId"],
+            REQUEST_ID,
+        )
+        self.assertEqual(
+            requests[0]["params"]["message"]["parts"][0]["data"]["envelope"]["requestId"],
+            REQUEST_ID,
+        )
 
     def test_rejects_mismatched_response_request_id(self):
         client = AgentCoreClient(
