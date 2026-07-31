@@ -23,6 +23,7 @@ def signed_proof(
     value: object = str(verify.PRICE_WEI),
     *,
     valid_before: int = NOW + 600,
+    accepted_overrides: dict[str, object] | None = None,
 ) -> str:
     account = Account.from_key("0x" + "11" * 32)
     nonce = bytes.fromhex("22" * 32)
@@ -47,10 +48,16 @@ def signed_proof(
     ).signature.hex()
     if not signature.startswith("0x"):
         signature = "0x" + signature
+    accepted = verify.build_payment_requirement(SUPPORTED_EXTRA)
+    accepted.update(accepted_overrides or {})
     proof = {
         "x402Version": 2,
-        "scheme": "exact",
-        "network": f"eip155:{verify.CHAIN_ID}",
+        "resource": {
+            "url": RESOURCE_URL,
+            "description": "Stock analysis report",
+            "mimeType": "application/json",
+        },
+        "accepted": accepted,
         "payload": {
             "signature": signature,
             "authorization": authorization,
@@ -103,6 +110,55 @@ class VerifiedPaymentTests(unittest.TestCase):
 
         self.assertIsNone(payment)
         self.assertTrue(reason)
+
+    def test_paid_proof_requires_official_accepted_requirement(self) -> None:
+        decoded = json.loads(base64.b64decode(signed_proof()))
+        decoded.pop("accepted")
+        proof = base64.b64encode(json.dumps(decoded).encode()).decode()
+
+        payment, reason = verify.validate_payment_proof(proof, now=NOW)
+
+        self.assertIsNone(payment)
+        self.assertEqual(reason, "payment requirement is missing or invalid")
+
+    def test_paid_proof_rejects_mismatched_requirement_fields(self) -> None:
+        mismatches: list[tuple[str, object]] = [
+            ("scheme", "upto"),
+            ("network", "eip155:56"),
+            ("amount", str(verify.PRICE_WEI - 1)),
+            ("asset", "0x" + "33" * 20),
+            ("payTo", "0x" + "44" * 20),
+            ("maxTimeoutSeconds", 1),
+            ("extra", {**SUPPORTED_EXTRA, "signerAddress": "0x" + "55" * 20}),
+        ]
+
+        for field, value in mismatches:
+            with self.subTest(field=field):
+                payment, reason = verify.validate_payment_proof(
+                    signed_proof(accepted_overrides={field: value}),
+                    expected_requirement=verify.build_payment_requirement(
+                        SUPPORTED_EXTRA
+                    ),
+                    now=NOW,
+                )
+                self.assertIsNone(payment)
+                self.assertEqual(reason, "payment requirement mismatch")
+
+    def test_paid_proof_exposes_official_payload_for_settlement(self) -> None:
+        proof = signed_proof()
+
+        payment, reason = verify.validate_payment_proof(
+            proof,
+            expected_requirement=verify.build_payment_requirement(
+                SUPPORTED_EXTRA
+            ),
+            now=NOW,
+        )
+
+        self.assertEqual(reason, "")
+        assert payment is not None
+        self.assertEqual(payment.proof["accepted"]["extra"], SUPPORTED_EXTRA)
+        self.assertNotIn("scheme", payment.proof)
 
     def test_pure_validation_rejects_infinite_value_without_raising(self) -> None:
         encoded_proof = signed_proof()

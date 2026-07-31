@@ -184,15 +184,18 @@ _TRANSFER_TYPE_HASH = _ktext(
 )
 
 
-def _domain_separator() -> bytes:
+def _domain_separator(
+    name: str = _TOKEN_DOMAIN_NAME,
+    version: str = _TOKEN_DOMAIN_VERSION,
+) -> bytes:
     import eth_abi
     from eth_utils import to_checksum_address
     return _keccak(eth_abi.encode(
         ["bytes32", "bytes32", "bytes32", "uint256", "address"],
         [
             _DOMAIN_TYPE_HASH,
-            _ktext(_TOKEN_DOMAIN_NAME),
-            _ktext(_TOKEN_DOMAIN_VERSION),
+            _ktext(name),
+            _ktext(version),
             CHAIN_ID,
             to_checksum_address(U_TOKEN_BSC_TESTNET),
         ],
@@ -202,6 +205,9 @@ def _domain_separator() -> bytes:
 def _eip712_digest(
     from_: str, to: str, value: int,
     valid_after: int, valid_before: int, nonce: bytes,
+    *,
+    domain_name: str = _TOKEN_DOMAIN_NAME,
+    domain_version: str = _TOKEN_DOMAIN_VERSION,
 ) -> bytes:
     """keccak256(\\x19\\x01 || domain_separator || struct_hash)."""
     import eth_abi
@@ -218,7 +224,11 @@ def _eip712_digest(
             nonce,
         ],
     ))
-    return _keccak(b"\x19\x01" + _domain_separator() + struct_hash)
+    return _keccak(
+        b"\x19\x01"
+        + _domain_separator(domain_name, domain_version)
+        + struct_hash
+    )
 
 
 # ── Public API ─────────────────────────────────────────────────────────────────
@@ -261,6 +271,7 @@ def build_payment_requirement(extra: Mapping[str, Any]) -> dict[str, Any]:
 def validate_payment_proof(
     proof_header: str,
     *,
+    expected_requirement: Mapping[str, Any] | None = None,
     now: int | None = None,
     allow_expired: bool = False,
 ) -> tuple[VerifiedPayment | None, str]:
@@ -280,11 +291,34 @@ def validate_payment_proof(
             f"unsupported x402Version: {proof.get('x402Version')!r} "
             "(expected 2)"
         )
-    if proof.get("scheme", "exact") != "exact":
-        return None, f"unsupported scheme: {proof.get('scheme')!r}"
-    network = proof.get("network", f"eip155:{CHAIN_ID}")
-    if network != f"eip155:{CHAIN_ID}":
-        return None, f"wrong network: {network!r} (expected eip155:{CHAIN_ID})"
+
+    resource = proof.get("resource")
+    if (
+        not isinstance(resource, dict)
+        or not isinstance(resource.get("url"), str)
+        or not resource["url"]
+    ):
+        return None, "payment resource is missing or invalid"
+
+    accepted = proof.get("accepted")
+    if not isinstance(accepted, dict):
+        return None, "payment requirement is missing or invalid"
+    extra = accepted.get("extra")
+    if (
+        not isinstance(extra, dict)
+        or extra.get("name") != _TOKEN_DOMAIN_NAME
+        or extra.get("version") != _TOKEN_DOMAIN_VERSION
+        or extra.get("assetTransferMethod") != "eip3009"
+        or not _EVM_ADDRESS.fullmatch(str(extra.get("signerAddress") or ""))
+    ):
+        return None, "payment requirement is missing or invalid"
+    required = (
+        dict(expected_requirement)
+        if expected_requirement is not None
+        else build_payment_requirement(extra)
+    )
+    if accepted != required:
+        return None, "payment requirement mismatch"
 
     payload = proof.get("payload") or {}
     auth = payload.get("authorization") or {}
@@ -308,11 +342,15 @@ def validate_payment_proof(
         return None, f"invalid from address: {from_address!r}"
     if to_address != SELLER_WALLET.lower():
         return None, f"wrong recipient: {to_address!r}"
+    if to_address != str(accepted["payTo"]).lower():
+        return None, f"wrong recipient: {to_address!r}"
     if value < MIN_PRICE_WEI:
         return None, (
             f"value {value / 1e18:.3f} U < minimum "
             f"{MIN_PRICE_WEI / 1e18:.3f} U"
         )
+    if value != int(accepted["amount"]):
+        return None, "authorization value does not match payment requirement"
     if len(nonce_bytes) != 32:
         return None, "nonce must be bytes32"
     if current_time < valid_after:
@@ -332,6 +370,8 @@ def validate_payment_proof(
             valid_after,
             valid_before,
             nonce_bytes,
+            domain_name=str(extra["name"]),
+            domain_version=str(extra["version"]),
         )
         recovered = Account._recover_hash(digest, signature=signature)
     except Exception as exc:
