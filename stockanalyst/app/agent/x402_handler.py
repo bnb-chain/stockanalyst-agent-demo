@@ -14,14 +14,11 @@ Payment verification is FIXED CODE in x402_verify.py — never LLM-callable.
 from __future__ import annotations
 
 import base64
-import hashlib
-import hmac
 import json
 import logging
 import os
 import re
 import time
-import uuid
 from collections.abc import AsyncGenerator, Callable
 from urllib.parse import parse_qs
 
@@ -29,6 +26,13 @@ import httpx
 
 from competition_reporting import report_competition_call
 if __package__:
+    from .b402_client import (
+        B402Client,
+        B402Config,
+        B402ConfigurationError,
+        B402IndeterminateError,
+        B402RejectedError,
+    )
     from .x402_job_service import (
         JobView,
         SettlementIndeterminate,
@@ -36,6 +40,13 @@ if __package__:
         X402JobService,
     )
 else:
+    from b402_client import (
+        B402Client,
+        B402Config,
+        B402ConfigurationError,
+        B402IndeterminateError,
+        B402RejectedError,
+    )
     from x402_job_service import (
         JobView,
         SettlementIndeterminate,
@@ -70,13 +81,16 @@ class RequestDisconnected(ValueError):
 
 # ── Settlement configuration (priority: B402 > generic facilitator > demo) ─────
 
-# Binance Pay B402 authenticated facilitator (preferred).
-# Apply for credentials at https://forms.gle/aUQvxUETfGMzyTky5
-# After approval: bag env set B402_CLIENT_ID <clientId>
-#                 bag env set B402_SECRET <secret>
-B402_CLIENT_ID = os.environ.get("B402_CLIENT_ID", "").strip()
-B402_SECRET    = os.environ.get("B402_SECRET", "").strip()
-B402_BASE_URL  = os.environ.get("B402_BASE_URL", "https://bpay.binance.com").rstrip("/")
+# Binance B402 V2 authenticated facilitator (preferred).
+try:
+    _B402_CONFIG = B402Config.from_env()
+except B402ConfigurationError:
+    _B402_CONFIG = None
+    logger.error(
+        "x402: incomplete or invalid B402 V2 configuration; paid requests "
+        "will fail closed"
+    )
+_B402_CLIENT = B402Client(_B402_CONFIG) if _B402_CONFIG is not None else None
 
 # Generic x402 facilitator (fallback — no HMAC auth).
 FACILITATOR_URL = os.environ.get("X402_FACILITATOR_URL", "").rstrip("/")
@@ -85,11 +99,8 @@ FACILITATOR_URL = os.environ.get("X402_FACILITATOR_URL", "").rstrip("/")
 # NEVER set this in production — signatures verified but NO token transferred.
 X402_DEMO_MODE = os.environ.get("X402_DEMO_MODE", "").strip().lower() in ("1", "true", "yes")
 
-if B402_CLIENT_ID and B402_SECRET:
-    logger.info(
-        "x402: B402 HMAC-SHA512 facilitator active — client_id=%s base_url=%s",
-        B402_CLIENT_ID, B402_BASE_URL,
-    )
+if _B402_CLIENT is not None:
+    logger.info("x402: Binance B402 V2 RSA facilitator active")
 elif FACILITATOR_URL:
     logger.info("x402: generic facilitator active — %s", FACILITATOR_URL)
 elif X402_DEMO_MODE:
@@ -101,34 +112,16 @@ else:
     logger.warning(
         "x402: SECURITY — no settlement backend configured. "
         "The paid /x402/analyze/async endpoint will REJECT all requests until one is set. "
-        "For production:    export B402_CLIENT_ID=<id> B402_SECRET=<secret>. "
+        "For production: configure B402_CLIENT_ID, B402_ACCESS_TOKEN, "
+        "B402_BASE_URL, and B402_PRIVATE_KEY. "
         "For local testing: export X402_DEMO_MODE=1."
     )
-
-
-def _b402_headers(payload_dict: dict) -> dict[str, str]:
-    """Build Binance Pay HMAC-SHA512 authentication headers for B402 settle."""
-    timestamp = int(time.time() * 1000)
-    nonce = uuid.uuid4().hex[:32]
-    payload_to_sign = f"{timestamp}\n{nonce}\n{json.dumps(payload_dict)}\n"
-    signature = hmac.new(
-        B402_SECRET.encode("utf-8"),
-        payload_to_sign.encode("utf-8"),
-        hashlib.sha512,
-    ).hexdigest().upper()
-    return {
-        "BinancePay-Timestamp": str(timestamp),
-        "BinancePay-Nonce": nonce,
-        "BinancePay-Certificate-SN": B402_CLIENT_ID,
-        "BinancePay-Signature": signature,
-        "Content-Type": "application/json",
-    }
 
 
 async def _settle_via_facilitator(proof_b64: str) -> tuple[bool, str]:
     """Execute on-chain settlement via configured backend.
 
-    Priority: B402 (HMAC-SHA512) → generic facilitator → demo mode → fail closed.
+    Priority: B402 V2 (RSA-SHA256) → generic facilitator → demo mode → fail closed.
 
     Returns (True, txHash) on success, (False, error_reason) on failure.
     """
@@ -139,22 +132,26 @@ async def _settle_via_facilitator(proof_b64: str) -> tuple[bool, str]:
     except Exception as exc:
         return False, f"could not decode proof: {exc}"
 
+    accepted = proof.get("accepted")
+    if not isinstance(accepted, dict):
+        return False, "payment not settled: missing V2 accepted requirement"
     payload = {
         "x402Version": 2,
         "paymentPayload": proof,
-        "paymentRequirements": {
-            "scheme":            "exact",
-            "network":           f"eip155:{CHAIN_ID}",
-            "maxAmountRequired": str(PRICE_WEI),
-            "asset":             U_TOKEN_BSC_TESTNET,
-            "payTo":             SELLER_WALLET.lower(),
-            "maxTimeoutSeconds": 60,
-        },
+        "paymentRequirements": accepted,
     }
 
-    # ── 1. Binance Pay B402 (HMAC-SHA512) ──────────────────────────────────────
-    if B402_CLIENT_ID and B402_SECRET:
-        return await _settle_b402(payload)
+    # ── 1. Binance B402 V2 (RSA-SHA256) ────────────────────────────────────────
+    if _B402_CLIENT is not None:
+        try:
+            transaction = await _B402_CLIENT.verify_and_settle(proof)
+            logger.info("x402 B402 settled: txHash=%s", transaction)
+            return True, transaction
+        except B402RejectedError as exc:
+            logger.warning("x402 B402 rejected: %s", exc)
+            return False, str(exc)
+        except B402IndeterminateError as exc:
+            raise SettlementIndeterminate() from exc
 
     # ── 2. Generic x402 facilitator (unauthenticated POST) ─────────────────────
     if FACILITATOR_URL:
@@ -170,39 +167,9 @@ async def _settle_via_facilitator(proof_b64: str) -> tuple[bool, str]:
     # ── 4. Fail closed ─────────────────────────────────────────────────────────
     return False, (
         "payment not settled: no settlement backend configured. "
-        "Set B402_CLIENT_ID + B402_SECRET for production, or X402_DEMO_MODE=1 for local testing."
+        "Configure all four B402 V2 settings for production, or "
+        "X402_DEMO_MODE=1 for local testing."
     )
-
-
-async def _settle_b402(payload: dict) -> tuple[bool, str]:
-    """POST to Binance Pay B402 /papi/v2/b402/settle with HMAC-SHA512 auth."""
-    url = f"{B402_BASE_URL}/papi/v2/b402/settle"
-    try:
-        headers = _b402_headers(payload)
-        async with httpx.AsyncClient(timeout=20.0) as client:
-            resp = await client.post(url, json=payload, headers=headers)
-            if resp.status_code >= 500:
-                raise SettlementIndeterminate()
-            data = resp.json()
-        if not isinstance(data, dict):
-            raise SettlementIndeterminate()
-        if data.get("status") == "SUCCESS" and data.get("code") == "000000":
-            txhash = str((data.get("data") or {}).get("transactionHash") or "")
-            logger.info("x402 B402 settled: txHash=%s", txhash)
-            return True, txhash
-        reason = str(
-            (data.get("data") or {}).get("errorMessage")
-            or data.get("errorMessage")
-            or data.get("msg")
-            or f"B402 rejected (code={data.get('code')})"
-        )
-        logger.warning("x402 B402 rejected: %s | response=%s", reason, data)
-        return False, reason
-    except SettlementIndeterminate:
-        raise
-    except Exception as exc:
-        logger.exception("x402 B402 call failed")
-        raise SettlementIndeterminate() from exc
 
 
 async def _settle_generic(payload: dict) -> tuple[bool, str]:
@@ -253,10 +220,12 @@ class X402Handler:
         *,
         free_stream_work: Callable[..., AsyncGenerator[tuple[str, dict], None]] | None = None,
         job_service: X402JobService | None = None,
+        b402_client: B402Client | None = _B402_CLIENT,
     ) -> None:
         self._inner = app
         self._free_stream_work = free_stream_work
         self._job_service = job_service
+        self._b402_client = b402_client
 
     async def __call__(self, scope, receive, send) -> None:
         if scope["type"] != "http" or not scope.get("path", "").startswith("/x402"):
@@ -350,20 +319,50 @@ class X402Handler:
 
     async def _handle_price(self, scope, send) -> None:
         """GET /x402/price — price info without payment."""
-        challenge = build_payment_challenge([], "")
+        try:
+            extra = await self._paid_payment_extra()
+        except Exception:
+            logger.warning("x402 payment configuration unavailable")
+            await _send_payment_backend_unavailable(send)
+            return
+        challenge = build_payment_challenge(
+            [],
+            _public_resource(scope, "/x402/analyze/async"),
+            extra,
+        )
         accept    = (challenge.get("accepts") or [{}])[0]
         await _send_json(send, 200, {
             "x402Version":  2,
             "price_u":      "1.0",
-            "price_wei":    accept.get("maxAmountRequired", str(PRICE_WEI)),
+            "price_wei":    accept.get("amount", str(PRICE_WEI)),
             "min_price_u":  "0.5",
             "min_price_wei": str(MIN_PRICE_WEI),
             "asset":        accept.get("asset"),
             "network":      accept.get("network"),
             "payTo":        accept.get("payTo"),
             "signingScheme": "eip3009",
-            "facilitator":  FACILITATOR_URL or "(demo mode — no on-chain settlement)",
+            "facilitator": (
+                "binance-b402-v2"
+                if self._b402_client is not None
+                else FACILITATOR_URL or "(demo mode — no on-chain settlement)"
+            ),
         })
+
+    async def _paid_payment_extra(self) -> dict:
+        if self._b402_client is not None:
+            return await self._b402_client.payment_extra(
+                f"eip155:{CHAIN_ID}",
+                os.environ.get("U_TOKEN_DOMAIN_NAME", "U"),
+                os.environ.get("U_TOKEN_DOMAIN_VERSION", "1"),
+            )
+        if FACILITATOR_URL or X402_DEMO_MODE:
+            return {
+                "name": os.environ.get("U_TOKEN_DOMAIN_NAME", "U"),
+                "version": os.environ.get("U_TOKEN_DOMAIN_VERSION", "1"),
+                "assetTransferMethod": "eip3009",
+                "signerAddress": SELLER_WALLET.lower(),
+            }
+        raise B402IndeterminateError("payment backend unavailable")
 
     async def _handle_async_analyze(self, scope, receive, send) -> None:
         """POST /x402/analyze/async — settle and return a durable job handle."""
@@ -399,10 +398,17 @@ class X402Handler:
         payment_header = _header(scope, b"x-payment")
         if not payment_header:
             symbols = _parse_symbols(req.get("symbols") or "")
-            challenge = build_payment_challenge(
-                symbols,
-                _public_resource(scope, "/x402/analyze/async"),
-            )
+            try:
+                extra = await self._paid_payment_extra()
+                challenge = build_payment_challenge(
+                    symbols,
+                    _public_resource(scope, "/x402/analyze/async"),
+                    extra,
+                )
+            except Exception:
+                logger.warning("x402 payment configuration unavailable")
+                await _send_payment_backend_unavailable(send)
+                return
             challenge_json = json.dumps(challenge).encode()
             await _send_json(
                 send,
@@ -794,6 +800,18 @@ async def _send_service_unavailable(
         extra_headers=_async_response_headers(
             token_authenticated=token_authenticated
         ),
+    )
+
+
+async def _send_payment_backend_unavailable(send) -> None:
+    await _send_json(
+        send,
+        503,
+        {
+            "errorCode": "payment_backend_unavailable",
+            "retryable": True,
+        },
+        extra_headers=_async_response_headers(),
     )
 
 

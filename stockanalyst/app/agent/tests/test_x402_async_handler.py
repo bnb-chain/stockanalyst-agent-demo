@@ -15,6 +15,12 @@ from stockanalyst.app.agent.x402_job_service import (
 
 JOB_ID = "x402_" + "a" * 32
 EXPIRES_AT = 1_785_945_600_123
+SUPPORTED_EXTRA = {
+    "name": "U",
+    "version": "1",
+    "assetTransferMethod": "eip3009",
+    "signerAddress": "0x1111111111111111111111111111111111111111",
+}
 
 
 @dataclass(frozen=True)
@@ -119,11 +125,15 @@ async def call_disconnected_handler(
     return send
 
 
-def make_handler(service=None) -> X402Handler:
+def make_handler(service=None, *, b402_client=None) -> X402Handler:
+    if b402_client is None:
+        b402_client = AsyncMock()
+        b402_client.payment_extra.return_value = SUPPORTED_EXTRA
     return X402Handler(
         AsyncMock(),
         free_stream_work=Mock(),
         job_service=service,
+        b402_client=b402_client,
     )
 
 
@@ -209,9 +219,35 @@ class X402AsyncHandlerTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(response.status, 402)
         self.assertEqual(
-            response.json["paymentRequired"]["resource"],
+            response.json["paymentRequired"]["resource"]["url"],
             "https://api.example.test/testnet/x402/analyze/async",
         )
+        self.assertEqual(
+            response.json["paymentRequired"]["accepts"][0]["extra"],
+            SUPPORTED_EXTRA,
+        )
+
+    async def test_async_challenge_fails_closed_when_supported_is_unavailable(
+        self,
+    ) -> None:
+        b402_client = AsyncMock()
+        b402_client.payment_extra.side_effect = RuntimeError(
+            "credential detail must not leak"
+        )
+
+        response = await call_handler(
+            make_handler(AsyncMock(), b402_client=b402_client),
+            method="POST",
+            path="/x402/analyze/async",
+            json_body={"symbols": ["AAPL"]},
+        )
+
+        self.assertEqual(response.status, 503)
+        self.assertEqual(response.json, {
+            "errorCode": "payment_backend_unavailable",
+            "retryable": True,
+        })
+        self.assertNotIn("credential", response.body.decode())
 
     async def test_async_create_rejects_invalid_json(self) -> None:
         service = AsyncMock()

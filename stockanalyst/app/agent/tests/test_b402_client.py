@@ -14,6 +14,7 @@ from stockanalyst.app.agent.b402_client import (
     B402Client,
     B402Config,
     B402ConfigurationError,
+    B402IndeterminateError,
     B402RejectedError,
 )
 
@@ -226,6 +227,162 @@ class B402SupportedKindTests(unittest.IsolatedAsyncioTestCase):
 
         with self.assertRaisesRegex(B402RejectedError, "does not support"):
             await client.payment_extra("eip155:97", "U", "1")
+
+
+PAYMENT_REQUIREMENT = {
+    "scheme": "exact",
+    "network": "eip155:97",
+    "amount": "1000000000000000000",
+    "asset": "0xc70B8741B8B07A6d61E54fd4B20f22Fa648E5565",
+    "payTo": "0xd10bddc20e4dc42a1a19a9653e994991e25b8153",
+    "maxTimeoutSeconds": 600,
+    "extra": SUPPORTED_EXTRA,
+}
+PAYMENT_PAYLOAD = {
+    "x402Version": 2,
+    "resource": {
+        "url": "https://api.example.test/x402/analyze/async",
+        "description": "Stock analysis report",
+        "mimeType": "application/json",
+    },
+    "accepted": PAYMENT_REQUIREMENT,
+    "payload": {
+        "signature": "0x" + "12" * 65,
+        "authorization": {
+            "from": "0x2222222222222222222222222222222222222222",
+            "to": PAYMENT_REQUIREMENT["payTo"],
+            "value": PAYMENT_REQUIREMENT["amount"],
+            "validAfter": "0",
+            "validBefore": "1785485400",
+            "nonce": "0x" + "34" * 32,
+        },
+    },
+}
+
+
+class B402SettlementTests(unittest.IsolatedAsyncioTestCase):
+    def client(self) -> B402Client:
+        config = B402Config.from_env(_environment())
+        assert config is not None
+        client = B402Client(config)
+        client.payment_extra = AsyncMock(return_value=SUPPORTED_EXTRA)
+        return client
+
+    async def test_verifies_before_settling_the_identical_envelope(self) -> None:
+        client = self.client()
+        client.post = AsyncMock(side_effect=[
+            {
+                "code": "000000",
+                "message": "success",
+                "data": {
+                    "isValid": True,
+                    "payer": "0x2222222222222222222222222222222222222222",
+                },
+            },
+            {
+                "code": "000000",
+                "message": "success",
+                "data": {
+                    "success": True,
+                    "transaction": "0x" + "12" * 32,
+                    "payer": "0x2222222222222222222222222222222222222222",
+                    "network": "eip155:97",
+                    "amount": PAYMENT_REQUIREMENT["amount"],
+                },
+            },
+        ])
+
+        transaction = await client.verify_and_settle(PAYMENT_PAYLOAD)
+
+        self.assertEqual(transaction, "0x" + "12" * 32)
+        self.assertEqual(
+            [call.args[0] for call in client.post.await_args_list],
+            ["/papi/v2/b402/verify", "/papi/v2/b402/settle"],
+        )
+        verify_body = client.post.await_args_list[0].args[1]
+        settle_body = client.post.await_args_list[1].args[1]
+        self.assertEqual(verify_body, settle_body)
+        self.assertEqual(verify_body["paymentPayload"], PAYMENT_PAYLOAD)
+        self.assertEqual(
+            verify_body["paymentRequirements"],
+            PAYMENT_REQUIREMENT,
+        )
+
+    async def test_explicit_verification_rejection_stops_settlement(self) -> None:
+        client = self.client()
+        client.post = AsyncMock(return_value={
+            "code": "000000",
+            "message": "success",
+            "data": {
+                "isValid": False,
+                "invalidReason": "insufficient_funds",
+                "payer": "0x0000000000000000000000000000000000000000",
+            },
+        })
+
+        with self.assertRaisesRegex(B402RejectedError, "insufficient_funds"):
+            await client.verify_and_settle(PAYMENT_PAYLOAD)
+
+        client.post.assert_awaited_once()
+
+    async def test_prebroadcast_settlement_failure_is_explicit(self) -> None:
+        client = self.client()
+        client.post = AsyncMock(side_effect=[
+            {
+                "code": "000000",
+                "message": "success",
+                "data": {"isValid": True, "payer": "0x" + "22" * 20},
+            },
+            {
+                "code": "000000",
+                "message": "success",
+                "data": {
+                    "success": False,
+                    "transaction": "",
+                    "payer": "0x" + "22" * 20,
+                    "network": "",
+                    "errorReason": "insufficient_funds",
+                },
+            },
+        ])
+
+        with self.assertRaisesRegex(B402RejectedError, "insufficient_funds"):
+            await client.verify_and_settle(PAYMENT_PAYLOAD)
+
+    async def test_broadcast_pending_settlement_is_indeterminate(self) -> None:
+        client = self.client()
+        client.post = AsyncMock(side_effect=[
+            {
+                "code": "000000",
+                "message": "success",
+                "data": {"isValid": True, "payer": "0x" + "22" * 20},
+            },
+            {
+                "code": "000000",
+                "message": "success",
+                "data": {
+                    "success": False,
+                    "transaction": "0x" + "56" * 32,
+                    "payer": "0x" + "22" * 20,
+                    "network": "eip155:97",
+                    "errorReason": "invalid_transaction_state",
+                },
+            },
+        ])
+
+        with self.assertRaises(B402IndeterminateError):
+            await client.verify_and_settle(PAYMENT_PAYLOAD)
+
+    async def test_malformed_verify_envelope_is_indeterminate(self) -> None:
+        client = self.client()
+        client.post = AsyncMock(return_value={
+            "code": "000000",
+            "message": "success",
+            "data": {},
+        })
+
+        with self.assertRaises(B402IndeterminateError):
+            await client.verify_and_settle(PAYMENT_PAYLOAD)
 
 
 if __name__ == "__main__":

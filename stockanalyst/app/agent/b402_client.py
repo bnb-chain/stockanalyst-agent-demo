@@ -217,6 +217,67 @@ class B402Client:
             f"B402 does not support exact eip3009 {name} {version} on {network}"
         )
 
+    async def verify_and_settle(
+        self,
+        payment_payload: Mapping[str, Any],
+    ) -> str:
+        accepted = payment_payload.get("accepted")
+        if not isinstance(accepted, dict):
+            raise B402RejectedError("payment requirement is missing")
+        extra = accepted.get("extra")
+        if not isinstance(extra, dict):
+            raise B402RejectedError("payment requirement extra is missing")
+
+        current_extra = await self.payment_extra(
+            str(accepted.get("network") or ""),
+            str(extra.get("name") or ""),
+            str(extra.get("version") or ""),
+        )
+        if current_extra != extra:
+            raise B402RejectedError("payment requirement is no longer supported")
+
+        envelope = {
+            "x402Version": 2,
+            "paymentPayload": copy.deepcopy(dict(payment_payload)),
+            "paymentRequirements": copy.deepcopy(accepted),
+        }
+        verification = await self.post("/papi/v2/b402/verify", envelope)
+        verification_data = _success_data(verification, operation="verify")
+        is_valid = verification_data.get("isValid")
+        if is_valid is False:
+            reason = _reason(
+                verification_data,
+                "invalidReason",
+                "payment verification rejected",
+            )
+            raise B402RejectedError(reason)
+        if is_valid is not True:
+            raise B402IndeterminateError(
+                "B402 returned a malformed verification result"
+            )
+
+        settlement = await self.post("/papi/v2/b402/settle", envelope)
+        settlement_data = _success_data(settlement, operation="settle")
+        success = settlement_data.get("success")
+        transaction = settlement_data.get("transaction")
+        if success is True and isinstance(transaction, str) and transaction:
+            return transaction
+        if success is False and isinstance(transaction, str):
+            if transaction:
+                raise B402IndeterminateError(
+                    "B402 settlement was broadcast but is not confirmed"
+                )
+            raise B402RejectedError(
+                _reason(
+                    settlement_data,
+                    "errorReason",
+                    "payment settlement rejected",
+                )
+            )
+        raise B402IndeterminateError(
+            "B402 returned a malformed settlement result"
+        )
+
     async def _get_supported_kinds(self) -> list[dict[str, Any]]:
         now = self._monotonic()
         if (
@@ -257,3 +318,25 @@ def _is_evm_address(value: object) -> bool:
     except ValueError:
         return False
     return True
+
+
+def _success_data(
+    response: Mapping[str, Any],
+    *,
+    operation: str,
+) -> dict[str, Any]:
+    data = response.get("data")
+    if response.get("code") != "000000" or not isinstance(data, dict):
+        raise B402IndeterminateError(
+            f"B402 returned an invalid {operation} response"
+        )
+    return data
+
+
+def _reason(
+    data: Mapping[str, Any],
+    field: str,
+    fallback: str,
+) -> str:
+    value = data.get(field)
+    return value if isinstance(value, str) and value else fallback
