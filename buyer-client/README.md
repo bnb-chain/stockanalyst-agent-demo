@@ -371,9 +371,13 @@ Buyer                              Agent (localhost:9000)
   │                                        │
   │  POST /x402/analyze/async              │
   │  {"symbols": ["AAPL","NVDA"], ...}     │
+  │  (without X-Payment) ─────────────────▶│  B402 /supported
+  │◀── 402 accepted + resource + extra ─────│
+  │                                        │
+  │  sign exact returned requirement       │
   │  X-Payment: base64(1-U proof)  ───────▶│
   │                                        │  validate_payment_proof() ← fixed code
-  │                                        │  Binance Pay facilitator → on-chain tx
+  │                                        │  B402 /verify → /settle → on-chain tx
   │◀── 202 jobId + private jobToken ───────│
   │  GET /x402/jobs/{jobId} ──────────────▶│  background analysis
   │◀── queued / running / succeeded ───────│
@@ -399,9 +403,9 @@ const sig = await wallet.signTypedData(
     validBefore: BigInt(now + 600), nonce }
 );
 
-// x402 v2 wire format
+// Paid B402 V2 wire format. `accepted` and `resource` are copied from the 402.
 const proof = {
-  x402Version: 2, scheme: "exact", network: "eip155:97",
+  x402Version: 2, resource, accepted,
   payload: { signature: sig, authorization: { from, to, value, validAfter, validBefore, nonce } },
 };
 // X-Payment header: Buffer.from(JSON.stringify(proof)).toString("base64")
@@ -455,12 +459,13 @@ To call the agent from your own code, here are the minimal integration points:
 
 ### x402 async (simplest — any language/framework)
 
-1. **GET** `http://<agent>:9000/x402/price` → read `payTo`, `maxAmountRequired`, `network`
-2. Sign the EIP-712 EIP-3009 authorization with the buyer wallet.
-3. **POST** `/x402/analyze/async` with `X-Payment` and the analysis request.
-4. Persist the returned `jobId`, `jobToken`, status path, and expiry.
-5. Poll the status path with `X-Job-Token`; resume when instructed.
-6. Download the report from the returned private presigned URL.
+1. **POST** `/x402/analyze/async` without `X-Payment` and read the returned HTTP 402 `paymentRequired`.
+2. Validate and copy its complete `resource`, selected `accepts[]` requirement, and `extra` values.
+3. Sign the EIP-712 EIP-3009 authorization using that requirement.
+4. Repeat the same **POST** with the official V2 proof in `X-Payment`.
+5. Persist the returned `jobId`, `jobToken`, status path, and expiry.
+6. Poll the status path with `X-Job-Token`; resume when instructed.
+7. Download the report from the returned private presigned URL.
 
 ### ERC-8183 (TypeScript SDK)
 

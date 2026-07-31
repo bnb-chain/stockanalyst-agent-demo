@@ -9,8 +9,18 @@ separately by the Binance Pay x402 facilitator (called from x402_handler.py).
 Wire format — X-Payment header = base64(JSON):
   {
     "x402Version": 2,
-    "scheme":      "exact",
-    "network":     "eip155:97",           // BSC Testnet (eip155:<chainId>)
+    "resource": {"url": "https://<agent>/x402/analyze/async", ...},
+    "accepted": {
+      "scheme": "exact", "network": "eip155:97",
+      "amount": "1000000000000000000",
+      "asset": "0xc70B8741B8B07A6d61E54fd4B20f22Fa648E5565",
+      "payTo": "0x<seller>", "maxTimeoutSeconds": 600,
+      "extra": {
+        "name": "U", "version": "1",
+        "assetTransferMethod": "eip3009",
+        "signerAddress": "0x<facilitator>"
+      }
+    },
     "payload": {
       "signature":     "0x<65-byte EIP-712 sig>",
       "authorization": {
@@ -60,7 +70,13 @@ To generate a test proof (Python):
      int(auth["value"]), int(auth["validAfter"]), int(auth["validBefore"]), nonce]))
   digest = keccak(b"\\x19\\x01" + domain_sep + struct_hash)
   sig = Account._sign_hash(digest, PRIV).signature.hex()
-  proof = {"x402Version":2,"scheme":"exact","network":"eip155:97",
+  requirement = {"scheme":"exact","network":"eip155:97",
+    "amount":"1000000000000000000","asset":TOKEN,"payTo":SELLER.lower(),
+    "maxTimeoutSeconds":600,"extra":{"name":"U","version":"1",
+      "assetTransferMethod":"eip3009","signerAddress":"0x<from-/supported>"}}
+  proof = {"x402Version":2,
+           "resource":{"url":"https://<agent>/x402/analyze/async"},
+           "accepted":requirement,
            "payload":{"signature":"0x"+sig,"authorization":auth}}
   print(base64.b64encode(json.dumps(proof).encode()).decode())
   EOF
