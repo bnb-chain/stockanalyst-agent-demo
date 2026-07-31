@@ -4,6 +4,7 @@ import base64
 import unittest
 from dataclasses import dataclass
 from typing import Any
+from unittest.mock import AsyncMock
 
 from Crypto.Hash import SHA256
 from Crypto.PublicKey import RSA
@@ -13,6 +14,7 @@ from stockanalyst.app.agent.b402_client import (
     B402Client,
     B402Config,
     B402ConfigurationError,
+    B402RejectedError,
 )
 
 
@@ -132,6 +134,98 @@ class B402TransportTests(unittest.IsolatedAsyncioTestCase):
             SHA256.new(body + b"1785484800123"),
             base64.b64decode(headers["X-Tesla-Signature"]),
         )
+
+
+SUPPORTED_EXTRA = {
+    "name": "U",
+    "version": "1",
+    "assetTransferMethod": "eip3009",
+    "signerAddress": "0x1111111111111111111111111111111111111111",
+}
+
+
+def _supported_response(
+    *,
+    kinds: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    return {
+        "code": "000000",
+        "message": "success",
+        "data": {
+            "kinds": kinds if kinds is not None else [
+                {
+                    "x402Version": 2,
+                    "scheme": "exact",
+                    "network": "eip155:97",
+                    "extra": SUPPORTED_EXTRA,
+                }
+            ],
+            "extensions": [],
+            "signers": {
+                "eip155:*": [
+                    "0x1111111111111111111111111111111111111111"
+                ]
+            },
+        },
+    }
+
+
+class B402SupportedKindTests(unittest.IsolatedAsyncioTestCase):
+    def client(self, now: list[float]) -> B402Client:
+        config = B402Config.from_env(_environment())
+        assert config is not None
+        return B402Client(config, monotonic=lambda: now[0])
+
+    async def test_selects_and_defensively_copies_eip3009_kind(self) -> None:
+        now = [100.0]
+        client = self.client(now)
+        client.post = AsyncMock(return_value=_supported_response())
+
+        first = await client.payment_extra("eip155:97", "U", "1")
+        first["signerAddress"] = "changed"
+        second = await client.payment_extra("eip155:97", "U", "1")
+
+        self.assertEqual(second, SUPPORTED_EXTRA)
+        client.post.assert_awaited_once_with(
+            "/papi/v2/b402/supported",
+            {},
+        )
+
+    async def test_refreshes_supported_kinds_after_one_hour(self) -> None:
+        now = [100.0]
+        client = self.client(now)
+        client.post = AsyncMock(return_value=_supported_response())
+
+        await client.payment_extra("eip155:97", "U", "1")
+        now[0] += 3_601
+        await client.payment_extra("eip155:97", "U", "1")
+
+        self.assertEqual(client.post.await_count, 2)
+
+    async def test_rejects_missing_matching_kind(self) -> None:
+        now = [100.0]
+        client = self.client(now)
+        client.post = AsyncMock(return_value=_supported_response(kinds=[]))
+
+        with self.assertRaisesRegex(B402RejectedError, "does not support"):
+            await client.payment_extra("eip155:97", "U", "1")
+
+    async def test_requires_a_valid_signer_address(self) -> None:
+        now = [100.0]
+        client = self.client(now)
+        extra = {
+            **SUPPORTED_EXTRA,
+            "signerAddress": "invalid",
+        }
+        client.post = AsyncMock(return_value=_supported_response(kinds=[{
+            "x402Version": 2,
+            "scheme": "exact",
+            "network": "eip155:97",
+            "extra": extra,
+        }]))
+
+        with self.assertRaisesRegex(B402RejectedError, "does not support"):
+            await client.payment_extra("eip155:97", "U", "1")
 
 
 if __name__ == "__main__":

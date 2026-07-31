@@ -68,6 +68,7 @@ To generate a test proof (Python):
 from __future__ import annotations
 
 import base64
+import copy
 import json
 import logging
 import os
@@ -224,32 +225,36 @@ def _eip712_digest(
 
 def build_payment_challenge(
     symbols: list[str],
-    resource_url: str = "http://localhost:9000/x402/analyze/async",
+    resource_url: str,
+    extra: Mapping[str, Any],
 ) -> dict:
     """Return x402 v2 standard payment challenge (HTTP 402 body / X-Payment-Required header)."""
+    description = (
+        f"Stock analysis for {', '.join(s.upper() for s in symbols)}"
+        if symbols else "Stock analysis report"
+    )
     return {
         "x402Version": 2,
-        "accepts": [
-            {
-                "scheme":            "exact",
-                "network":           f"eip155:{CHAIN_ID}",
-                "maxAmountRequired": str(PRICE_WEI),
-                "asset":             U_TOKEN_BSC_TESTNET,
-                "payTo":             SELLER_WALLET.lower(),
-                "maxTimeoutSeconds": 600,
-                "extra": {
-                    "assetTransferMethod": "eip3009",
-                    "name":    _TOKEN_DOMAIN_NAME,
-                    "version": _TOKEN_DOMAIN_VERSION,
-                    "description": (
-                        f"Stock analysis for {', '.join(s.upper() for s in symbols)}"
-                        if symbols else "Stock analysis report"
-                    ),
-                },
-            }
-        ],
+        "accepts": [build_payment_requirement(extra)],
         "error":    "Payment Required",
-        "resource": resource_url,
+        "resource": {
+            "url": resource_url,
+            "description": description,
+            "mimeType": "application/json",
+        },
+    }
+
+
+def build_payment_requirement(extra: Mapping[str, Any]) -> dict[str, Any]:
+    """Build the paid requirement shared by the challenge and B402 calls."""
+    return {
+        "scheme": "exact",
+        "network": f"eip155:{CHAIN_ID}",
+        "amount": str(PRICE_WEI),
+        "asset": U_TOKEN_BSC_TESTNET,
+        "payTo": SELLER_WALLET.lower(),
+        "maxTimeoutSeconds": 600,
+        "extra": copy.deepcopy(dict(extra)),
     }
 
 

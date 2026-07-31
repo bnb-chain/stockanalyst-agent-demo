@@ -6,7 +6,9 @@ payloads.
 """
 from __future__ import annotations
 
+import asyncio
 import base64
+import copy
 import json
 import os
 import time
@@ -127,6 +129,7 @@ class B402Client:
         *,
         http_client_factory: Callable[[], _HttpClient] | None = None,
         now_ms: Callable[[], int] | None = None,
+        monotonic: Callable[[], float] | None = None,
     ) -> None:
         self._config = config
         self._private_key = RSA.import_key(
@@ -138,6 +141,10 @@ class B402Client:
             else lambda: httpx.AsyncClient(timeout=20.0)
         )
         self._now_ms = now_ms or (lambda: int(time.time() * 1000))
+        self._monotonic = monotonic or time.monotonic
+        self._supported_kinds: list[dict[str, Any]] | None = None
+        self._supported_expires_at = 0.0
+        self._supported_lock = asyncio.Lock()
 
     async def post(
         self,
@@ -185,3 +192,68 @@ class B402Client:
         if not isinstance(parsed, dict):
             raise B402IndeterminateError("B402 returned a malformed response")
         return parsed
+
+    async def payment_extra(
+        self,
+        network: str,
+        name: str,
+        version: str,
+    ) -> dict[str, Any]:
+        kinds = await self._get_supported_kinds()
+        for kind in kinds:
+            extra = kind.get("extra")
+            if (
+                kind.get("x402Version") == 2
+                and kind.get("scheme") == "exact"
+                and kind.get("network") == network
+                and isinstance(extra, dict)
+                and extra.get("name") == name
+                and extra.get("version") == version
+                and extra.get("assetTransferMethod") == "eip3009"
+                and _is_evm_address(extra.get("signerAddress"))
+            ):
+                return copy.deepcopy(extra)
+        raise B402RejectedError(
+            f"B402 does not support exact eip3009 {name} {version} on {network}"
+        )
+
+    async def _get_supported_kinds(self) -> list[dict[str, Any]]:
+        now = self._monotonic()
+        if (
+            self._supported_kinds is not None
+            and now < self._supported_expires_at
+        ):
+            return self._supported_kinds
+        async with self._supported_lock:
+            now = self._monotonic()
+            if (
+                self._supported_kinds is not None
+                and now < self._supported_expires_at
+            ):
+                return self._supported_kinds
+            response = await self.post("/papi/v2/b402/supported", {})
+            data = response.get("data")
+            kinds = data.get("kinds") if isinstance(data, dict) else None
+            if response.get("code") != "000000" or not isinstance(kinds, list):
+                raise B402IndeterminateError(
+                    "B402 returned an invalid supported response"
+                )
+            if not all(isinstance(kind, dict) for kind in kinds):
+                raise B402IndeterminateError(
+                    "B402 returned malformed supported kinds"
+                )
+            self._supported_kinds = copy.deepcopy(kinds)
+            self._supported_expires_at = now + 3_600.0
+            return self._supported_kinds
+
+
+def _is_evm_address(value: object) -> bool:
+    if not isinstance(value, str) or len(value) != 42:
+        return False
+    if not value.startswith("0x"):
+        return False
+    try:
+        int(value[2:], 16)
+    except ValueError:
+        return False
+    return True

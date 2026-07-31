@@ -10,6 +10,13 @@ from stockanalyst.app.agent import x402_verify as verify
 
 
 NOW = 1_785_340_800
+RESOURCE_URL = "https://api.example.test/testnet/x402/analyze/async"
+SUPPORTED_EXTRA = {
+    "name": "U",
+    "version": "1",
+    "assetTransferMethod": "eip3009",
+    "signerAddress": "0x1111111111111111111111111111111111111111",
+}
 
 
 def signed_proof(
@@ -133,16 +140,28 @@ class VerifiedPaymentTests(unittest.TestCase):
         self.assertIsNone(payment)
         self.assertEqual(reason, "authorization expired")
 
-    def test_payment_challenge_uses_exact_https_resource_url(self) -> None:
+    def test_payment_challenge_uses_official_v2_requirement(self) -> None:
         challenge = verify.build_payment_challenge(
             ["AAPL"],
-            "https://api.example.test/testnet/x402/analyze/async",
+            RESOURCE_URL,
+            SUPPORTED_EXTRA,
         )
 
-        self.assertEqual(
-            challenge["resource"],
-            "https://api.example.test/testnet/x402/analyze/async",
-        )
+        accept = challenge["accepts"][0]
+        self.assertEqual(accept["amount"], str(verify.PRICE_WEI))
+        self.assertNotIn("maxAmountRequired", accept)
+        self.assertEqual(accept["extra"], SUPPORTED_EXTRA)
+        self.assertEqual(challenge["resource"]["url"], RESOURCE_URL)
+        self.assertEqual(challenge["resource"]["mimeType"], "application/json")
+
+    def test_payment_requirement_defensively_copies_extra(self) -> None:
+        extra = dict(SUPPORTED_EXTRA)
+
+        requirement = verify.build_payment_requirement(extra)
+        extra["signerAddress"] = "changed"
+
+        self.assertEqual(requirement["extra"], SUPPORTED_EXTRA)
+        self.assertEqual(requirement["amount"], str(verify.PRICE_WEI))
 
     def test_expired_recovery_still_rejects_an_invalid_signature(self) -> None:
         proof = json.loads(
