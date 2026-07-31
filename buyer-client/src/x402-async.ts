@@ -37,6 +37,7 @@ import {
   createAsyncAnalysis,
   canonicalStatusPath,
   downloadAsyncReport,
+  fetchPaymentChallenge,
   pollAsyncAnalysis,
   AsyncJobClientError,
   type AsyncAnalysisRequest,
@@ -933,21 +934,28 @@ async function main(): Promise<void> {
         const context = await buildTaskFromMemory(new GuardUserMemory());
         symbols = context.symbols;
         console.log(`  Symbols: ${symbols.join(", ")}`);
+        const request: AsyncAnalysisRequest = {
+          symbols,
+          analysis_type: "comprehensive",
+          portfolio: context.portfolio,
+          risk_profile: context.riskProfile,
+        };
+        console.log("Fetching the current B402 payment requirement...");
+        const challenge = await fetchPaymentChallenge(
+          AGENT_ENDPOINT,
+          request,
+          sellerWallet,
+        );
         const keystorePath = resolve(MODULE_DIRECTORY, "..", KEYSTORE_PATH);
         const wallet = await Wallet.fromEncryptedJson(
           readFileSync(keystorePath, "utf8"),
           WALLET_PASSWORD,
         ) as Wallet;
         console.log("Signing one x402 EIP-3009 payment authorization...");
-        const proof = await buildPaymentProof(wallet, undefined, undefined, sellerWallet);
+        const proof = await buildPaymentProof(wallet, challenge);
         pending = createPendingRecord(
           proof,
-          {
-            symbols,
-            analysis_type: "comprehensive",
-            portfolio: context.portfolio,
-            risk_profile: context.riskProfile,
-          },
+          request,
         );
         // This durable record must exist before the first payment POST.
         persistPendingCreate(PENDING_CREATE_PATH, pending);

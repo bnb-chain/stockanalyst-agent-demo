@@ -7,6 +7,36 @@ export const U_TOKEN_DOMAIN_NAME = process.env["U_TOKEN_DOMAIN_NAME"] ?? "U";
 export const U_TOKEN_DOMAIN_VERSION = process.env["U_TOKEN_DOMAIN_VERSION"] ?? "1";
 export const BSC_TESTNET_CHAIN_ID = 97;
 
+export interface B402PaymentExtra {
+  name: string;
+  version: string;
+  assetTransferMethod: "eip3009";
+  signerAddress: string;
+  [key: string]: unknown;
+}
+
+export interface B402PaymentRequirement {
+  scheme: "exact";
+  network: `eip155:${number}`;
+  amount: string;
+  asset: string;
+  payTo: string;
+  maxTimeoutSeconds: number;
+  extra: B402PaymentExtra;
+}
+
+export interface B402PaymentResource {
+  url: string;
+  description: string;
+  mimeType: "application/json";
+}
+
+export interface PaidPaymentChallenge {
+  x402Version: 2;
+  resource: B402PaymentResource;
+  accepted: B402PaymentRequirement;
+}
+
 export function resolveX402SellerWallet(
   env: Readonly<Record<string, string | undefined>> = process.env,
 ): string {
@@ -27,27 +57,27 @@ export function resolveX402SellerWallet(
  */
 export async function buildPaymentProof(
   wallet: Wallet,
-  priceWei: string = "1000000000000000000",
+  challenge: PaidPaymentChallenge,
   ttlSeconds: number = 600,
-  sellerWallet: string = resolveX402SellerWallet(),
 ): Promise<string> {
+  const { accepted, resource } = challenge;
   const now = Math.floor(Date.now() / 1000);
   const nonce = `0x${randomBytes(32).toString("hex")}`;
-  const recipient = getAddress(sellerWallet).toLowerCase();
+  const recipient = getAddress(accepted.payTo).toLowerCase();
 
   const authorization = {
     from: wallet.address.toLowerCase(),
     to: recipient,
-    value: priceWei,
+    value: accepted.amount,
     validAfter: "0",
     validBefore: String(now + ttlSeconds),
     nonce,
   };
   const domain = {
-    name: U_TOKEN_DOMAIN_NAME,
-    version: U_TOKEN_DOMAIN_VERSION,
+    name: accepted.extra.name,
+    version: accepted.extra.version,
     chainId: BSC_TESTNET_CHAIN_ID,
-    verifyingContract: U_TOKEN_ADDRESS,
+    verifyingContract: accepted.asset,
   };
   const types = {
     TransferWithAuthorization: [
@@ -70,8 +100,11 @@ export async function buildPaymentProof(
   });
   const proof = {
     x402Version: 2,
-    scheme: "exact",
-    network: `eip155:${BSC_TESTNET_CHAIN_ID}`,
+    resource: { ...resource },
+    accepted: {
+      ...accepted,
+      extra: { ...accepted.extra },
+    },
     payload: {
       signature,
       authorization,
