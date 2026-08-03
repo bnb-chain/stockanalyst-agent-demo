@@ -25,6 +25,7 @@ dependencies = [
     "fredapi>=0.3.12",
     "newsapi-python>=0.2.7",
     "eth-account>=0.13,<1",
+    "pycryptodome>=3.23,<4",
 ]
 
 [build-system]
@@ -59,6 +60,7 @@ known-first-party = [
     "agent_card",
     "agent_instruction",
     "analysis",
+    "b402_client",
     "competition_reporting",
     "data_sources",
     "executor",

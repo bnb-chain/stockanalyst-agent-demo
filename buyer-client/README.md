@@ -135,8 +135,9 @@ AGENT_CLIENT_SECRET=<cognito-secret>
 DELIVERY_MODE=ipfs
 PROVIDER_ADDRESS=0x1FF095E1C5Cf4bC72a3DC54be17B6cf85043Fb67
 
-# ── x402 (local agent, no auth needed) ───────────────────────────
-X402_ENDPOINT=http://localhost:9000        # default — set only to override
+# ── x402 (API Gateway in testnet; local agent may use localhost) ─
+X402_ENDPOINT=https://<api-id>.execute-api.us-east-1.amazonaws.com/testnet
+X402_SELLER_WALLET=0xd10BdDC20E4DC42A1a19a9653e994991e25b8153
 # Optional async-client polling deadline; default is 30 minutes.
 X402_POLL_TIMEOUT_MS=1800000
 
@@ -147,8 +148,11 @@ UOMP_GUARD_TOKEN=your_guard_jwt_token
 
 > **Note:** `X402_ENDPOINT` and `AGENT_ENDPOINT` are separate.
 > `AGENT_ENDPOINT` is the deployed A2A path (requires Cognito auth) used by `npm run dev`.
-> `X402_ENDPOINT` is the bare agent URL used by `npm run x402:async` and
-> `npm run x402:free` — it defaults to `http://localhost:9000`.
+> `X402_ENDPOINT` is the API Gateway base URL for the deployed x402 gateway,
+> never the raw AgentCore invocation URL. Local development may instead use
+> `http://localhost:9000`. Only the four paid asynchronous routes are public:
+> price, create, private job status, and private resume; the free route is not
+> exposed through this gateway.
 
 ### AWS AgentCore runtime
 
@@ -367,9 +371,13 @@ Buyer                              Agent (localhost:9000)
   │                                        │
   │  POST /x402/analyze/async              │
   │  {"symbols": ["AAPL","NVDA"], ...}     │
+  │  (without X-Payment) ─────────────────▶│  B402 /supported
+  │◀── 402 accepted + resource + extra ─────│
+  │                                        │
+  │  sign exact returned requirement       │
   │  X-Payment: base64(1-U proof)  ───────▶│
   │                                        │  validate_payment_proof() ← fixed code
-  │                                        │  Binance Pay facilitator → on-chain tx
+  │                                        │  B402 /verify → /settle → on-chain tx
   │◀── 202 jobId + private jobToken ───────│
   │  GET /x402/jobs/{jobId} ──────────────▶│  background analysis
   │◀── queued / running / succeeded ───────│
@@ -395,9 +403,9 @@ const sig = await wallet.signTypedData(
     validBefore: BigInt(now + 600), nonce }
 );
 
-// x402 v2 wire format
+// Paid B402 V2 wire format. `accepted` and `resource` are copied from the 402.
 const proof = {
-  x402Version: 2, scheme: "exact", network: "eip155:97",
+  x402Version: 2, resource, accepted,
   payload: { signature: sig, authorization: { from, to, value, validAfter, validBefore, nonce } },
 };
 // X-Payment header: Buffer.from(JSON.stringify(proof)).toString("base64")
@@ -451,12 +459,13 @@ To call the agent from your own code, here are the minimal integration points:
 
 ### x402 async (simplest — any language/framework)
 
-1. **GET** `http://<agent>:9000/x402/price` → read `payTo`, `maxAmountRequired`, `network`
-2. Sign the EIP-712 EIP-3009 authorization with the buyer wallet.
-3. **POST** `/x402/analyze/async` with `X-Payment` and the analysis request.
-4. Persist the returned `jobId`, `jobToken`, status path, and expiry.
-5. Poll the status path with `X-Job-Token`; resume when instructed.
-6. Download the report from the returned private presigned URL.
+1. **POST** `/x402/analyze/async` without `X-Payment` and read the returned HTTP 402 `paymentRequired`.
+2. Validate and copy its complete `resource`, selected `accepts[]` requirement, and `extra` values.
+3. Sign the EIP-712 EIP-3009 authorization using that requirement.
+4. Repeat the same **POST** with the official V2 proof in `X-Payment`.
+5. Persist the returned `jobId`, `jobToken`, status path, and expiry.
+6. Poll the status path with `X-Job-Token`; resume when instructed.
+7. Download the report from the returned private presigned URL.
 
 ### ERC-8183 (TypeScript SDK)
 

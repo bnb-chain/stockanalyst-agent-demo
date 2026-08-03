@@ -37,6 +37,7 @@ import {
   createAsyncAnalysis,
   canonicalStatusPath,
   downloadAsyncReport,
+  fetchPaymentChallenge,
   pollAsyncAnalysis,
   AsyncJobClientError,
   type AsyncAnalysisRequest,
@@ -48,14 +49,13 @@ import {
   type SleepImpl,
 } from "./x402-async-client.js";
 import {
-  SELLER_WALLET,
   U_TOKEN_ADDRESS,
   buildPaymentProof,
+  resolveX402SellerWallet,
 } from "./x402-payment.js";
 
 const MODULE_DIRECTORY = dirname(fileURLToPath(import.meta.url));
-const KEYSTORE_PATH = process.env["KEYSTORE_PATH"]
-  ?? "../stockanalyst/.studio/wallets/0x1FF095E1C5Cf4bC72a3DC54be17B6cf85043Fb67.json";
+const KEYSTORE_PATH = process.env["KEYSTORE_PATH"] ?? "";
 const WALLET_PASSWORD = process.env["WALLET_PASSWORD"] ?? "";
 const AGENT_ENDPOINT = process.env["X402_ENDPOINT"] ?? "http://localhost:9000";
 const RECEIPT_PATH = resolve(
@@ -892,6 +892,7 @@ async function main(): Promise<void> {
       basename(RECEIPT_PATH),
       basename(PENDING_CREATE_PATH),
     ]);
+    const sellerWallet = resolveX402SellerWallet();
     let receipt: AsyncJobReceipt;
     let symbols: string[];
 
@@ -926,25 +927,35 @@ async function main(): Promise<void> {
         if (!WALLET_PASSWORD) {
           throw new Error("WALLET_PASSWORD is required to create a new job");
         }
+        if (!KEYSTORE_PATH) {
+          throw new Error("KEYSTORE_PATH is required to create a new job");
+        }
         console.log("Loading UOMP portfolio context...");
         const context = await buildTaskFromMemory(new GuardUserMemory());
         symbols = context.symbols;
         console.log(`  Symbols: ${symbols.join(", ")}`);
+        const request: AsyncAnalysisRequest = {
+          symbols,
+          analysis_type: "comprehensive",
+          portfolio: context.portfolio,
+          risk_profile: context.riskProfile,
+        };
+        console.log("Fetching the current B402 payment requirement...");
+        const challenge = await fetchPaymentChallenge(
+          AGENT_ENDPOINT,
+          request,
+          sellerWallet,
+        );
         const keystorePath = resolve(MODULE_DIRECTORY, "..", KEYSTORE_PATH);
         const wallet = await Wallet.fromEncryptedJson(
           readFileSync(keystorePath, "utf8"),
           WALLET_PASSWORD,
         ) as Wallet;
         console.log("Signing one x402 EIP-3009 payment authorization...");
-        const proof = await buildPaymentProof(wallet);
+        const proof = await buildPaymentProof(wallet, challenge);
         pending = createPendingRecord(
           proof,
-          {
-            symbols,
-            analysis_type: "comprehensive",
-            portfolio: context.portfolio,
-            risk_profile: context.riskProfile,
-          },
+          request,
         );
         // This durable record must exist before the first payment POST.
         persistPendingCreate(PENDING_CREATE_PATH, pending);
@@ -956,7 +967,7 @@ async function main(): Promise<void> {
         RECEIPT_PATH,
       );
       console.log(`Created asynchronous job ${receipt.jobId}`);
-      console.log(`Payment: 1.0 U → ${SELLER_WALLET}`);
+      console.log(`Payment: 1.0 U → ${sellerWallet}`);
       console.log(`Token contract: ${U_TOKEN_ADDRESS}`);
     }
 

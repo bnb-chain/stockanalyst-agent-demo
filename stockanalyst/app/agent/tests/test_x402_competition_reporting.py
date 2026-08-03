@@ -19,6 +19,21 @@ NONCE = f"0x{'22' * 32}"
 
 def _payment_header() -> str:
     proof = {
+        "x402Version": 2,
+        "accepted": {
+            "scheme": "exact",
+            "network": "eip155:97",
+            "amount": "1000000000000000000",
+            "asset": "0xc70B8741B8B07A6d61E54fd4B20f22Fa648E5565",
+            "payTo": "0xd10bddc20e4dc42a1a19a9653e994991e25b8153",
+            "maxTimeoutSeconds": 600,
+            "extra": {
+                "name": "U",
+                "version": "1",
+                "assetTransferMethod": "eip3009",
+                "signerAddress": "0x3333333333333333333333333333333333333333",
+            },
+        },
         "payload": {
             "authorization": {
                 "from": ADDRESS,
@@ -136,20 +151,18 @@ class X402CompetitionReportingTests(unittest.IsolatedAsyncioTestCase):
         )
         handler._stream_free_sse.assert_awaited_once()
 
-    async def test_facilitator_5xx_is_indeterminate_not_rejection(self) -> None:
-        response = _FakeResponse(
-            503,
-            {"code": "SYSTEM_BUSY", "errorMessage": "try later"},
+    async def test_b402_unknown_outcome_is_indeterminate_not_rejection(
+        self,
+    ) -> None:
+        client = AsyncMock()
+        client.verify_and_settle.side_effect = (
+            handler_module.B402IndeterminateError("response lost")
         )
         with (
-            patch.object(
-                handler_module.httpx,
-                "AsyncClient",
-                return_value=_FakeHttpClient(response),
-            ),
+            patch.object(handler_module, "_B402_CLIENT", client),
             self.assertRaises(SettlementIndeterminate),
         ):
-            await handler_module._settle_b402({})
+            await handler_module._settle_via_facilitator(_payment_header())
 
     async def test_facilitator_malformed_response_is_indeterminate(self) -> None:
         response = _FakeResponse(200, malformed=True)
@@ -163,20 +176,29 @@ class X402CompetitionReportingTests(unittest.IsolatedAsyncioTestCase):
         ):
             await handler_module._settle_generic({})
 
-    async def test_structured_facilitator_rejection_remains_explicit(self) -> None:
-        response = _FakeResponse(
-            400,
-            {"code": "INVALID_AUTHORIZATION", "errorMessage": "rejected"},
+    async def test_structured_b402_rejection_remains_explicit(self) -> None:
+        client = AsyncMock()
+        client.verify_and_settle.side_effect = handler_module.B402RejectedError(
+            "insufficient_funds"
         )
-        with patch.object(
-            handler_module.httpx,
-            "AsyncClient",
-            return_value=_FakeHttpClient(response),
-        ):
-            settled, reason = await handler_module._settle_b402({})
+        with patch.object(handler_module, "_B402_CLIENT", client):
+            settled, reason = await handler_module._settle_via_facilitator(
+                _payment_header()
+            )
 
         self.assertFalse(settled)
-        self.assertEqual(reason, "rejected")
+        self.assertEqual(reason, "insufficient_funds")
+
+    async def test_confirmed_b402_settlement_returns_transaction(self) -> None:
+        client = AsyncMock()
+        client.verify_and_settle.return_value = "0x" + "12" * 32
+        with patch.object(handler_module, "_B402_CLIENT", client):
+            settled, transaction = await handler_module._settle_via_facilitator(
+                _payment_header()
+            )
+
+        self.assertTrue(settled)
+        self.assertEqual(transaction, "0x" + "12" * 32)
 
     async def test_async_create_delegates_accounting_to_job_service(self) -> None:
         job_service = AsyncMock()

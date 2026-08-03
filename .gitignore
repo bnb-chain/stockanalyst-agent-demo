@@ -66,3 +66,6 @@ htmlcov/
 docs/superpowers/
 output/
 agentcore/
+infra/
+
+.DS_Store

@@ -54,6 +54,11 @@ def _load_agent_card():
 
 
 class NotifyFundedCardTests(unittest.TestCase):
+    def test_card_does_not_advertise_internal_x402_envelope(self) -> None:
+        card = _load_agent_card().build_agent_card()
+        skill_ids = {skill.id for skill in card.skills}
+        self.assertEqual(skill_ids, {"negotiate", "notify_funded"})
+
     def test_negotiate_handoff_requires_signed_notify_helper(self) -> None:
         agent_card = _load_agent_card()
         description = agent_card._NEGOTIATE.description

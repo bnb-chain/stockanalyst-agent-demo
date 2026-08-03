@@ -1,3 +1,10 @@
+import type {
+  B402PaymentExtra,
+  B402PaymentRequirement,
+  B402PaymentResource,
+  PaidPaymentChallenge,
+} from "./x402-payment.js";
+
 export type FetchImpl = (
   input: RequestInfo | URL,
   init?: RequestInit,
@@ -95,6 +102,10 @@ const MAX_CREATE_TIMEOUT_MILLISECONDS = 5 * 60 * 1_000;
 const MIN_POLL_MILLISECONDS = 1_000;
 const MAX_REPORT_BYTES = 2 * 1024 * 1024;
 const MAX_JSON_BYTES = 64 * 1024;
+const BSC_TESTNET_NETWORK = "eip155:97";
+const U_TOKEN_ADDRESS = "0x330949Aed7d00FCe0558C64ED6FeC9792616cC39";
+const PAID_AMOUNT = "1000000";
+const EVM_ADDRESS_PATTERN = /^0x[0-9a-fA-F]{40}$/;
 const SAFE_SERVER_ERROR_CODES = new Set([
   "analysis_failed",
   "analysis_timeout",
@@ -107,6 +118,7 @@ const SAFE_SERVER_ERROR_CODES = new Set([
   "job_service_unavailable",
   "job_state_unavailable",
   "payment_failed",
+  "payment_backend_unavailable",
   "payment_rejected",
   "payment_unavailable",
   "request_too_large",
@@ -166,7 +178,103 @@ function normalizedEndpoint(endpoint: string): URL {
 
 function routeUrl(endpoint: string, path: string): string {
   const base = normalizedEndpoint(endpoint);
-  return new URL(path, base.origin).toString();
+  const prefix = base.pathname.replace(/\/+$/, "");
+  base.pathname = `${prefix}/${path.replace(/^\/+/, "")}`;
+  return base.toString();
+}
+
+function invalidPaymentChallenge(): never {
+  throw new AsyncJobClientError("invalid_payment_challenge");
+}
+
+function parsePaymentChallenge(
+  endpoint: string,
+  expectedSeller: string,
+  value: unknown,
+): PaidPaymentChallenge {
+  if (!isRecord(value)) invalidPaymentChallenge();
+  const paymentRequired = value["paymentRequired"];
+  if (
+    !isRecord(paymentRequired)
+    || paymentRequired["x402Version"] !== 2
+    || !Array.isArray(paymentRequired["accepts"])
+    || paymentRequired["accepts"].length !== 1
+  ) {
+    invalidPaymentChallenge();
+  }
+  const acceptedValue = paymentRequired["accepts"][0];
+  const resourceValue = paymentRequired["resource"];
+  if (!isRecord(acceptedValue) || !isRecord(resourceValue)) {
+    invalidPaymentChallenge();
+  }
+  const extraValue = acceptedValue["extra"];
+  if (!isRecord(extraValue)) invalidPaymentChallenge();
+
+  const resourceUrl = resourceValue["url"];
+  const description = resourceValue["description"];
+  const mimeType = resourceValue["mimeType"];
+  const expectedResourceUrl = routeUrl(endpoint, "/x402/analyze/async");
+  if (
+    resourceUrl !== expectedResourceUrl
+    || typeof description !== "string"
+    || description.length === 0
+    || mimeType !== "application/json"
+  ) {
+    invalidPaymentChallenge();
+  }
+
+  const seller = expectedSeller.toLowerCase();
+  const asset = acceptedValue["asset"];
+  const payTo = acceptedValue["payTo"];
+  const timeout = acceptedValue["maxTimeoutSeconds"];
+  const signerAddress = extraValue["signerAddress"];
+  if (
+    !EVM_ADDRESS_PATTERN.test(expectedSeller)
+    || acceptedValue["scheme"] !== "exact"
+    || acceptedValue["network"] !== BSC_TESTNET_NETWORK
+    || acceptedValue["amount"] !== PAID_AMOUNT
+    || typeof asset !== "string"
+    || asset.toLowerCase() !== U_TOKEN_ADDRESS.toLowerCase()
+    || typeof payTo !== "string"
+    || payTo.toLowerCase() !== seller
+    || !Number.isSafeInteger(timeout)
+    || (timeout as number) <= 0
+    || (timeout as number) > 3_600
+    || extraValue["name"] !== "U"
+    || extraValue["version"] !== "1"
+    || extraValue["assetTransferMethod"] !== "eip3009"
+    || typeof signerAddress !== "string"
+    || !EVM_ADDRESS_PATTERN.test(signerAddress)
+  ) {
+    invalidPaymentChallenge();
+  }
+
+  const extra: B402PaymentExtra = {
+    ...extraValue,
+    name: "U",
+    version: "1",
+    assetTransferMethod: "eip3009",
+    signerAddress,
+  };
+  const accepted: B402PaymentRequirement = {
+    scheme: "exact",
+    network: BSC_TESTNET_NETWORK,
+    amount: PAID_AMOUNT,
+    asset,
+    payTo: payTo.toLowerCase(),
+    maxTimeoutSeconds: timeout as number,
+    extra,
+  };
+  const resource: B402PaymentResource = {
+    url: resourceUrl,
+    description,
+    mimeType: "application/json",
+  };
+  return {
+    x402Version: 2,
+    resource,
+    accepted,
+  };
 }
 
 function jobUrl(endpoint: string, jobId: string): string {
@@ -512,6 +620,56 @@ async function resumeJob(
     status: parseJobStatus(receipt.jobId, await readJson(response)),
     retryAfterMilliseconds: retryAfterMilliseconds(response, now),
   };
+}
+
+export async function fetchPaymentChallenge(
+  endpoint: string,
+  request: AsyncAnalysisRequest,
+  expectedSeller: string,
+  fetchImpl: FetchImpl = globalThis.fetch,
+): Promise<PaidPaymentChallenge> {
+  let body: string;
+  try {
+    body = JSON.stringify(request);
+  } catch {
+    throw new AsyncJobClientError("invalid_request");
+  }
+  const response = await safeFetch(
+    fetchImpl,
+    routeUrl(endpoint, "/x402/analyze/async"),
+    {
+      method: "POST",
+      headers: {
+        Accept: "application/json",
+        "Content-Type": "application/json",
+      },
+      body,
+      redirect: "error",
+    },
+  );
+  if (response.status !== 402) {
+    throw new AsyncJobClientError("invalid_payment_challenge", {
+      httpStatus: response.status,
+      retryable: response.status >= 500,
+    });
+  }
+  try {
+    return parsePaymentChallenge(
+      endpoint,
+      expectedSeller,
+      await readJson(response),
+    );
+  } catch (error) {
+    if (
+      error instanceof AsyncJobClientError
+      && error.code === "invalid_payment_challenge"
+    ) {
+      throw error;
+    }
+    throw new AsyncJobClientError("invalid_payment_challenge", {
+      httpStatus: response.status,
+    });
+  }
 }
 
 export async function createAsyncAnalysis(

@@ -30,7 +30,7 @@ platform_artifact = "zip"
 packaging = "zip"
 iam_notice_accepted_at = "2026-07-29T08:12:28Z"
 iam_notice_version = 1
-last_deploy_at = "2026-07-29T08:22:03Z"
+last_deploy_at = "2026-07-29T08:55:51Z"
 runtime_arn = "arn:aws:bedrock-agentcore:us-east-1:201243086760:runtime/stockanalyst_stockanalyst-hrXlh1BUtQ"
 
 [wallet]
@@ -41,8 +41,8 @@ kind = "evm-local"
 signer = "local"
 keystore_dir = "../../.studio/wallets"
 # address = "0x..."   # filled by `bag wallet new`
-address = "0x1FF095E1C5Cf4bC72a3DC54be17B6cf85043Fb67"
-platform_exposed_addresses = ["0x1FF095E1C5Cf4bC72a3DC54be17B6cf85043Fb67"]
+address = "0xd10BdDC20E4DC42A1a19a9653e994991e25b8153"
+platform_exposed_addresses = ["0xd10BdDC20E4DC42A1a19a9653e994991e25b8153"]
 
 [llm]
 provider = "openrouter"
@@ -124,13 +124,15 @@ endpoint = "/x402/analyze/async"
 port = 9001
 public = true
 
-# ── Binance Pay B402 facilitator (preferred) ────────────────────────────────
-# Apply for B402 credentials at https://forms.gle/aUQvxUETfGMzyTky5
-# After approval, IP-whitelist your agent's egress IP in the Binance console,
-# then set both vars (HMAC-SHA512 auth, BSC testnet supported):
-#   bag env set B402_CLIENT_ID <your-clientId>
-#   bag env set B402_SECRET    <your-secret>
-#   bag env set B402_BASE_URL  https://bpay.binance.com   # default, sandbox same
+# ── Binance B402 V2 facilitator (preferred) ─────────────────────────────────
+# Binance supplies clientId, accessToken, and an environment-specific base URL
+# during onboarding. B402_PRIVATE_KEY is the partner-owned, one-line Base64
+# PKCS#8 DER private key registered for that account. All four values are
+# required; there is intentionally no default base URL.
+#   bag env set B402_CLIENT_ID     <your-clientId>
+#   bag env set B402_ACCESS_TOKEN  <your-accessToken>
+#   bag env set B402_BASE_URL      <your-Binance-sandbox-base-URL>
+#   bag env set B402_PRIVATE_KEY   <your-Base64-PKCS8-private-key>
 #
 # ── Generic x402 facilitator (fallback, unauthenticated) ───────────────────
 #   bag env set X402_FACILITATOR_URL https://x402.org/facilitate

@@ -18,6 +18,7 @@ import {
   AsyncJobClientError,
   createAsyncAnalysis,
   downloadAsyncReport,
+  fetchPaymentChallenge,
   pollAsyncAnalysis,
   resumeAsyncAnalysis,
   type AsyncJobReceipt,
@@ -26,11 +27,12 @@ import {
 } from "./x402-async-client.js";
 import {
   BSC_TESTNET_CHAIN_ID,
-  SELLER_WALLET,
   U_TOKEN_ADDRESS,
   U_TOKEN_DOMAIN_NAME,
   U_TOKEN_DOMAIN_VERSION,
   buildPaymentProof,
+  resolveX402SellerWallet,
+  type PaidPaymentChallenge,
 } from "./x402-payment.js";
 import {
   acquireExclusiveCliLock,
@@ -56,6 +58,47 @@ const EXPIRES_AT = 1_800_000_000_000;
 const REPORT_URL = "https://reports-bucket.s3.us-east-1.amazonaws.com/report.md?X-Amz-Signature=test";
 const OLD_REPORT_URL = "https://reports-bucket.s3.us-east-1.amazonaws.com/old.md?X-Amz-Signature=old";
 const NEW_REPORT_URL = "https://reports-bucket.s3.us-east-1.amazonaws.com/new.md?X-Amz-Signature=new";
+const SELLER = "0xd10BdDC20E4DC42A1a19a9653e994991e25b8153";
+const SIGNER = "0x1111111111111111111111111111111111111111";
+const B402_U_TOKEN = "0x330949Aed7d00FCe0558C64ED6FeC9792616cC39";
+const ONE_U_ATOMIC = "1000000";
+
+function paymentChallenge(
+  overrides: {
+    resource?: Record<string, unknown>;
+    accepted?: Record<string, unknown>;
+    extra?: Record<string, unknown>;
+  } = {},
+): PaidPaymentChallenge {
+  const resource = {
+    url: `${ENDPOINT}/x402/analyze/async`,
+    description: "Stock analysis for AAPL",
+    mimeType: "application/json",
+    ...overrides.resource,
+  };
+  const extra = {
+    name: "U",
+    version: "1",
+    assetTransferMethod: "eip3009",
+    signerAddress: SIGNER,
+    ...overrides.extra,
+  };
+  const accepted = {
+    scheme: "exact",
+    network: "eip155:97",
+    amount: ONE_U_ATOMIC,
+    asset: U_TOKEN_ADDRESS,
+    payTo: SELLER.toLowerCase(),
+    maxTimeoutSeconds: 600,
+    extra,
+    ...overrides.accepted,
+  };
+  return {
+    x402Version: 2,
+    resource,
+    accepted,
+  } as PaidPaymentChallenge;
+}
 
 function receipt(overrides: Partial<AsyncJobReceipt> = {}): AsyncJobReceipt {
   return {
@@ -118,14 +161,48 @@ function proofExpiringAt(validBeforeSeconds: number): string {
   })).toString("base64");
 }
 
-test("buildPaymentProof preserves the paid EIP-3009 wire format", async () => {
+function decodeProof(proof: string): {
+  payload: { authorization: { to: string } };
+} {
+  return JSON.parse(Buffer.from(proof, "base64").toString("utf8")) as {
+    payload: { authorization: { to: string } };
+  };
+}
+
+test("requires an explicit x402 seller wallet", () => {
+  assert.throws(
+    () => resolveX402SellerWallet({}),
+    /X402_SELLER_WALLET/,
+  );
+});
+
+test("uses the B402-supported six-decimal U token", () => {
+  assert.equal(U_TOKEN_ADDRESS, B402_U_TOKEN);
+  assert.equal(paymentChallenge().accepted.amount, ONE_U_ATOMIC);
+});
+
+test("signs the authorization to the configured seller wallet", async () => {
+  const proof = decodeProof(
+    await buildPaymentProof(
+      new Wallet(Wallet.createRandom().privateKey),
+      paymentChallenge(),
+    ),
+  );
+
+  assert.equal(proof.payload.authorization.to, SELLER.toLowerCase());
+});
+
+test("buildPaymentProof creates the official B402 V2 proof", async () => {
   const wallet = new Wallet(Wallet.createRandom().privateKey);
+  const challenge = paymentChallenge({
+    accepted: { amount: "42" },
+  });
   const proof = JSON.parse(
-    Buffer.from(await buildPaymentProof(wallet, "42", 300), "base64").toString("utf8"),
+    Buffer.from(await buildPaymentProof(wallet, challenge, 300), "base64").toString("utf8"),
   ) as {
     x402Version: number;
-    scheme: string;
-    network: string;
+    resource: PaidPaymentChallenge["resource"];
+    accepted: PaidPaymentChallenge["accepted"];
     payload: {
       signature: string;
       authorization: {
@@ -140,10 +217,12 @@ test("buildPaymentProof preserves the paid EIP-3009 wire format", async () => {
   };
 
   assert.equal(proof.x402Version, 2);
-  assert.equal(proof.scheme, "exact");
-  assert.equal(proof.network, `eip155:${BSC_TESTNET_CHAIN_ID}`);
+  assert.deepEqual(proof.resource, challenge.resource);
+  assert.deepEqual(proof.accepted, challenge.accepted);
+  assert.equal("scheme" in proof, false);
+  assert.equal("network" in proof, false);
   assert.equal(proof.payload.authorization.from, wallet.address.toLowerCase());
-  assert.equal(proof.payload.authorization.to, SELLER_WALLET);
+  assert.equal(proof.payload.authorization.to, SELLER.toLowerCase());
   assert.equal(proof.payload.authorization.value, "42");
   assert.equal(proof.payload.authorization.validAfter, "0");
   assert.match(proof.payload.authorization.nonce, /^0x[0-9a-f]{64}$/);
@@ -174,6 +253,98 @@ test("buildPaymentProof preserves the paid EIP-3009 wire format", async () => {
     proof.payload.signature,
   );
   assert.equal(recovered, wallet.address);
+});
+
+test("fetchPaymentChallenge validates the B402 payment challenge", async () => {
+  const expected = paymentChallenge();
+  const calls: Array<{ url: string; headers: Headers }> = [];
+  const fetchImpl: FetchImpl = async (input, init) => {
+    calls.push({
+      url: String(input),
+      headers: new Headers(init?.headers),
+    });
+    return json({
+      error: "Payment Required",
+      paymentRequired: {
+        x402Version: 2,
+        accepts: [expected.accepted],
+        resource: expected.resource,
+      },
+    }, { status: 402 });
+  };
+
+  const actual = await fetchPaymentChallenge(
+    ENDPOINT,
+    { symbols: ["AAPL"] },
+    SELLER,
+    fetchImpl,
+  );
+
+  assert.deepEqual(actual, expected);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0]?.url, `${ENDPOINT}/x402/analyze/async`);
+  assert.equal(calls[0]?.headers.has("X-Payment"), false);
+});
+
+test("fetchPaymentChallenge preserves an API Gateway stage prefix", async () => {
+  const endpoint = `${ENDPOINT}/testnet`;
+  const expected = paymentChallenge({
+    resource: {
+      url: `${endpoint}/x402/analyze/async`,
+    },
+  });
+  let requestedUrl = "";
+  const actual = await fetchPaymentChallenge(
+    endpoint,
+    { symbols: ["AAPL"] },
+    SELLER,
+    async (input) => {
+      requestedUrl = String(input);
+      return json({
+        paymentRequired: {
+          x402Version: 2,
+          accepts: [expected.accepted],
+          resource: expected.resource,
+        },
+      }, { status: 402 });
+    },
+  );
+
+  assert.deepEqual(actual, expected);
+  assert.equal(requestedUrl, `${endpoint}/x402/analyze/async`);
+});
+
+test("fetchPaymentChallenge rejects unsafe B402 payment challenges", async () => {
+  const invalid: Array<[string, PaidPaymentChallenge]> = [
+    ["network", paymentChallenge({ accepted: { network: "eip155:56" } })],
+    ["asset", paymentChallenge({ accepted: { asset: "0x" + "22".repeat(20) } })],
+    ["seller", paymentChallenge({ accepted: { payTo: "0x" + "33".repeat(20) } })],
+    ["amount", paymentChallenge({ accepted: { amount: "999" } })],
+    ["method", paymentChallenge({ extra: { assetTransferMethod: "permit2-exact" } })],
+    ["signer", paymentChallenge({ extra: { signerAddress: "invalid" } })],
+    ["resource", paymentChallenge({ resource: { url: "https://evil.example/x402" } })],
+  ];
+
+  for (const [field, challenge] of invalid) {
+    await assert.rejects(
+      fetchPaymentChallenge(
+        ENDPOINT,
+        { symbols: ["AAPL"] },
+        SELLER,
+        async () => json({
+          paymentRequired: {
+            x402Version: 2,
+            accepts: [challenge.accepted],
+            resource: challenge.resource,
+          },
+        }, { status: 402 }),
+      ),
+      (error: unknown) => {
+        assert.equal((error as AsyncJobClientError).code, "invalid_payment_challenge", field);
+        return true;
+      },
+    );
+  }
 });
 
 test("creates, polls, and downloads an asynchronous report", async () => {
