@@ -139,9 +139,9 @@ def _resolve_seller_wallet(
 
 
 SELLER_WALLET       = _resolve_seller_wallet()
-U_TOKEN_BSC_TESTNET = "0xc70B8741B8B07A6d61E54fd4B20f22Fa648E5565"
-PRICE_WEI           = 10**18         # 1.0 U
-MIN_PRICE_WEI       = 5 * 10**17    # 0.5 U
+U_TOKEN_BSC_TESTNET = "0x330949Aed7d00FCe0558C64ED6FeC9792616cC39"
+PRICE_WEI           = 10**6         # 1.0 U (6 decimals)
+MIN_PRICE_WEI       = 5 * 10**5     # 0.5 U (6 decimals)
 CHAIN_ID            = 97            # BSC Testnet
 
 

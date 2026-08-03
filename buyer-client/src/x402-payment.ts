@@ -2,7 +2,7 @@ import { randomBytes } from "node:crypto";
 import { getAddress, type Wallet } from "ethers";
 
 // These values must match stockanalyst/app/agent/x402_verify.py.
-export const U_TOKEN_ADDRESS = "0xc70B8741B8B07A6d61E54fd4B20f22Fa648E5565";
+export const U_TOKEN_ADDRESS = "0x330949Aed7d00FCe0558C64ED6FeC9792616cC39";
 export const U_TOKEN_DOMAIN_NAME = process.env["U_TOKEN_DOMAIN_NAME"] ?? "U";
 export const U_TOKEN_DOMAIN_VERSION = process.env["U_TOKEN_DOMAIN_VERSION"] ?? "1";
 export const BSC_TESTNET_CHAIN_ID = 97;

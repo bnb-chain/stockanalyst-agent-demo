@@ -60,6 +60,8 @@ const OLD_REPORT_URL = "https://reports-bucket.s3.us-east-1.amazonaws.com/old.md
 const NEW_REPORT_URL = "https://reports-bucket.s3.us-east-1.amazonaws.com/new.md?X-Amz-Signature=new";
 const SELLER = "0xd10BdDC20E4DC42A1a19a9653e994991e25b8153";
 const SIGNER = "0x1111111111111111111111111111111111111111";
+const B402_U_TOKEN = "0x330949Aed7d00FCe0558C64ED6FeC9792616cC39";
+const ONE_U_ATOMIC = "1000000";
 
 function paymentChallenge(
   overrides: {
@@ -84,7 +86,7 @@ function paymentChallenge(
   const accepted = {
     scheme: "exact",
     network: "eip155:97",
-    amount: "1000000000000000000",
+    amount: ONE_U_ATOMIC,
     asset: U_TOKEN_ADDRESS,
     payTo: SELLER.toLowerCase(),
     maxTimeoutSeconds: 600,
@@ -172,6 +174,11 @@ test("requires an explicit x402 seller wallet", () => {
     () => resolveX402SellerWallet({}),
     /X402_SELLER_WALLET/,
   );
+});
+
+test("uses the B402-supported six-decimal U token", () => {
+  assert.equal(U_TOKEN_ADDRESS, B402_U_TOKEN);
+  assert.equal(paymentChallenge().accepted.amount, ONE_U_ATOMIC);
 });
 
 test("signs the authorization to the configured seller wallet", async () => {
@@ -277,6 +284,34 @@ test("fetchPaymentChallenge validates the B402 payment challenge", async () => {
   assert.equal(calls.length, 1);
   assert.equal(calls[0]?.url, `${ENDPOINT}/x402/analyze/async`);
   assert.equal(calls[0]?.headers.has("X-Payment"), false);
+});
+
+test("fetchPaymentChallenge preserves an API Gateway stage prefix", async () => {
+  const endpoint = `${ENDPOINT}/testnet`;
+  const expected = paymentChallenge({
+    resource: {
+      url: `${endpoint}/x402/analyze/async`,
+    },
+  });
+  let requestedUrl = "";
+  const actual = await fetchPaymentChallenge(
+    endpoint,
+    { symbols: ["AAPL"] },
+    SELLER,
+    async (input) => {
+      requestedUrl = String(input);
+      return json({
+        paymentRequired: {
+          x402Version: 2,
+          accepts: [expected.accepted],
+          resource: expected.resource,
+        },
+      }, { status: 402 });
+    },
+  );
+
+  assert.deepEqual(actual, expected);
+  assert.equal(requestedUrl, `${endpoint}/x402/analyze/async`);
 });
 
 test("fetchPaymentChallenge rejects unsafe B402 payment challenges", async () => {

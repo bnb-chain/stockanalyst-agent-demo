@@ -651,12 +651,13 @@ class X402AsyncHandlerTests(unittest.IsolatedAsyncioTestCase):
             "secret bucket/key/token detail"
         )
 
-        response = await call_handler(
-            make_handler(service),
-            method="GET",
-            path=f"/x402/jobs/{JOB_ID}",
-            headers={"x-job-token": "token"},
-        )
+        with self.assertLogs("seller-agent.x402", level="WARNING") as logs:
+            response = await call_handler(
+                make_handler(service),
+                method="GET",
+                path=f"/x402/jobs/{JOB_ID}",
+                headers={"x-job-token": "token"},
+            )
 
         self.assertEqual(response.status, 503)
         self.assert_private_no_store(response, token_authenticated=True)
@@ -665,6 +666,8 @@ class X402AsyncHandlerTests(unittest.IsolatedAsyncioTestCase):
             "retryable": True,
         })
         self.assertNotIn(b"secret", response.body)
+        self.assertIn("dependency=RuntimeError", logs.output[0])
+        self.assertNotIn("secret bucket/key/token detail", logs.output[0])
 
     async def test_new_routes_are_404_when_service_is_not_configured(self) -> None:
         create = await call_handler(

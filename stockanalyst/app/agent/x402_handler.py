@@ -432,8 +432,11 @@ class X402Handler:
         except X402JobError as exc:
             await _send_job_error(send, exc, token_authenticated=False)
             return
-        except Exception:
-            logger.warning("x402 asynchronous job service unavailable")
+        except Exception as exc:
+            logger.warning(
+                "x402 asynchronous job service unavailable dependency=%s",
+                type(exc).__name__,
+            )
             await _send_service_unavailable(
                 send,
                 token_authenticated=False,
@@ -466,8 +469,11 @@ class X402Handler:
         except X402JobError as exc:
             await _send_job_error(send, exc, token_authenticated=True)
             return
-        except Exception:
-            logger.warning("x402 asynchronous job service unavailable")
+        except Exception as exc:
+            logger.warning(
+                "x402 asynchronous job service unavailable dependency=%s",
+                type(exc).__name__,
+            )
             await _send_service_unavailable(
                 send,
                 token_authenticated=True,
@@ -497,8 +503,11 @@ class X402Handler:
         except X402JobError as exc:
             await _send_job_error(send, exc, token_authenticated=True)
             return
-        except Exception:
-            logger.warning("x402 asynchronous job service unavailable")
+        except Exception as exc:
+            logger.warning(
+                "x402 asynchronous job service unavailable dependency=%s",
+                type(exc).__name__,
+            )
             await _send_service_unavailable(
                 send,
                 token_authenticated=True,

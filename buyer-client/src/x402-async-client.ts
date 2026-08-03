@@ -103,8 +103,8 @@ const MIN_POLL_MILLISECONDS = 1_000;
 const MAX_REPORT_BYTES = 2 * 1024 * 1024;
 const MAX_JSON_BYTES = 64 * 1024;
 const BSC_TESTNET_NETWORK = "eip155:97";
-const U_TOKEN_ADDRESS = "0xc70B8741B8B07A6d61E54fd4B20f22Fa648E5565";
-const PAID_AMOUNT = "1000000000000000000";
+const U_TOKEN_ADDRESS = "0x330949Aed7d00FCe0558C64ED6FeC9792616cC39";
+const PAID_AMOUNT = "1000000";
 const EVM_ADDRESS_PATTERN = /^0x[0-9a-fA-F]{40}$/;
 const SAFE_SERVER_ERROR_CODES = new Set([
   "analysis_failed",
@@ -178,7 +178,9 @@ function normalizedEndpoint(endpoint: string): URL {
 
 function routeUrl(endpoint: string, path: string): string {
   const base = normalizedEndpoint(endpoint);
-  return new URL(path, base.origin).toString();
+  const prefix = base.pathname.replace(/\/+$/, "");
+  base.pathname = `${prefix}/${path.replace(/^\/+/, "")}`;
+  return base.toString();
 }
 
 function invalidPaymentChallenge(): never {

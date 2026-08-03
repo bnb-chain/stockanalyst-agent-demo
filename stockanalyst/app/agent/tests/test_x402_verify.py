@@ -80,6 +80,13 @@ class VerifiedPaymentTests(unittest.TestCase):
 
         self.assertEqual(resolved, active_seller)
 
+    def test_uses_b402_supported_six_decimal_u_token(self) -> None:
+        self.assertEqual(
+            verify.U_TOKEN_BSC_TESTNET,
+            "0x330949Aed7d00FCe0558C64ED6FeC9792616cC39",
+        )
+        self.assertEqual(verify.PRICE_WEI, 1_000_000)
+
     def test_invalid_seller_wallet_fails_closed(self) -> None:
         with self.assertRaisesRegex(RuntimeError, "seller wallet"):
             verify._resolve_seller_wallet(
