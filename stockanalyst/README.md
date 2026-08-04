@@ -31,7 +31,13 @@ The agent aggregates data from five sources before writing a single word of anal
 | **Alpha Vantage** | AI-scored news sentiment per ticker (–1 bearish → +1 bullish) | `ALPHA_VANTAGE_API_KEY` |
 | **GNews** | Top 5 recent headlines by company name | `GNEWS_API_KEY` |
 
-If an API key is absent, that data block is skipped — the agent continues with what it has. SEC EDGAR and yfinance always run.
+If an API key is absent, that data block is skipped — the agent continues with
+what it has. SEC EDGAR and yfinance always run. When Alpha Vantage or GNews is
+configured, transient transport failures, timeouts, HTTP 5xx responses, and
+provider rate limits are retried three times after the initial request, with a
+fixed 30-second delay. Non-rate-limit failures still degrade gracefully after
+the retries. If rate limiting remains after all retries, the paid analysis job
+fails with the stable public error described below.
 
 ### Technical Indicators
 
@@ -234,6 +240,20 @@ not expose the AgentCore invocation URL. See
 [`docs/x402-lambda-gateway.md`](../docs/x402-lambda-gateway.md) for operation
 and rollback procedures.
 The free POST returns buffered JSON (`content` plus `format`), not SSE.
+
+If Alpha Vantage or GNews remains rate-limited after the initial request and
+three retries, authenticated job polling returns a retryable failure without
+exposing provider details or credentials:
+
+```json
+{
+  "jobId": "x402_...",
+  "status": "failed",
+  "errorCode": "too_many_users",
+  "error": "Too many users now. Please try again later",
+  "retryable": true
+}
+```
 
 ### Prerequisites
 
@@ -440,6 +460,11 @@ ALPHA_VANTAGE_API_KEY=...   # alphavantage.co — free, 25 req/day
 GNEWS_API_KEY=...           # gnews.io — free, 100 req/day
 ```
 
+`.env.local` configures local runs only. For AgentCore deployments, ensure the
+JSON secret referenced by `BNBAGENT_RUNTIME_SECRET_ID` contains
+`ALPHA_VANTAGE_API_KEY` and `GNEWS_API_KEY`; the runtime loads that secret into
+the process environment before constructing the agent tools.
+
 SEC EDGAR and yfinance (price, technicals, options) require no key and always run.
 
 ### Install buyer dependencies
@@ -568,7 +593,11 @@ Agent 在写任何分析之前，会先聚合来自五个数据源的数据。�
 | **Alpha Vantage** | AI 新闻情绪评分（–1 看空 → +1 看多） | `ALPHA_VANTAGE_API_KEY` |
 | **GNews** | 按公司名搜索的最新 5 条头条 | `GNEWS_API_KEY` |
 
-如果某个 Key 未配置，对应数据块跳过，Agent 继续用现有数据完成报告。SEC EDGAR 和 yfinance 始终可用。
+如果某个 Key 未配置，对应数据块跳过，Agent 继续用现有数据完成报告。SEC EDGAR
+和 yfinance 始终可用。配置 Alpha Vantage 或 GNews 后，网络异常、超时、HTTP
+5xx 和供应商限流会在首次请求失败后再重试 3 次，每次固定间隔 30 秒。非限流
+错误在重试耗尽后仍按原逻辑降级；如果最终仍为限流，付费分析任务会使用下方稳定
+错误结束。
 
 ### 技术指标
 
@@ -775,6 +804,20 @@ URL 仍可独立使用到其自身过期时间，最长 30 分钟。S3 Lifecycle
 异步调度。本操作手册只支持一个从未启用 S3 Versioning 的独立私有 x402 任务
 bucket。
 
+如果 Alpha Vantage 或 GNews 在首次请求及 3 次重试后仍然限流，鉴权轮询返回：
+
+```json
+{
+  "jobId": "x402_...",
+  "status": "failed",
+  "errorCode": "too_many_users",
+  "error": "Too many users now. Please try again later",
+  "retryable": true
+}
+```
+
+响应不会暴露供应商原始错误、API Key 或其他凭证。
+
 先在操作者本地设置变量，不要提交真实值：
 
 ```bash
@@ -938,6 +981,11 @@ FRED_API_KEY=...            # fred.stlouisfed.org — 免费，秒批
 ALPHA_VANTAGE_API_KEY=...   # alphavantage.co — 免费，25 次/天
 GNEWS_API_KEY=...           # gnews.io — 免费，100 次/天
 ```
+
+`.env.local` 只用于本地运行。部署到 AgentCore 时，需要确保
+`BNBAGENT_RUNTIME_SECRET_ID` 指向的 JSON Secret 包含
+`ALPHA_VANTAGE_API_KEY` 和 `GNEWS_API_KEY`；运行时会在初始化 Agent 工具前将其
+载入进程环境。
 
 ### 安装买家依赖
 
