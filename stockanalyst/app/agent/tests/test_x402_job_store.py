@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import io
-import json
 import unittest
 from typing import Any
 
@@ -148,9 +147,8 @@ class X402JobStoreTests(unittest.IsolatedAsyncioTestCase):
                 "unexpected": "field",
             },
         ):
-            with self.subTest(marker=marker):
-                with self.assertRaises(X402JobStoreError):
-                    await self.store.create_accounting_marker(job_id, marker)
+            with self.subTest(marker=marker), self.assertRaises(X402JobStoreError):
+                await self.store.create_accounting_marker(job_id, marker)
 
     async def test_attempt_reports_use_distinct_presigned_keys(self) -> None:
         job_id = "x402_" + "a" * 32

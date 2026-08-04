@@ -19,7 +19,8 @@ The valuable agent and **sole key-holder/signer** for the stockanalyst seller. S
 
 | Route | Auth | Cost | LLM |
 |-------|------|------|-----|
-| `POST /x402/free` | 0-U EIP-712, 10/24h per wallet | free | no |
+| `GET /x402/free` | none | 0-U signing challenge | no |
+| `POST /x402/free` | 0-U EIP-712, 10/24h per wallet | free JSON quote | no |
 | `POST /x402/analyze/async` | 1-U EIP-712 EIP-3009 | 1.0 U | kimi-k2.6 |
 | A2A `notify_funded` | ERC-8183 + Cognito Bearer | 1.0 U (escrow) | kimi-k2.6 |
 

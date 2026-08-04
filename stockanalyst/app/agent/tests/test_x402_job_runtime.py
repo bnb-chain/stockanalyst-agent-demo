@@ -22,7 +22,6 @@ from x402_job_service import (
 from x402_job_store import X402JobStore
 from x402_verify import U_TOKEN_BSC_TESTNET, VerifiedPayment
 
-
 MAIN_PATH = Path(__file__).parents[1] / "main.py"
 STUDIO_PATH = Path(__file__).parents[1] / "studio.toml"
 
@@ -60,7 +59,10 @@ def _load_runtime_functions(
         "report_competition_call": report or AsyncMock(return_value=True),
         "get_8183_client": get_client or (lambda: None),
     }
-    exec(compile(ast.Module(body=functions, type_ignores=[]), MAIN_PATH, "exec"), namespace)
+    exec(  # noqa: S102 — isolate selected main.py helpers without importing main
+        compile(ast.Module(body=functions, type_ignores=[]), MAIN_PATH, "exec"),
+        namespace,
+    )
     return namespace
 
 
@@ -73,7 +75,7 @@ def _load_runtime_secrets_function():
         and node.name == "_load_runtime_secrets"
     )
     namespace = {"json": json, "os": os}
-    exec(
+    exec(  # noqa: S102 — isolate _load_runtime_secrets without importing main
         compile(ast.Module(body=[function], type_ignores=[]), MAIN_PATH, "exec"),
         namespace,
     )

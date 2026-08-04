@@ -7,7 +7,7 @@ existing A2A server (pure ASGI middleware — no extra framework or heavy deps):
   POST /x402/analyze/async        → settle payment and return a durable job
   GET  /x402/jobs/{jobId}         → authenticated job status and download URL
   POST /x402/jobs/{jobId}/resume  → authenticated recovery
-  GET|POST /x402/free             → zero-price quick quote over SSE
+  GET|POST /x402/free             → zero-price quick quote as JSON
 
 Payment verification is FIXED CODE in x402_verify.py — never LLM-callable.
 """
@@ -20,11 +20,23 @@ import os
 import re
 import time
 from collections.abc import AsyncGenerator, Callable
+from typing import Any
 from urllib.parse import parse_qs
 
 import httpx
 
 from competition_reporting import report_competition_call
+from x402_verify import (
+    CHAIN_ID,
+    FREE_TIER_LIMIT,
+    MIN_PRICE_WEI,
+    PRICE_WEI,
+    SELLER_WALLET,
+    build_free_payment_challenge,
+    build_payment_challenge,
+    verify_free_payment_proof,
+)
+
 if __package__:
     from .b402_client import (
         B402Client,
@@ -53,17 +65,6 @@ else:
         X402JobError,
         X402JobService,
     )
-from x402_verify import (
-    CHAIN_ID,
-    FREE_TIER_LIMIT,
-    MIN_PRICE_WEI,
-    PRICE_WEI,
-    SELLER_WALLET,
-    U_TOKEN_BSC_TESTNET,
-    build_free_payment_challenge,
-    build_payment_challenge,
-    verify_free_payment_proof,
-)
 
 logger = logging.getLogger("seller-agent.x402")
 
@@ -209,7 +210,7 @@ class X402Handler:
 
     Args:
         app: Inner ASGI application (A2A + existing routes).
-        free_stream_work: Async generator used only by the free quick-quote
+        free_work: Async generator used only by the free quick-quote
             endpoint.
         job_service: Durable paid-analysis service.
     """
@@ -218,12 +219,12 @@ class X402Handler:
         self,
         app,
         *,
-        free_stream_work: Callable[..., AsyncGenerator[tuple[str, dict], None]] | None = None,
+        free_work: Callable[..., AsyncGenerator[tuple[str, dict], None]] | None = None,
         job_service: X402JobService | None = None,
         b402_client: B402Client | None = _B402_CLIENT,
     ) -> None:
         self._inner = app
-        self._free_stream_work = free_stream_work
+        self._free_work = free_work
         self._job_service = job_service
         self._b402_client = b402_client
 
@@ -528,8 +529,10 @@ class X402Handler:
         """GET /x402/free?symbol=AAPL — return 402 free tier challenge (0 U)."""
         qs = parse_qs((scope.get("query_string") or b"").decode())
         symbol = ((qs.get("symbol") or qs.get("symbols") or [""])[0]).strip().upper()
-        host = _host(scope)
-        challenge = build_free_payment_challenge(symbol, host)
+        challenge = build_free_payment_challenge(
+            symbol,
+            _public_resource(scope, "/x402/free"),
+        )
         challenge_json = json.dumps(challenge).encode()
         await send({
             "type": "http.response.start",
@@ -550,8 +553,8 @@ class X402Handler:
         await send({"type": "http.response.body", "body": body, "more_body": False})
 
     async def _handle_free(self, scope, receive, send) -> None:
-        """POST /x402/free — verify 0-U EIP-712 proof + rate limit + stream quick quote."""
-        if not self._free_stream_work:
+        """POST /x402/free — verify a 0-U proof and return a JSON quick quote."""
+        if not self._free_work:
             await _send_json(send, 501, {"error": "free tier not configured"})
             return
 
@@ -586,8 +589,10 @@ class X402Handler:
         payment_header = (headers_dict.get(b"x-payment") or b"").decode().strip()
 
         if not payment_header:
-            host = _host(scope)
-            challenge = build_free_payment_challenge(symbol, host)
+            challenge = build_free_payment_challenge(
+                symbol,
+                _public_resource(scope, "/x402/free"),
+            )
             challenge_json = json.dumps(challenge).encode()
             await send({
                 "type": "http.response.start",
@@ -628,45 +633,33 @@ class X402Handler:
         except Exception:
             logger.exception("x402 free-tier competition accounting failed")
 
-        logger.info("x402 free tier: streaming quote for %s (from=%s, %s)", symbol, from_addr, msg)
-        await self._stream_free_sse(send, symbol, from_addr, msg)
-
-    async def _stream_free_sse(
-        self, send, symbol: str, from_addr: str, rate_msg: str,
-    ) -> None:
-        """Stream SSE events for the free quick-quote tier."""
-        await send({
-            "type": "http.response.start",
-            "status": 200,
-            "headers": [
-                (b"content-type", b"text/event-stream; charset=utf-8"),
-                (b"cache-control", b"no-cache"),
-                (b"x-accel-buffering", b"no"),
-                (b"transfer-encoding", b"chunked"),
-            ],
-        })
-
-        async def _emit(event: str, data: dict) -> None:
-            frame = f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
-            await send({
-                "type": "http.response.body",
-                "body": frame.encode("utf-8"),
-                "more_body": True,
-            })
-
+        logger.info("x402 free tier: generating quote for %s (from=%s, %s)", symbol, from_addr, msg)
+        report: dict[str, str] | None = None
         try:
-            await _emit("progress", {
-                "stage": "starting",
-                "symbol": symbol,
-                "message": f"Fetching quote for {symbol}... ({rate_msg})",
-            })
-            async for event_name, data in self._free_stream_work(symbol):
-                await _emit(event_name, data)
-        except Exception as exc:
-            logger.exception("x402 free SSE delivery failed for %s", symbol)
-            await _emit("error", {"message": str(exc)})
+            async for event_name, data in self._free_work(symbol):
+                if event_name == "error":
+                    logger.warning("x402 free quote generation failed for %s", symbol)
+                    await _send_free_unavailable(send)
+                    return
+                if event_name == "report" and isinstance(data, dict):
+                    content = data.get("content")
+                    report_format = data.get("format")
+                    if (
+                        isinstance(content, str)
+                        and content
+                        and report_format in {"markdown", "text"}
+                    ):
+                        report = {"content": content, "format": report_format}
+        except Exception:
+            logger.exception("x402 free quote generation failed for %s", symbol)
+            await _send_free_unavailable(send)
+            return
 
-        await send({"type": "http.response.body", "body": b"", "more_body": False})
+        if report is None:
+            logger.warning("x402 free quote returned no report for %s", symbol)
+            await _send_free_unavailable(send)
+            return
+        await _send_json(send, 200, report)
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
@@ -883,3 +876,11 @@ async def _send_json(
         "headers": headers,
     })
     await send({"type": "http.response.body", "body": body, "more_body": False})
+
+
+async def _send_free_unavailable(send) -> None:
+    await _send_json(
+        send,
+        503,
+        {"errorCode": "free_quote_unavailable", "retryable": True},
+    )

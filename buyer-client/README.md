@@ -150,9 +150,8 @@ UOMP_GUARD_TOKEN=your_guard_jwt_token
 > `AGENT_ENDPOINT` is the deployed A2A path (requires Cognito auth) used by `npm run dev`.
 > `X402_ENDPOINT` is the API Gateway base URL for the deployed x402 gateway,
 > never the raw AgentCore invocation URL. Local development may instead use
-> `http://localhost:9000`. Only the four paid asynchronous routes are public:
-> price, create, private job status, and private resume; the free route is not
-> exposed through this gateway.
+> `http://localhost:9000`. The public gateway exposes price, free challenge,
+> free quote, paid create, private job status, and private resume routes.
 
 ### AWS AgentCore runtime
 
@@ -351,7 +350,7 @@ src/
 ### x402 free tier — wallet identity proof (0 U)
 
 ```
-Buyer                              Agent (localhost:9000)
+Buyer                              Public x402 gateway
   │                                        │
   │  POST /x402/free                       │
   │  {"symbol": "AAPL"}                    │
@@ -359,9 +358,7 @@ Buyer                              Agent (localhost:9000)
   │                                        │  verify_free_payment_proof()
   │                                        │  value must = 0, rate limit 10/24h
   │                                        │  fetch_quote("AAPL")  — no LLM
-  │◀── event: progress ────────────────────│
-  │◀── event: report   ────────────────────│  markdown price table
-  │◀── event: done     ────────────────────│
+  │◀── 200 JSON {content, format} ─────────│  markdown price table
 ```
 
 ### x402 paid async — Binance Pay facilitator (1.0 U)
@@ -416,17 +413,17 @@ The agent verifies: EIP-712 signature recovers to `from`, `to` == seller wallet,
 **curl example:**
 ```bash
 # Get price / challenge
-curl http://localhost:9000/x402/price
-curl "http://localhost:9000/x402/free?symbol=AAPL"
+curl "$X402_ENDPOINT/x402/price"
+curl "$X402_ENDPOINT/x402/free?symbol=AAPL"
 
 # Create paid async analysis (generate a proof with x402-payment.ts)
-curl -X POST http://localhost:9000/x402/analyze/async \
+curl -X POST "$X402_ENDPOINT/x402/analyze/async" \
   -H "Content-Type: application/json" \
   -H "X-Payment: <base64-proof>" \
   -d '{"symbols": ["AAPL", "NVDA"]}'
 
 # Free quick quote
-curl -N -X POST http://localhost:9000/x402/free \
+curl -X POST "$X402_ENDPOINT/x402/free" \
   -H "Content-Type: application/json" \
   -H "X-Payment: <base64-0u-proof>" \
   -d '{"symbol": "AAPL"}'

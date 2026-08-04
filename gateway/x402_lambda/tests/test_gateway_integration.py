@@ -69,6 +69,16 @@ class FakeOAuth:
         return "Bearer fake-access-token"
 
 
+class FakeB402Client:
+    async def payment_extra(self, network: str, name: str, version: str) -> dict[str, str]:
+        return {
+            "name": name,
+            "version": version,
+            "assetTransferMethod": "eip3009",
+            "signerAddress": "0xd10bddc20e4dc42a1a19a9653e994991e25b8153",
+        }
+
+
 class FakeJobService:
     def __init__(self) -> None:
         self.create_calls: list[tuple[str, dict[str, Any]]] = []
@@ -86,7 +96,11 @@ class FakeJobService:
 class FakeAgentCoreTransport:
     """Runs the agent's real envelope skill while preserving A2A wire shapes."""
     def __init__(self, job_service: FakeJobService) -> None:
-        self._app = X402Handler(_unreached_inner_app, job_service=job_service)
+        self._app = X402Handler(
+            _unreached_inner_app,
+            job_service=job_service,
+            b402_client=FakeB402Client(),
+        )
         self.requests: list[dict[str, Any]] = []
 
     def __call__(
@@ -211,7 +225,7 @@ class GatewayIntegrationTests(unittest.TestCase):
         body = json.loads(response["body"])
         self.assertEqual(body["error"], "Payment Required")
         self.assertEqual(
-            body["paymentRequired"]["resource"],
+            body["paymentRequired"]["resource"]["url"],
             "https://a1b2c3d4e5.execute-api.us-east-1.amazonaws.com/testnet/x402/analyze/async",
         )
         self.assertEqual(self.job_service.create_calls, [])

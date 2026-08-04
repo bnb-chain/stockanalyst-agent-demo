@@ -12,7 +12,6 @@ from stockanalyst.app.agent.x402_job_service import (
     SettlementIndeterminate,
 )
 
-
 ADDRESS = "0x1111111111111111111111111111111111111111"
 NONCE = f"0x{'22' * 32}"
 
@@ -118,12 +117,14 @@ class X402CompetitionReportingTests(unittest.IsolatedAsyncioTestCase):
     def handler(self) -> X402Handler:
         return X402Handler(
             None,
-            free_stream_work=Mock(),
+            free_work=Mock(),
         )
 
-    async def test_zero_value_free_payment_reports_before_streaming(self) -> None:
+    async def test_zero_value_free_payment_reports_before_quote_generation(self) -> None:
         handler = self.handler()
-        handler._stream_free_sse = AsyncMock()
+        async def free_work(_symbol: str):
+            yield "report", {"content": "report", "format": "markdown"}
+        handler._free_work = free_work
         report = AsyncMock(return_value=True)
         with (
             patch.object(
@@ -149,7 +150,6 @@ class X402CompetitionReportingTests(unittest.IsolatedAsyncioTestCase):
             address=ADDRESS,
             called_at=ANY,
         )
-        handler._stream_free_sse.assert_awaited_once()
 
     async def test_b402_unknown_outcome_is_indeterminate_not_rejection(
         self,
@@ -210,7 +210,7 @@ class X402CompetitionReportingTests(unittest.IsolatedAsyncioTestCase):
         )
         handler = X402Handler(
             None,
-            free_stream_work=Mock(),
+            free_work=Mock(),
             job_service=job_service,
         )
         sent: list[dict] = []

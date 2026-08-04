@@ -158,13 +158,20 @@ class HandlerTests(unittest.TestCase):
         self.assertTrue(body["retryable"])
         self.assertNotIn("proof", result["body"].lower())
 
-    def test_invalid_gateway_request_uses_its_safe_status(self):
-        event = {**EVENT, "path": "/testnet/x402/free"}
-        app = handler.GatewayApplication(FakeOAuth(), FakeAgentCore(response_envelope()))
+    def test_free_gateway_request_is_forwarded(self):
+        event = {
+            **EVENT,
+            "path": "/testnet/x402/free",
+            "queryStringParameters": {"symbol": "AAPL"},
+            "multiValueQueryStringParameters": {"symbol": ["AAPL"]},
+        }
+        agentcore = FakeAgentCore(response_envelope())
+        app = handler.GatewayApplication(FakeOAuth(), agentcore)
         with patch.object(handler, "_application", app):
             result = handler.lambda_handler(event, CONTEXT)
-        self.assertEqual(result["statusCode"], 400)
-        self.assertEqual(json.loads(result["body"])["errorCode"], "route_not_allowed")
+        self.assertEqual(result["statusCode"], 402)
+        self.assertEqual(agentcore.calls[0]["envelope"]["path"], "/x402/free")
+        self.assertEqual(agentcore.calls[0]["envelope"]["queryString"], "symbol=AAPL")
 
     def test_missing_configuration_returns_safe_503(self):
         with patch.object(handler, "_application", None), patch.dict(os.environ, {}, clear=True):

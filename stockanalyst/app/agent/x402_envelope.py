@@ -5,7 +5,7 @@ import base64
 import re
 from dataclasses import dataclass
 from typing import Any
-from urllib.parse import urlsplit
+from urllib.parse import parse_qsl, urlencode, urlsplit
 
 
 class EnvelopeError(ValueError):
@@ -16,9 +16,12 @@ class EnvelopeError(ValueError):
 
 _ROUTES = {
     ("GET", "/x402/price"),
+    ("GET", "/x402/free"),
+    ("POST", "/x402/free"),
     ("POST", "/x402/analyze/async"),
 }
 _JOB_ROUTE = re.compile(r"/x402/jobs/x402_[0-9a-f]{32}(?:/resume)?\Z")
+_FREE_SYMBOL = re.compile(r"[A-Za-z0-9.^_-]{1,32}\Z")
 _HEADER_NAME = re.compile(r"[a-z0-9-]+\Z")
 _REQUEST_ID = re.compile(r"x402gw_[0-9a-f]{64}\Z")
 _REQUEST_HEADERS = {"accept", "content-type", "x-payment", "x-job-token"}
@@ -37,6 +40,7 @@ _ENVELOPE_FIELDS = {
     "requestId",
     "method",
     "path",
+    "queryString",
     "headers",
     "bodyBase64",
     "publicBaseUrl",
@@ -48,6 +52,7 @@ class _Request:
     request_id: str
     method: str
     path: str
+    query_string: bytes
     headers: list[tuple[bytes, bytes]]
     body: bytes
     public_base_url: str
@@ -82,7 +87,7 @@ async def dispatch_x402_envelope(
             "method": request.method,
             "path": request.path,
             "raw_path": request.path.encode(),
-            "query_string": b"",
+            "query_string": request.query_string,
             "headers": request.headers,
             "x402_public_base_url": request.public_base_url,
         },
@@ -115,6 +120,7 @@ def _validate_request(
         raise EnvelopeError("route_not_allowed")
     if not _is_allowed_route(method, path):
         raise EnvelopeError("route_not_allowed")
+    query_string = _validate_query_string(envelope["queryString"], method, path)
 
     body = _decode_request_body(envelope["bodyBase64"])
     if method == "GET" and body:
@@ -124,6 +130,7 @@ def _validate_request(
         request_id=request_id,
         method=method,
         path=path,
+        query_string=query_string,
         headers=_validate_request_headers(envelope["headers"]),
         body=body,
         public_base_url=public_base_url,
@@ -138,6 +145,31 @@ def _is_allowed_route(method: str, path: str) -> bool:
     return (method == "GET" and not path.endswith("/resume")) or (
         method == "POST" and path.endswith("/resume")
     )
+
+
+def _validate_query_string(value: Any, method: str, path: str) -> bytes:
+    if not isinstance(value, str):
+        raise EnvelopeError("query_not_allowed")
+    if not value:
+        return b""
+    if method != "GET" or path != "/x402/free":
+        raise EnvelopeError("query_not_allowed")
+    try:
+        pairs = parse_qsl(
+            value,
+            keep_blank_values=True,
+            strict_parsing=True,
+            encoding="utf-8",
+            errors="strict",
+        )
+    except (UnicodeDecodeError, ValueError):
+        raise EnvelopeError("query_not_allowed") from None
+    if len(pairs) != 1 or pairs[0][0] != "symbol":
+        raise EnvelopeError("query_not_allowed")
+    symbol = pairs[0][1]
+    if not _FREE_SYMBOL.fullmatch(symbol) or urlencode({"symbol": symbol}) != value:
+        raise EnvelopeError("query_not_allowed")
+    return value.encode("ascii")
 
 
 def _validate_public_base_url(value: Any) -> str:

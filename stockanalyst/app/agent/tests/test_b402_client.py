@@ -3,13 +3,12 @@ from __future__ import annotations
 import base64
 import unittest
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Self
 from unittest.mock import AsyncMock
 
 from Crypto.Hash import SHA256
 from Crypto.PublicKey import RSA
 from Crypto.Signature import pkcs1_15
-
 from stockanalyst.app.agent.b402_client import (
     B402Client,
     B402Config,
@@ -17,7 +16,6 @@ from stockanalyst.app.agent.b402_client import (
     B402IndeterminateError,
     B402RejectedError,
 )
-
 
 _PRIVATE_KEY = RSA.generate(1024)
 PRIVATE_KEY_B64 = base64.b64encode(_PRIVATE_KEY.export_key(format="DER", pkcs=8)).decode()
@@ -76,7 +74,7 @@ class _RecordingHttpClient:
     def __init__(self) -> None:
         self.requests: list[dict[str, Any]] = []
 
-    async def __aenter__(self) -> _RecordingHttpClient:
+    async def __aenter__(self) -> Self:
         return self
 
     async def __aexit__(self, *_args: object) -> None:

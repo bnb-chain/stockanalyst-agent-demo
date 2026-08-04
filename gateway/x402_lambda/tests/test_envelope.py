@@ -16,6 +16,7 @@ def api_event(
     body=b"",
     base64_encoded=False,
     stage="testnet",
+    query=None,
 ):
     encoded = base64.b64encode(body).decode("ascii") if base64_encoded else body.decode("utf-8")
     return {
@@ -24,8 +25,11 @@ def api_event(
         "httpMethod": method,
         "headers": headers or {},
         "multiValueHeaders": {},
-        "queryStringParameters": None,
-        "multiValueQueryStringParameters": None,
+        "queryStringParameters": query,
+        "multiValueQueryStringParameters": (
+            {name: [value] for name, value in query.items()}
+            if query is not None else None
+        ),
         "pathParameters": {"proxy": path.lstrip("/")},
         "stageVariables": None,
         "requestContext": {"stage": stage, "requestId": "gateway-request"},
@@ -51,9 +55,24 @@ class EnvelopeTests(unittest.TestCase):
         self.assertEqual(envelope["publicBaseUrl"], PUBLIC_BASE)
         self.assertEqual(envelope["headers"]["x-payment"], "proof")
 
-    def test_rejects_unpublished_route(self):
-        with self.assertRaisesRegex(GatewayRequestError, "route_not_allowed"):
-            build_envelope(api_event(path="/x402/free"), public_base_url=PUBLIC_BASE)
+    def test_free_get_and_post_routes_build_envelopes(self):
+        challenge = build_envelope(
+            api_event(path="/x402/free", query={"symbol": "AAPL"}),
+            public_base_url=PUBLIC_BASE,
+        )
+        quote = build_envelope(
+            api_event(
+                method="POST",
+                path="/x402/free",
+                headers={"X-Payment": "proof"},
+                body=b'{"symbol":"AAPL"}',
+            ),
+            public_base_url=PUBLIC_BASE,
+        )
+
+        self.assertEqual(challenge["queryString"], "symbol=AAPL")
+        self.assertEqual(quote["queryString"], "")
+        self.assertEqual(quote["path"], "/x402/free")
 
     def test_request_id_is_stable_for_exact_retry(self):
         event = api_event(headers={"X-Payment": "proof"})
@@ -72,6 +91,32 @@ class EnvelopeTests(unittest.TestCase):
             build_envelope(event, public_base_url=PUBLIC_BASE)["path"],
             f"/x402/jobs/{JOB_ID}",
         )
+
+    def test_free_get_rejects_unknown_duplicate_and_invalid_query_values(self):
+        for query, multi in (
+            ({"unexpected": "AAPL"}, None),
+            ({"symbol": "AAPL"}, {"symbol": ["AAPL", "NVDA"]}),
+            ({"symbol": "AAPL/USD"}, None),
+            ({"symbol": "A" * 33}, None),
+        ):
+            event = api_event(path="/x402/free", query=query)
+            if multi is not None:
+                event["multiValueQueryStringParameters"] = multi
+            with self.subTest(query=query, multi=multi), self.assertRaisesRegex(
+                GatewayRequestError, "query_not_allowed"
+            ):
+                build_envelope(event, public_base_url=PUBLIC_BASE)
+
+    def test_free_query_is_bound_into_request_id(self):
+        aapl = build_envelope(
+            api_event(path="/x402/free", query={"symbol": "AAPL"}),
+            public_base_url=PUBLIC_BASE,
+        )
+        nvda = build_envelope(
+            api_event(path="/x402/free", query={"symbol": "NVDA"}),
+            public_base_url=PUBLIC_BASE,
+        )
+        self.assertNotEqual(aapl["requestId"], nvda["requestId"])
 
     def test_rejects_invalid_base64_and_oversized_body(self):
         invalid = api_event(body=b"ignored", base64_encoded=True)
@@ -120,9 +165,11 @@ class EnvelopeTests(unittest.TestCase):
                 public_base_url=PUBLIC_BASE,
             )
 
-    def test_all_four_published_route_pairs_and_inverse_rejections(self):
+    def test_all_six_published_route_pairs_and_inverse_rejections(self):
         routes = (
             ("GET", "/x402/price", b""),
+            ("GET", "/x402/free", b""),
+            ("POST", "/x402/free", b'{"symbol":"AAPL"}'),
             ("POST", "/x402/analyze/async", b'{"symbols":["AAPL"]}'),
             ("GET", f"/x402/jobs/{JOB_ID}", b""),
             ("POST", f"/x402/jobs/{JOB_ID}/resume", b'{"retry":true}'),
@@ -135,6 +182,7 @@ class EnvelopeTests(unittest.TestCase):
                 )
         for method, path in (
             ("POST", "/x402/price"),
+            ("PUT", "/x402/free"),
             ("GET", "/x402/analyze/async"),
             ("POST", f"/x402/jobs/{JOB_ID}"),
             ("GET", f"/x402/jobs/{JOB_ID}/resume"),

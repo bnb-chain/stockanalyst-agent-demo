@@ -808,7 +808,7 @@ class X402JobService:
                         self._consume_report(running.record),
                         timeout=self._analysis_timeout_seconds,
                     )
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     await self._stop_heartbeat(heartbeat)
                     await self._fail_execution(
                         holder[0],

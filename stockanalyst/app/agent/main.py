@@ -528,7 +528,7 @@ def _format_free_report(symbol: str, quote: dict) -> str:
     return "\n".join(lines)
 
 
-async def _stream_free(symbol: str) -> AsyncGenerator[tuple[str, dict], None]:
+async def _free_quote_work(symbol: str) -> AsyncGenerator[tuple[str, dict], None]:
     """Free-tier generator: fetch_quote only, format as simple markdown table.
 
     No LLM, no ADK — completes in ~1 s (one yfinance call).
@@ -572,7 +572,7 @@ async def _x402_not_found(scope, receive, send):
 
 x402_app = X402Handler(
     _x402_not_found,
-    free_stream_work=_stream_free,
+    free_work=_free_quote_work,
     job_service=x402_jobs,
 )
 

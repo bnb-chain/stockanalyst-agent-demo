@@ -225,13 +225,15 @@ X402_ENDPOINT=https://<api-id>.execute-api.us-east-1.amazonaws.com/testnet
 X402_SELLER_WALLET=0xd10BdDC20E4DC42A1a19a9653e994991e25b8153
 ```
 
-Only four asynchronous paid routes are public through that gateway:
-`GET /x402/price`, `POST /x402/analyze/async`,
+Six x402 method/path pairs are public through that gateway:
+`GET /x402/price`, `GET /x402/free`, `POST /x402/free`,
+`POST /x402/analyze/async`,
 `GET /x402/jobs/{jobId}`, and `POST /x402/jobs/{jobId}/resume`. The gateway
 uses its Lambda `live` alias and trusted API Gateway request context; it does
 not expose the AgentCore invocation URL. See
 [`docs/x402-lambda-gateway.md`](../docs/x402-lambda-gateway.md) for operation
 and rollback procedures.
+The free POST returns buffered JSON (`content` plus `format`), not SSE.
 
 ### Prerequisites
 

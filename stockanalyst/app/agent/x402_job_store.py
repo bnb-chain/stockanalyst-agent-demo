@@ -35,7 +35,7 @@ class X402JobStoreConfig:
     prefix: str = "x402-jobs"
 
     @classmethod
-    def from_env(cls, env: Mapping[str, str]) -> "X402JobStoreConfig":
+    def from_env(cls, env: Mapping[str, str]) -> X402JobStoreConfig:
         bucket = env.get("X402_JOB_S3_BUCKET", "").strip()
         prefix = env.get("X402_JOB_S3_PREFIX", "x402-jobs").strip().strip("/")
         if not bucket or not _BUCKET_RE.fullmatch(bucket):
@@ -64,7 +64,7 @@ class X402JobStore:
         env: Mapping[str, str] = os.environ,
         *,
         s3_client: Any | None = None,
-    ) -> "X402JobStore":
+    ) -> X402JobStore:
         return cls(
             X402JobStoreConfig.from_env(env),
             s3_client if s3_client is not None else boto3.client("s3"),
