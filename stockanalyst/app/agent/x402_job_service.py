@@ -830,6 +830,25 @@ class X402JobService:
                     return
                 except asyncio.CancelledError:
                     raise
+                except X402JobError as error:
+                    await self._stop_heartbeat(heartbeat)
+                    if error.code == "too_many_users":
+                        await self._fail_execution(
+                            holder[0],
+                            lease_owner,
+                            lease_lost,
+                            error_code="too_many_users",
+                            retryable=True,
+                        )
+                    else:
+                        await self._fail_execution(
+                            holder[0],
+                            lease_owner,
+                            lease_lost,
+                            error_code="analysis_failed",
+                            retryable=error.retryable,
+                        )
+                    return
                 except Exception:
                     await self._stop_heartbeat(heartbeat)
                     await self._fail_execution(

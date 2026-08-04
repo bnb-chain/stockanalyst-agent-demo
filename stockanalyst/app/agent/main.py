@@ -321,6 +321,19 @@ def _extract_json(text: str) -> str:
 
 _log = logging.getLogger("seller-agent")
 
+
+def _raise_for_provider_rate_limit(event: Any) -> None:
+    content = getattr(event, "content", None)
+    for part in getattr(content, "parts", ()) if content else ():
+        function_response = getattr(part, "function_response", None)
+        response = getattr(function_response, "response", None)
+        if (
+            isinstance(response, Mapping)
+            and response.get("error") == "provider_rate_limited"
+        ):
+            raise X402JobError("too_many_users", retryable=True)
+
+
 async def _call_runner(prompt: str, session_id: str) -> str:
     """Run the ADK runner once and return raw final-response text (thought-filtered)."""
     session_service = runner.session_service
@@ -336,6 +349,7 @@ async def _call_runner(prompt: str, session_id: str) -> str:
     async for event in runner.run_async(
         user_id="service", session_id=session_id, new_message=user_msg
     ):
+        _raise_for_provider_rate_limit(event)
         if event.is_final_response() and event.content:
             for p in event.content.parts:
                 if p.text and not getattr(p, "thought", False):
@@ -431,6 +445,7 @@ async def _stream_runner(
 
             # kind == "event"
             event = payload
+            _raise_for_provider_rate_limit(event)
             if event.content:
                 for part in event.content.parts:
                     fn_call = getattr(part, "function_call", None)

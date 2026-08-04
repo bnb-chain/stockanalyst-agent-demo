@@ -17,6 +17,7 @@ import json
 import logging
 import math
 import os
+import time
 from datetime import UTC
 from typing import Any
 
@@ -43,12 +44,15 @@ _PROVIDER_CHUNK_BYTES = 64 * 1024
 _MAX_ALPHA_ARTICLES = 20
 _MAX_TICKER_SENTIMENT_ENTRIES = 100
 _MAX_TOTAL_ARTICLES = 1_000_000_000
+_PROVIDER_MAX_RETRIES = 3
+_PROVIDER_RETRY_DELAY_SECONDS = 30.0
 
 
 class _ProviderResponseError(Exception):
-    def __init__(self, code: str) -> None:
+    def __init__(self, code: str, *, retryable: bool = False) -> None:
         super().__init__(code)
         self.code = code
+        self.retryable = retryable
 
 
 def _read_provider_json(
@@ -67,7 +71,10 @@ def _read_provider_json(
     except requests.HTTPError:
         request_error = "provider_http_error"
     except (requests.RequestException, OSError):
-        request_error = "provider_transport_error"
+        raise _ProviderResponseError(
+            "provider_transport_error",
+            retryable=True,
+        ) from None
     if request_error is not None:
         raise _ProviderResponseError(request_error) from None
 
@@ -79,7 +86,19 @@ def _read_provider_json(
         except requests.HTTPError:
             http_failed = True
         if http_failed:
-            raise _ProviderResponseError("provider_http_error") from None
+            status = getattr(response, "status_code", None)
+            rate_limited = status == 429 or (
+                status == 403 and url == "https://gnews.io/api/v4/search"
+            )
+            if rate_limited:
+                raise _ProviderResponseError(
+                    "provider_rate_limited",
+                    retryable=True,
+                ) from None
+            raise _ProviderResponseError(
+                "provider_http_error",
+                retryable=isinstance(status, int) and 500 <= status <= 599,
+            ) from None
 
         content_length = response.headers.get("Content-Length")
         if content_length is not None:
@@ -108,7 +127,10 @@ def _read_provider_json(
         except (requests.RequestException, OSError):
             stream_failed = True
         if stream_failed:
-            raise _ProviderResponseError("provider_transport_error") from None
+            raise _ProviderResponseError(
+                "provider_transport_error",
+                retryable=True,
+            ) from None
 
         invalid_json = False
         try:
@@ -136,7 +158,40 @@ def _read_provider_json(
         if close_memory_error is not None:
             raise close_memory_error from None
         if close_transport_failed and not primary_failed:
-            raise _ProviderResponseError("provider_transport_error") from None
+            raise _ProviderResponseError(
+                "provider_transport_error",
+                retryable=True,
+            ) from None
+
+
+def _read_provider_json_with_retry(
+    url: str,
+    *,
+    params: dict[str, str],
+    alpha_information_is_rate_limit: bool = False,
+) -> dict[str, Any]:
+    """Read one provider response with three fixed-delay retries."""
+    for attempt in range(_PROVIDER_MAX_RETRIES + 1):
+        try:
+            data = _read_provider_json(url, params=params)
+            if alpha_information_is_rate_limit and "Information" in data:
+                raise _ProviderResponseError(
+                    "provider_rate_limited",
+                    retryable=True,
+                )
+            return data
+        except _ProviderResponseError as error:
+            if not error.retryable or attempt == _PROVIDER_MAX_RETRIES:
+                raise
+            logger.warning(
+                "provider request failed; retrying in %ss (attempt %s/%s): %s",
+                int(_PROVIDER_RETRY_DELAY_SECONDS),
+                attempt + 1,
+                _PROVIDER_MAX_RETRIES,
+                error.code,
+            )
+            time.sleep(_PROVIDER_RETRY_DELAY_SECONDS)
+    raise AssertionError("unreachable")
 
 
 # ── Macro context (FRED + VIX) ────────────────────────────────────────────────
@@ -322,7 +377,7 @@ def fetch_alpha_vantage_sentiment(symbol: str) -> dict[str, Any]:
         return {"symbol": symbol, "note": "ALPHA_VANTAGE_API_KEY not set"}
 
     try:
-        data = _read_provider_json(
+        data = _read_provider_json_with_retry(
             "https://www.alphavantage.co/query",
             params={
                 "function": "NEWS_SENTIMENT",
@@ -330,16 +385,8 @@ def fetch_alpha_vantage_sentiment(symbol: str) -> dict[str, Any]:
                 "limit": "20",
                 "apikey": api_key,
             },
+            alpha_information_is_rate_limit=True,
         )
-
-        if "Information" in data:  # rate-limited
-            return {
-                "symbol": symbol,
-                "note": normalize_untrusted_text(
-                    data["Information"],
-                    max_chars=_MAX_HEADLINE_CHARS,
-                ),
-            }
 
         raw_feed = data.get("feed")
         feed = raw_feed if isinstance(raw_feed, list) else []
@@ -427,7 +474,7 @@ def fetch_gnews_headlines(symbol: str, company_name: str = "") -> dict[str, Any]
 
     query = company_name or symbol
     try:
-        data = _read_provider_json(
+        data = _read_provider_json_with_retry(
             "https://gnews.io/api/v4/search",
             params={
                 "q": query,
