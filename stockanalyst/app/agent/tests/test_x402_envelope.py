@@ -6,7 +6,6 @@ from unittest.mock import AsyncMock
 
 from x402_envelope import EnvelopeError, dispatch_x402_envelope
 
-
 PUBLIC_BASE = "https://gateway.example.test/stages/testnet"
 JOB_ID = "x402_" + "a" * 32
 REQUEST_ID = "x402gw_" + "a" * 64

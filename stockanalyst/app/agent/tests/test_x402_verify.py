@@ -5,9 +5,7 @@ import json
 import unittest
 
 from eth_account import Account
-
 from stockanalyst.app.agent import x402_verify as verify
-
 
 NOW = 1_785_340_800
 RESOURCE_URL = "https://api.example.test/testnet/x402/analyze/async"

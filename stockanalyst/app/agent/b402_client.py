@@ -14,7 +14,7 @@ import os
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import Any, Protocol, Self
 from urllib.parse import urlsplit
 
 import httpx
@@ -109,7 +109,7 @@ class _Response(Protocol):
 
 
 class _HttpClient(Protocol):
-    async def __aenter__(self) -> _HttpClient: ...
+    async def __aenter__(self) -> Self: ...
 
     async def __aexit__(self, *args: object) -> None: ...
 
@@ -314,7 +314,7 @@ def _is_evm_address(value: object) -> bool:
     if not value.startswith("0x"):
         return False
     try:
-        int(value[2:], 16)
+        int(value, 0)
     except ValueError:
         return False
     return True

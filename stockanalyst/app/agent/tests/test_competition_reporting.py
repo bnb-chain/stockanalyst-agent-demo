@@ -4,7 +4,6 @@ import json
 import unittest
 
 import httpx
-
 from stockanalyst.app.agent.competition_reporting import (
     CompetitionReporter,
     CompetitionReportingError,
@@ -21,12 +20,11 @@ class CompetitionReportingConfigTests(unittest.TestCase):
             {"COMPETITION_AI_CALLS_URL": "http://competition.internal/events"},
             {"COMPETITION_INTERNAL_TOKEN": "secret"},
         ):
-            with self.subTest(env=env):
-                with self.assertRaisesRegex(
-                    CompetitionReportingError,
-                    "must be set together",
-                ):
-                    load_competition_reporting_config(env)
+            with self.subTest(env=env), self.assertRaisesRegex(
+                CompetitionReportingError,
+                "must be set together",
+            ):
+                load_competition_reporting_config(env)
 
     def test_complete_configuration_is_loaded(self) -> None:
         config = load_competition_reporting_config(

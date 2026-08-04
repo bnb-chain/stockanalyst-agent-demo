@@ -20,11 +20,23 @@ import os
 import re
 import time
 from collections.abc import AsyncGenerator, Callable
+from typing import Any
 from urllib.parse import parse_qs
 
 import httpx
 
 from competition_reporting import report_competition_call
+from x402_verify import (
+    CHAIN_ID,
+    FREE_TIER_LIMIT,
+    MIN_PRICE_WEI,
+    PRICE_WEI,
+    SELLER_WALLET,
+    build_free_payment_challenge,
+    build_payment_challenge,
+    verify_free_payment_proof,
+)
+
 if __package__:
     from .b402_client import (
         B402Client,
@@ -53,17 +65,6 @@ else:
         X402JobError,
         X402JobService,
     )
-from x402_verify import (
-    CHAIN_ID,
-    FREE_TIER_LIMIT,
-    MIN_PRICE_WEI,
-    PRICE_WEI,
-    SELLER_WALLET,
-    U_TOKEN_BSC_TESTNET,
-    build_free_payment_challenge,
-    build_payment_challenge,
-    verify_free_payment_proof,
-)
 
 logger = logging.getLogger("seller-agent.x402")
 

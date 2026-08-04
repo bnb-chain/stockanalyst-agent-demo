@@ -11,6 +11,8 @@ from unittest.mock import ANY, AsyncMock, patch
 
 import httpx
 
+from tests.test_x402_verify import NOW as SIGNED_NOW
+from tests.test_x402_verify import signed_proof
 from x402_handler import _settle_generic
 from x402_job_service import (
     CreateJobResult,
@@ -21,10 +23,6 @@ from x402_job_service import (
 )
 from x402_job_store import JobConflict, StoredJob
 from x402_verify import CHAIN_ID, VerifiedPayment, validate_payment_proof
-
-from tests.test_x402_verify import NOW as SIGNED_NOW
-from tests.test_x402_verify import signed_proof
-
 
 ADDRESS = "0x1111111111111111111111111111111111111111"
 NONCE = "0x" + "22" * 32
@@ -1345,7 +1343,7 @@ class X402JobSettlementTests(unittest.IsolatedAsyncioTestCase):
         ) -> tuple[bool, str]:
             self.assertEqual(timeout, 60)
             awaitable.close()
-            raise asyncio.TimeoutError
+            raise TimeoutError
 
         class Python310BuiltinTimeout(Exception):
             pass

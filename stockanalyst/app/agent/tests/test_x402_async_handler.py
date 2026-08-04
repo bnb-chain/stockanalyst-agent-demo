@@ -12,7 +12,6 @@ from stockanalyst.app.agent.x402_job_service import (
     X402JobError,
 )
 
-
 JOB_ID = "x402_" + "a" * 32
 EXPIRES_AT = 1_785_945_600_123
 SUPPORTED_EXTRA = {

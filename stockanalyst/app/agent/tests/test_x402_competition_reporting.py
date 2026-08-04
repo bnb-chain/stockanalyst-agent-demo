@@ -12,7 +12,6 @@ from stockanalyst.app.agent.x402_job_service import (
     SettlementIndeterminate,
 )
 
-
 ADDRESS = "0x1111111111111111111111111111111111111111"
 NONCE = f"0x{'22' * 32}"
 
