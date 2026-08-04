@@ -21,7 +21,7 @@ jobs:
         run: pip install uv
 
       - name: Create venv & install deps
-        working-directory: app/agent
+        working-directory: stockanalyst/app/agent
         run: |
           uv venv .venv --python 3.12
           uv pip install -e ".[dev]" --python .venv/bin/python 2>/dev/null || \
@@ -29,11 +29,11 @@ jobs:
           uv pip install ruff --python .venv/bin/python
 
       - name: Lint
-        working-directory: app/agent
+        working-directory: stockanalyst/app/agent
         run: .venv/bin/ruff check . --exclude .venv
 
       - name: Test analysis engine
-        working-directory: app/agent
+        working-directory: stockanalyst/app/agent
         run: |
           .venv/bin/python -c "
           from analysis import fetch_quote, fetch_technical_signals
@@ -52,7 +52,7 @@ jobs:
           "
 
       - name: Test tools load
-        working-directory: app/agent
+        working-directory: stockanalyst/app/agent
         run: |
           .venv/bin/python -c "
           from tools import LLM_READ_TOOLS
@@ -63,7 +63,7 @@ jobs:
           "
 
       - name: Test prompt builder
-        working-directory: app/agent
+        working-directory: stockanalyst/app/agent
         run: |
           .venv/bin/python -c "
           import json
