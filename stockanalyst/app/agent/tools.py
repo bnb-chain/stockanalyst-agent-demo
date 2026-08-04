@@ -24,6 +24,8 @@ effect. It is commented out below.)
 """
 from __future__ import annotations
 
+import asyncio
+
 from bnbagent_studio_core.tools import chain_readonly as cr
 from google.adk.tools import FunctionTool
 
@@ -80,13 +82,17 @@ def get_insider_activity(symbol: str) -> dict:
     return fetch_insider_trades(symbol, days=90)
 
 
-def get_news_sentiment(symbol: str) -> dict:
+async def get_news_sentiment(symbol: str) -> dict:
     """Get news sentiment and recent headlines for a stock. Returns:
     - Alpha Vantage AI sentiment score [-1, 1] with bullish/bearish label (requires ALPHA_VANTAGE_API_KEY)
     - Top 5 recent news headlines from GNews (requires GNEWS_API_KEY)
     Call this to supplement quantitative signals with qualitative narrative."""
-    av = fetch_alpha_vantage_sentiment(symbol)
-    headlines = fetch_gnews_headlines(symbol)
+    av = await asyncio.to_thread(fetch_alpha_vantage_sentiment, symbol)
+    if av.get("error") == "provider_rate_limited":
+        return {"symbol": symbol, "error": "provider_rate_limited"}
+    headlines = await asyncio.to_thread(fetch_gnews_headlines, symbol)
+    if headlines.get("error") == "provider_rate_limited":
+        return {"symbol": symbol, "error": "provider_rate_limited"}
     return {
         "symbol": symbol,
         "alpha_vantage_sentiment": av,

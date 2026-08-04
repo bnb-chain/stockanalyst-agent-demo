@@ -566,6 +566,31 @@ class X402AsyncHandlerTests(unittest.IsolatedAsyncioTestCase):
         })
         self.assertNotIn("retry-after", response.headers)
 
+    async def test_rate_limited_view_includes_public_message(self) -> None:
+        service = AsyncMock()
+        service.get_job.return_value = JobView(
+            job_id=JOB_ID,
+            status="failed",
+            expires_at=EXPIRES_AT,
+            error_code="too_many_users",
+            retryable=True,
+        )
+
+        response = await call_handler(
+            make_handler(service),
+            method="GET",
+            path=f"/x402/jobs/{JOB_ID}",
+            headers={"x-job-token": "token"},
+        )
+
+        self.assertEqual(response.status, 200)
+        self.assertEqual(response.json["errorCode"], "too_many_users")
+        self.assertEqual(
+            response.json["error"],
+            "Too many users now. Please try again later",
+        )
+        self.assertTrue(response.json["retryable"])
+
     async def test_succeeded_view_includes_download_fields(self) -> None:
         service = AsyncMock()
         service.get_job.return_value = JobView(

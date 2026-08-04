@@ -1810,6 +1810,33 @@ class X402JobExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(sensitive, str(failed))
         self.assertFalse(service.is_busy())
 
+    async def test_exhausted_provider_rate_limit_has_stable_error_code(self) -> None:
+        store = MemoryJobStore()
+
+        async def rate_limited_stream(
+            _prompt: str,
+            _session_id: str,
+            _symbols: list[str],
+        ) -> Any:
+            yield "progress", {"stage": "collecting"}
+            raise X402JobError("too_many_users", retryable=True)
+
+        service = make_service(store=store, stream_work=rate_limited_stream)
+        created = await seed_execution_job(
+            service,
+            store,
+            status="queued",
+        )
+
+        service._spawn(created.job_id)
+        await service.wait_for_idle()
+
+        failed = store.jobs[created.job_id].record
+        self.assertEqual(failed["status"], "failed")
+        self.assertEqual(failed["errorCode"], "too_many_users")
+        self.assertTrue(failed["retryable"])
+        self.assertFalse(service.is_busy())
+
     async def test_analysis_timeout_is_retryable(self) -> None:
         store = MemoryJobStore()
         service = make_service(

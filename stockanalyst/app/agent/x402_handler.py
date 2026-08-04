@@ -704,6 +704,8 @@ def _job_view_body(view: JobView) -> dict[str, Any]:
     if view.error_code is not None:
         body["errorCode"] = view.error_code
         body["retryable"] = bool(view.retryable)
+        if view.error_code == "too_many_users":
+            body["error"] = "Too many users now. Please try again later"
     if view.download_url is not None:
         body["downloadUrl"] = view.download_url
         body["downloadUrlExpiresAt"] = view.download_url_expires_at

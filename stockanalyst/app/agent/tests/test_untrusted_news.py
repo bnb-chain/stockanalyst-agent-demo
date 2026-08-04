@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import ast
 import json
 import math
@@ -7,6 +8,7 @@ import os
 import traceback
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import requests
@@ -24,6 +26,7 @@ class _StreamingResponse:
         self,
         payload: object,
         *,
+        status_code: int = 200,
         status_error: Exception | None = None,
         headers: dict[str, str] | None = None,
         chunks: list[bytes] | None = None,
@@ -31,6 +34,7 @@ class _StreamingResponse:
         close_error: Exception | None = None,
     ) -> None:
         self._payload = payload
+        self.status_code = status_code
         self._status_error = status_error
         self.headers = headers or {}
         self._chunks = chunks
@@ -77,6 +81,132 @@ class UntrustedTextTests(unittest.TestCase):
 
 
 class NewsProviderTests(unittest.TestCase):
+    def setUp(self) -> None:
+        sleep_patch = patch("stockanalyst.app.agent.data_sources.time.sleep")
+        self.provider_sleep = sleep_patch.start()
+        self.addCleanup(sleep_patch.stop)
+
+    def test_news_tool_is_async_so_retries_do_not_block_event_loop(self) -> None:
+        tools_path = Path(__file__).parents[1] / "tools.py"
+        tools_tree = ast.parse(tools_path.read_text(encoding="utf-8"))
+        function = next(
+            node
+            for node in tools_tree.body
+            if getattr(node, "name", None) == "get_news_sentiment"
+        )
+
+        self.assertIsInstance(function, ast.AsyncFunctionDef)
+
+    @patch.dict(os.environ, {"ALPHA_VANTAGE_API_KEY": "test"}, clear=False)
+    @patch("stockanalyst.app.agent.data_sources.requests.get")
+    def test_alpha_retries_three_times_after_transport_errors(
+        self,
+        get: Mock,
+    ) -> None:
+        get.side_effect = [
+            requests.Timeout("timeout"),
+            requests.ConnectionError("offline"),
+            OSError("dns"),
+            _StreamingResponse({"feed": []}),
+        ]
+
+        result = fetch_alpha_vantage_sentiment("AAPL")
+
+        self.assertEqual(result, {"symbol": "AAPL", "article_count": 0})
+        self.assertEqual(get.call_count, 4)
+        self.assertEqual(
+            self.provider_sleep.call_args_list,
+            [unittest.mock.call(30.0)] * 3,
+        )
+
+    @patch.dict(os.environ, {"GNEWS_API_KEY": "test"}, clear=False)
+    @patch("stockanalyst.app.agent.data_sources.requests.get")
+    def test_gnews_retries_server_errors_then_succeeds(
+        self,
+        get: Mock,
+    ) -> None:
+        failures = [
+            _StreamingResponse(
+                {},
+                status_code=503,
+                status_error=requests.HTTPError("503"),
+            )
+            for _ in range(3)
+        ]
+        get.side_effect = [*failures, _StreamingResponse({"articles": []})]
+
+        result = fetch_gnews_headlines("AAPL")
+
+        self.assertEqual(result["headlines"], [])
+        self.assertEqual(get.call_count, 4)
+        self.assertEqual(
+            self.provider_sleep.call_args_list,
+            [unittest.mock.call(30.0)] * 3,
+        )
+        self.assertTrue(all(response.closed for response in failures))
+
+    @patch.dict(os.environ, {"ALPHA_VANTAGE_API_KEY": "test"}, clear=False)
+    @patch("stockanalyst.app.agent.data_sources.requests.get")
+    def test_alpha_returns_rate_limit_after_all_retries(
+        self,
+        get: Mock,
+    ) -> None:
+        get.side_effect = [
+            _StreamingResponse({"Information": "request limit reached"})
+            for _ in range(4)
+        ]
+
+        result = fetch_alpha_vantage_sentiment("AAPL")
+
+        self.assertEqual(result, {"symbol": "AAPL", "error": "provider_rate_limited"})
+        self.assertEqual(get.call_count, 4)
+        self.assertEqual(
+            self.provider_sleep.call_args_list,
+            [unittest.mock.call(30.0)] * 3,
+        )
+
+    @patch.dict(os.environ, {"GNEWS_API_KEY": "test"}, clear=False)
+    @patch("stockanalyst.app.agent.data_sources.requests.get")
+    def test_gnews_returns_rate_limit_after_daily_quota_retries(
+        self,
+        get: Mock,
+    ) -> None:
+        get.side_effect = [
+            _StreamingResponse(
+                {},
+                status_code=403,
+                status_error=requests.HTTPError("403"),
+            )
+            for _ in range(4)
+        ]
+
+        result = fetch_gnews_headlines("AAPL")
+
+        self.assertEqual(result, {"symbol": "AAPL", "error": "provider_rate_limited"})
+        self.assertEqual(get.call_count, 4)
+        self.assertEqual(
+            self.provider_sleep.call_args_list,
+            [unittest.mock.call(30.0)] * 3,
+        )
+
+    @patch.dict(os.environ, {"GNEWS_API_KEY": "test"}, clear=False)
+    @patch("stockanalyst.app.agent.data_sources.requests.get")
+    def test_gnews_does_not_retry_invalid_api_key(
+        self,
+        get: Mock,
+    ) -> None:
+        get.return_value = _StreamingResponse(
+            {},
+            status_code=401,
+            status_error=requests.HTTPError("401"),
+        )
+
+        result = fetch_gnews_headlines("AAPL")
+
+        self.assertEqual(result, {"symbol": "AAPL", "error": "provider_http_error"})
+        self.assertEqual(get.call_count, 1)
+        self.provider_sleep.assert_not_called()
+
     @patch.dict(os.environ, {"GNEWS_API_KEY": "test"}, clear=False)
     @patch("stockanalyst.app.agent.data_sources.requests.get")
     def test_gnews_normalizes_and_caps_untrusted_fields(self, get: Mock) -> None:
@@ -226,10 +356,11 @@ class NewsProviderTests(unittest.TestCase):
         function = next(
             node
             for node in tools_tree.body
-            if isinstance(node, ast.FunctionDef)
+            if isinstance(node, ast.AsyncFunctionDef)
             and node.name == "get_news_sentiment"
         )
         namespace = {
+            "asyncio": asyncio,
             "fetch_alpha_vantage_sentiment": fetch_alpha_vantage_sentiment,
             "fetch_gnews_headlines": lambda symbol: {"headlines": []},
         }
@@ -246,7 +377,7 @@ class NewsProviderTests(unittest.TestCase):
         get_news_sentiment = namespace["get_news_sentiment"]
 
         with self.assertLogs("seller-agent.data_sources", level="WARNING") as captured:
-            result = get_news_sentiment("AAPL")
+            result = asyncio.run(get_news_sentiment("AAPL"))
 
         self.assertEqual(
             result["alpha_vantage_sentiment"]["error"],
@@ -254,6 +385,92 @@ class NewsProviderTests(unittest.TestCase):
         )
         self.assertNotIn("ALPHA_TOOL_SECRET", str(result))
         self.assertNotIn("ALPHA_TOOL_SECRET", "\n".join(captured.output))
+
+    def test_news_tool_short_circuits_on_exhausted_provider_rate_limit(self) -> None:
+        tools_path = Path(__file__).parents[1] / "tools.py"
+        tools_tree = ast.parse(tools_path.read_text(encoding="utf-8"))
+        function = next(
+            node
+            for node in tools_tree.body
+            if isinstance(node, ast.AsyncFunctionDef)
+            and node.name == "get_news_sentiment"
+        )
+        gnews = Mock()
+        namespace = {
+            "asyncio": asyncio,
+            "fetch_alpha_vantage_sentiment": lambda symbol: {
+                "symbol": symbol,
+                "error": "provider_rate_limited",
+            },
+            "fetch_gnews_headlines": gnews,
+        }
+        exec(  # noqa: S102 — isolate the tool without importing ADK
+            compile(
+                ast.fix_missing_locations(
+                    ast.Module(body=[function], type_ignores=[]),
+                ),
+                str(tools_path),
+                "exec",
+            ),
+            namespace,
+        )
+
+        result = asyncio.run(namespace["get_news_sentiment"]("AAPL"))
+
+        self.assertEqual(
+            result,
+            {"symbol": "AAPL", "error": "provider_rate_limited"},
+        )
+        gnews.assert_not_called()
+
+    def test_runner_maps_provider_tool_rate_limit_to_public_job_error(self) -> None:
+        main_path = Path(__file__).parents[1] / "main.py"
+        main_tree = ast.parse(main_path.read_text(encoding="utf-8"))
+        helpers = [
+            node
+            for node in main_tree.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_raise_for_provider_rate_limit"
+        ]
+        self.assertEqual(len(helpers), 1)
+
+        class PublicJobError(RuntimeError):
+            def __init__(self, code: str, *, retryable: bool) -> None:
+                self.code = code
+                self.retryable = retryable
+
+        namespace = {
+            "Any": object,
+            "Mapping": dict,
+            "X402JobError": PublicJobError,
+        }
+        exec(  # noqa: S102 — isolate the event mapping helper
+            compile(
+                ast.fix_missing_locations(
+                    ast.Module(body=helpers, type_ignores=[]),
+                ),
+                str(main_path),
+                "exec",
+            ),
+            namespace,
+        )
+        event = SimpleNamespace(
+            content=SimpleNamespace(
+                parts=[
+                    SimpleNamespace(
+                        function_response=SimpleNamespace(
+                            response={"error": "provider_rate_limited"},
+                        ),
+                    ),
+                ],
+            ),
+        )
+
+        with self.assertRaises(PublicJobError) as raised:
+            namespace["_raise_for_provider_rate_limit"](event)
+
+        self.assertEqual(raised.exception.code, "too_many_users")
+        self.assertTrue(raised.exception.retryable)
 
     def test_provider_body_caps_apply_before_json_parsing(self) -> None:
         prefix = b'{"feed":[],"padding":"'
@@ -647,7 +864,7 @@ class NewsProviderTests(unittest.TestCase):
 
     @patch.dict(os.environ, {"ALPHA_VANTAGE_API_KEY": "test"}, clear=False)
     @patch("stockanalyst.app.agent.data_sources.requests.get")
-    def test_alpha_normalizes_information_and_abnormal_containers(
+    def test_alpha_information_is_treated_as_rate_limit(
         self,
         get: Mock,
     ) -> None:
@@ -655,18 +872,25 @@ class NewsProviderTests(unittest.TestCase):
             "Information": "  Rate\nlimit\x00 " + "word " * 100,
         })
         result = fetch_alpha_vantage_sentiment("AAPL")
-        self.assertNotIn("\n", result["note"])
-        self.assertNotIn("\x00", result["note"])
-        self.assertLessEqual(len(result["note"]), 300)
-        self.assertTrue(result["note"].startswith("Rate limit word"))
+        self.assertEqual(
+            result,
+            {"symbol": "AAPL", "error": "provider_rate_limited"},
+        )
+        self.assertEqual(get.call_count, 4)
 
         for value in (None, {"secret": "NON_STRING_INFO"}, ["info"]):
             with self.subTest(information=value):
+                get.reset_mock()
                 get.return_value = _StreamingResponse({"Information": value})
                 result = fetch_alpha_vantage_sentiment("AAPL")
-                self.assertEqual(result, {"symbol": "AAPL", "note": ""})
+                self.assertEqual(
+                    result,
+                    {"symbol": "AAPL", "error": "provider_rate_limited"},
+                )
+                self.assertEqual(get.call_count, 4)
                 self.assertNotIn("NON_STRING_INFO", str(result))
 
+        get.reset_mock()
         get.return_value = _StreamingResponse({"feed": {"not": "a list"}})
         result = fetch_alpha_vantage_sentiment("AAPL")
         self.assertEqual(result["article_count"], 0)
