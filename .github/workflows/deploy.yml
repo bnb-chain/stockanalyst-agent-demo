@@ -37,15 +37,15 @@ jobs:
           EOF
 
       - name: Install agent deps
-        working-directory: app/agent
+        working-directory: stockanalyst/app/agent
         run: |
           uv venv .venv --python 3.12
           uv pip install -e . --python .venv/bin/python
 
       - name: bag doctor
-        run: app/agent/.venv/bin/bag doctor
+        run: stockanalyst/app/agent/.venv/bin/bag doctor
 
       - name: Deploy agent
         env:
           BAG_PLATFORM_TOKEN: ${{ secrets.BAG_PLATFORM_TOKEN }}
-        run: app/agent/.venv/bin/bag deploy agent
+        run: stockanalyst/app/agent/.venv/bin/bag deploy agent
