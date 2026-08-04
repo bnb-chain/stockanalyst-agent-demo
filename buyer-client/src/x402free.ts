@@ -18,6 +18,7 @@ import { resolve, dirname } from "path";
 import { fileURLToPath } from "url";
 import { Wallet } from "ethers";
 import { randomBytes } from "crypto";
+import { readFreeQuoteResponse } from "./x402-free-client.js";
 import {
   BSC_TESTNET_CHAIN_ID,
   U_TOKEN_ADDRESS,
@@ -99,23 +100,6 @@ async function buildFreeProof(
   return Buffer.from(JSON.stringify(proof)).toString("base64");
 }
 
-// ── SSE stream reader ─────────────────────────────────────────────────────────
-
-interface SseEvent { event: string; data: string }
-
-function parseSseChunk(chunk: string): SseEvent[] {
-  const events: SseEvent[] = [];
-  for (const block of chunk.split("\n\n").filter((b) => b.trim())) {
-    let event = "message", data = "";
-    for (const line of block.split("\n")) {
-      if (line.startsWith("event: ")) event = line.slice(7).trim();
-      else if (line.startsWith("data: ")) data = line.slice(6).trim();
-    }
-    if (data) events.push({ event, data });
-  }
-  return events;
-}
-
 async function fetchFreeQuote(endpoint: string, symbol: string, proof: string): Promise<string> {
   const url  = `${endpoint}/x402/free`;
   const body = JSON.stringify({ symbol });
@@ -134,43 +118,7 @@ async function fetchFreeQuote(endpoint: string, symbol: string, proof: string): 
     const text = await resp.text();
     throw new Error(`HTTP ${resp.status}: ${text.slice(0, 200)}`);
   }
-  if (!resp.body) throw new Error("No response body");
-
-  const reader  = resp.body.getReader();
-  const decoder = new TextDecoder();
-  let report = "", buffer = "";
-
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    buffer += decoder.decode(value, { stream: true });
-    const events = parseSseChunk(buffer);
-    const lastSep = buffer.lastIndexOf("\n\n");
-    buffer = lastSep >= 0 ? buffer.slice(lastSep + 2) : buffer;
-
-    for (const { event, data } of events) {
-      try {
-        const payload = JSON.parse(data) as Record<string, unknown>;
-        if (event === "progress") {
-          const tool = String(payload["tool"] ?? "");
-          const msg  = String(payload["message"] ?? "");
-          if (tool) console.log(`  ⟳  ${tool}`);
-          else if (msg) console.log(`  →  ${msg}`);
-        } else if (event === "report") {
-          report = String(payload["content"] ?? "");
-          console.log(`\n  ✓ Report received (${report.length} chars)`);
-        } else if (event === "error") {
-          throw new Error(`Agent error: ${payload["message"] ?? data}`);
-        } else if (event === "done") {
-          return report;
-        }
-      } catch (e) {
-        if (e instanceof SyntaxError) continue;
-        throw e;
-      }
-    }
-  }
-  return report;
+  return readFreeQuoteResponse(resp);
 }
 
 // ── Main ──────────────────────────────────────────────────────────────────────

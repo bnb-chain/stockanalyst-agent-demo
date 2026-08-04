@@ -433,7 +433,10 @@ def _check_free_rate_limit(from_addr: str) -> tuple[bool, str]:
     return True, f"{FREE_TIER_LIMIT - len(calls)} uses remaining today"
 
 
-def build_free_payment_challenge(symbol: str, host: str = "localhost:9000") -> dict:
+def build_free_payment_challenge(
+    symbol: str,
+    resource_url: str = "http://localhost:9000/x402/free",
+) -> dict:
     """Return x402 v2 free tier challenge (maxAmountRequired=0, wallet identity proof only)."""
     desc = f"Free quick quote for {symbol.upper()}" if symbol else "Free quick quote"
     return {
@@ -457,7 +460,7 @@ def build_free_payment_challenge(symbol: str, host: str = "localhost:9000") -> d
             }
         ],
         "error":    "Payment Required",
-        "resource": f"http://{host}/x402/free",
+        "resource": resource_url,
     }
 
 

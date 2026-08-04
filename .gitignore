@@ -67,5 +67,6 @@ docs/superpowers/
 output/
 agentcore/
 infra/
+temp/
 
 .DS_Store

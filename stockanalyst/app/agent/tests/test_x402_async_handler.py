@@ -131,10 +131,16 @@ def make_handler(service=None, *, b402_client=None) -> X402Handler:
         b402_client.payment_extra.return_value = SUPPORTED_EXTRA
     return X402Handler(
         AsyncMock(),
-        free_stream_work=Mock(),
+        free_work=Mock(),
         job_service=service,
         b402_client=b402_client,
     )
+
+
+async def free_report_work(symbol: str):
+    yield "progress", {"stage": "collecting"}
+    yield "report", {"content": f"# {symbol} report", "format": "markdown"}
+    yield "done", {}
 
 
 class X402AsyncHandlerTests(unittest.IsolatedAsyncioTestCase):
@@ -728,6 +734,96 @@ class X402AsyncHandlerTests(unittest.IsolatedAsyncioTestCase):
             )
 
         free.assert_awaited_once()
+
+    async def test_free_challenge_uses_trusted_public_resource_url(self) -> None:
+        response = await call_handler(
+            make_handler(AsyncMock()),
+            method="GET",
+            path="/x402/free",
+            scope_overrides={
+                "query_string": b"symbol=AAPL",
+                "x402_public_base_url": "https://gateway.example/testnet",
+            },
+        )
+
+        self.assertEqual(response.status, 402)
+        self.assertEqual(
+            response.json["paymentRequired"]["resource"],
+            "https://gateway.example/testnet/x402/free",
+        )
+
+    async def test_free_post_returns_buffered_json_report(self) -> None:
+        handler = X402Handler(
+            AsyncMock(),
+            free_work=free_report_work,
+            b402_client=AsyncMock(),
+        )
+        with (
+            patch(
+                "stockanalyst.app.agent.x402_handler.verify_free_payment_proof",
+                return_value=(True, "9 uses remaining today", "0x" + "1" * 40),
+            ),
+            patch(
+                "stockanalyst.app.agent.x402_handler._payment_identity",
+                return_value=("0x" + "1" * 40, "0x" + "2" * 64),
+            ),
+            patch(
+                "stockanalyst.app.agent.x402_handler.report_competition_call",
+                new=AsyncMock(),
+            ),
+        ):
+            response = await call_handler(
+                handler,
+                method="POST",
+                path="/x402/free",
+                headers={"x-payment": "proof"},
+                json_body={"symbol": "AAPL"},
+            )
+
+        self.assertEqual(response.status, 200)
+        self.assertEqual(response.headers["content-type"], "application/json")
+        self.assertEqual(response.json, {
+            "content": "# AAPL report",
+            "format": "markdown",
+        })
+
+    async def test_free_post_returns_safe_error_when_quote_generation_fails(self) -> None:
+        async def failed_work(symbol: str):
+            yield "error", {"message": "private upstream failure"}
+
+        handler = X402Handler(
+            AsyncMock(),
+            free_work=failed_work,
+            b402_client=AsyncMock(),
+        )
+        with (
+            patch(
+                "stockanalyst.app.agent.x402_handler.verify_free_payment_proof",
+                return_value=(True, "9 uses remaining today", "0x" + "1" * 40),
+            ),
+            patch(
+                "stockanalyst.app.agent.x402_handler._payment_identity",
+                return_value=("0x" + "1" * 40, "0x" + "2" * 64),
+            ),
+            patch(
+                "stockanalyst.app.agent.x402_handler.report_competition_call",
+                new=AsyncMock(),
+            ),
+        ):
+            response = await call_handler(
+                handler,
+                method="POST",
+                path="/x402/free",
+                headers={"x-payment": "proof"},
+                json_body={"symbol": "AAPL"},
+            )
+
+        self.assertEqual(response.status, 503)
+        self.assertEqual(response.json, {
+            "errorCode": "free_quote_unavailable",
+            "retryable": True,
+        })
+        self.assertNotIn(b"private upstream failure", response.body)
 
 
 if __name__ == "__main__":

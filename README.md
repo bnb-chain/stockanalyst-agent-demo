@@ -37,13 +37,13 @@ Three ways to pay — pick the one that fits your use case:
         ▼
   buyer-client (Node.js)
         │
-        ├─── x402 free tier ──────────────► seller agent  :9000  (local)
+        ├─── x402 free tier ──────────────► public x402 API Gateway
         │    sign 0-U EIP-712 proof         └─ verify sig + rate limit (10/24h)
         │    POST /x402/free                   fetch_quote() — no LLM
-        │◄── SSE: quick quote table ──────────                  (~1s)
+        │◄── JSON: quick quote table ─────────                  (~1s)
         │
-        ├─── x402 paid async ─────────────► seller agent  :9000 / :9001 (platform)
-        │    sign 1-U EIP-712 proof         └─ verify + Binance Pay facilitator
+        ├─── x402 paid async ─────────────► public x402 API Gateway
+        │    sign 1-U EIP-712 proof         └─ seller agent → Binance Pay facilitator
         │    POST /x402/analyze/async          kimi-k2.6 background analysis
         │◄── jobId + private token ────────
         │    poll status → presigned URL ──► private S3 report
@@ -170,8 +170,9 @@ AGENT_CLIENT_ID=<client_id>
 AGENT_CLIENT_SECRET=<client_secret>
 PROVIDER_ADDRESS=<seller wallet address>
 
-# x402 — defaults to localhost:9000; set for deployed platform
-# X402_ENDPOINT=https://bnbagent-api.bnbchain.world/v1/rt/<agent_id>/x402
+# x402 — defaults to localhost:9000; deployed value is the API Gateway
+# CloudFormation `X402GatewayBaseUrl` stack output
+# X402_ENDPOINT=https://<api-id>.execute-api.us-east-1.amazonaws.com/testnet
 
 UOMP_GUARD_URL=http://127.0.0.1:9374
 UOMP_GUARD_TOKEN=demo-guard-token

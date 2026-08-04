@@ -6,11 +6,12 @@ import hashlib
 import re
 from collections.abc import Mapping
 from typing import Any
-from urllib.parse import urlsplit
+from urllib.parse import urlencode, urlsplit
 
 
 _ALLOWED_HEADERS = {"accept", "content-type", "x-payment", "x-job-token"}
 _JOB_PATH = re.compile(r"/x402/jobs/x402_[0-9a-f]{32}(?:/resume)?\Z")
+_FREE_SYMBOL = re.compile(r"[A-Za-z0-9.^_-]{1,32}\Z")
 _HEADER_NAME = re.compile(r"[a-z0-9-]+\Z")
 _MAX_BODY_BYTES = 256 * 1024
 
@@ -25,6 +26,7 @@ class GatewayRequestError(ValueError):
 def build_envelope(event: Mapping[str, Any], *, public_base_url: str) -> dict[str, Any]:
     """Validate an API Gateway REST proxy event without retaining its contents."""
     method, path = _validated_route(event)
+    query_string = _validated_query(event, method=method, path=path)
     body = _decode_body(event)
     if method == "GET" and body:
         raise GatewayRequestError("get_request_body_not_allowed")
@@ -32,6 +34,7 @@ def build_envelope(event: Mapping[str, Any], *, public_base_url: str) -> dict[st
     digest = hashlib.sha256()
     for part in (
         b"x402-gateway-v1\0", method.encode("ascii"), b"\0", path.encode("ascii"),
+        b"\0", query_string.encode("ascii"),
         b"\0", headers.get("x-payment", "").encode("utf-8"), b"\0",
         headers.get("x-job-token", "").encode("utf-8"), b"\0", body,
     ):
@@ -41,6 +44,7 @@ def build_envelope(event: Mapping[str, Any], *, public_base_url: str) -> dict[st
         "requestId": f"x402gw_{digest.hexdigest()}",
         "method": method,
         "path": path,
+        "queryString": query_string,
         "publicBaseUrl": validate_public_base(public_base_url),
         "headers": headers,
         "bodyBase64": base64.b64encode(body).decode("ascii"),
@@ -52,10 +56,13 @@ def _validated_route(event: Mapping[str, Any]) -> tuple[str, str]:
     raw_path = event.get("path")
     if not isinstance(method, str) or not isinstance(raw_path, str):
         raise GatewayRequestError("route_not_allowed")
-    if _has_query(event):
-        raise GatewayRequestError("query_not_allowed")
     path = _without_stage_prefix(raw_path, event.get("requestContext"))
-    allowed = ((method, path) in {("GET", "/x402/price"), ("POST", "/x402/analyze/async")})
+    allowed = ((method, path) in {
+        ("GET", "/x402/price"),
+        ("GET", "/x402/free"),
+        ("POST", "/x402/free"),
+        ("POST", "/x402/analyze/async"),
+    })
     if not allowed and _JOB_PATH.fullmatch(path):
         allowed = (method == "GET" and not path.endswith("/resume")) or (
             method == "POST" and path.endswith("/resume")
@@ -65,13 +72,36 @@ def _validated_route(event: Mapping[str, Any]) -> tuple[str, str]:
     return method, path
 
 
-def _has_query(event: Mapping[str, Any]) -> bool:
-    for key in ("queryStringParameters", "multiValueQueryStringParameters"):
-        value = event.get(key)
-        if value not in (None, {}):
-            if not isinstance(value, Mapping) or value:
-                return True
-    return False
+def _validated_query(event: Mapping[str, Any], *, method: str, path: str) -> str:
+    single = event.get("queryStringParameters")
+    multi = event.get("multiValueQueryStringParameters")
+    if single in (None, {}) and multi in (None, {}):
+        return ""
+    if method != "GET" or path != "/x402/free":
+        raise GatewayRequestError("query_not_allowed")
+    if single is not None and not isinstance(single, Mapping):
+        raise GatewayRequestError("query_not_allowed")
+    if multi is not None and not isinstance(multi, Mapping):
+        raise GatewayRequestError("query_not_allowed")
+    if single not in (None, {}) and set(single) != {"symbol"}:
+        raise GatewayRequestError("query_not_allowed")
+    if multi not in (None, {}) and set(multi) != {"symbol"}:
+        raise GatewayRequestError("query_not_allowed")
+
+    single_symbol = single.get("symbol") if isinstance(single, Mapping) else None
+    multi_symbols = multi.get("symbol") if isinstance(multi, Mapping) else None
+    if multi_symbols is not None:
+        if not isinstance(multi_symbols, list) or len(multi_symbols) != 1:
+            raise GatewayRequestError("query_not_allowed")
+        multi_symbol = multi_symbols[0]
+    else:
+        multi_symbol = None
+    if single_symbol is not None and multi_symbol is not None and single_symbol != multi_symbol:
+        raise GatewayRequestError("query_not_allowed")
+    symbol = multi_symbol if multi_symbol is not None else single_symbol
+    if not isinstance(symbol, str) or not _FREE_SYMBOL.fullmatch(symbol):
+        raise GatewayRequestError("query_not_allowed")
+    return urlencode({"symbol": symbol})
 
 
 def _without_stage_prefix(path: str, request_context: Any) -> str:
