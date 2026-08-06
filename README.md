@@ -82,7 +82,7 @@ Three ways to pay — pick the one that fits your use case:
 | Report | quick quote table | full analysis | full analysis |
 | LLM | none (yfinance only) | kimi-k2.6 | kimi-k2.6 |
 | Time | ~1s | asynchronous | 5–15 min |
-| Rate limit | 10/24h per wallet | none | none |
+| Rate limit | 10/24h per wallet + edge throttling | edge throttling | none |
 
 ## Quick start
 

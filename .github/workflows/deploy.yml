@@ -21,12 +21,16 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Install bnbagent-studio
+      - name: Install uv + bnbagent-studio
         run: |
           pip install uv
+          # Installs `bag` onto the uv tool bin path (~/.local/bin), not into
+          # the agent project venv created below.
           uv tool install bnbagent-studio
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
-      - name: Write secrets to .studio/.env.local
+      - name: Write secrets to stockanalyst/.studio/.env.local
+        working-directory: stockanalyst
         run: |
           mkdir -p .studio
           cat > .studio/.env.local <<EOF
@@ -43,9 +47,11 @@ jobs:
           uv pip install -e . --python .venv/bin/python
 
       - name: bag doctor
-        run: stockanalyst/app/agent/.venv/bin/bag doctor
+        working-directory: stockanalyst
+        run: bag doctor
 
       - name: Deploy agent
+        working-directory: stockanalyst
         env:
           BAG_PLATFORM_TOKEN: ${{ secrets.BAG_PLATFORM_TOKEN }}
-        run: stockanalyst/app/agent/.venv/bin/bag deploy agent
+        run: bag deploy agent

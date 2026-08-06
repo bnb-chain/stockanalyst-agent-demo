@@ -241,6 +241,24 @@ not expose the AgentCore invocation URL. See
 and rollback procedures.
 The free POST returns buffered JSON (`content` plus `format`), not SSE.
 
+The public gateway also applies source-IP rate limits in rolling five-minute
+windows: 1,200 GET requests, 60 job-creation POST requests, and 30 job-resume
+POST requests. A 2,000-request global limit protects all `/x402/*` routes as a
+last resort. API Gateway keeps its existing 25 requests/second rate and 50
+request burst limits. Requests rejected at either edge layer return HTTP 429,
+`Retry-After: 60`, and:
+
+```json
+{
+  "errorCode": "too_many_requests",
+  "error": "Too many requests. Please try again later.",
+  "retryable": true
+}
+```
+
+These limits are separate from the free tier's 10 successful calls per wallet
+per 24 hours and from upstream market-data provider limits.
+
 If Alpha Vantage or GNews remains rate-limited after the initial request and
 three retries, authenticated job polling returns a retryable failure without
 exposing provider details or credentials:
@@ -817,6 +835,22 @@ bucket。
 ```
 
 响应不会暴露供应商原始错误、API Key 或其他凭证。
+
+公网网关还按来源 IP 使用五分钟滚动窗口限流：GET 查询 1,200 次、创建任务的
+POST 请求 60 次、恢复任务的 POST 请求 30 次；同时对全部 `/x402/*` 路由设置
+2,000 次的全局兜底限制。API Gateway 仍保留每秒 25 次、突发 50 次的限制。任一
+边缘层拒绝请求时均返回 HTTP 429、`Retry-After: 60`，以及：
+
+```json
+{
+  "errorCode": "too_many_requests",
+  "error": "Too many requests. Please try again later.",
+  "retryable": true
+}
+```
+
+这些限制与免费功能每个钱包 24 小时内最多 10 次成功调用的业务限制、以及上游
+行情供应商限流互相独立。
 
 先在操作者本地设置变量，不要提交真实值：
 
