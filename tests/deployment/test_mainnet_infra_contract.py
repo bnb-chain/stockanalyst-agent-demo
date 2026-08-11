@@ -162,6 +162,13 @@ LEGACY_X402_HEADER = re.compile(
     r"(?<![A-Za-z0-9-])x-payment(?:-required|-response)?(?![A-Za-z0-9-])",
     re.IGNORECASE,
 )
+UNSAFE_PAYMENT_GUIDANCE_PATTERNS = (
+    r"(?i)\bapprove\s*\([^)]*(?:\b[A-Za-z_$][\w$]*\.)*MaxUint(?:256)?\b",
+    r"(?i)\bset(?:\s+the)?\s+allowance\s+to\s+(?:[A-Za-z_$][\w$]*\.)*MaxUint(?:256)?\b",
+    r"(?i)\buse\s+(?:an?\s+)?unlimited\s+allowance\b",
+    r"(?i)\b(?:normal\s+)?x402(?::async|\s+(?:client|flow|run|CLI))?\s+automatically\s+approves\b",
+)
+GUIDANCE_NEGATION = re.compile(r"(?i)\b(?:never|no|not|without)\b")
 
 
 def iter_x402_python_sources(
@@ -261,6 +268,18 @@ def declared_runtime_secret_names(studio: str) -> list[str]:
     )
 
 
+def affirmative_payment_guidance_violations(documentation: str) -> list[str]:
+    violations: list[str] = []
+    for pattern in UNSAFE_PAYMENT_GUIDANCE_PATTERNS:
+        for match in re.finditer(pattern, documentation):
+            prefix = documentation[: match.start()]
+            clause_start = max(prefix.rfind(boundary) for boundary in ".!?;,:\n") + 1
+            if GUIDANCE_NEGATION.search(prefix[clause_start:]):
+                continue
+            violations.append(match.group(0))
+    return violations
+
+
 class MainnetInfrastructureContractTests(unittest.TestCase):
     def test_public_docs_describe_the_complete_four_token_contract(self) -> None:
         for path in PUBLIC_FOUR_TOKEN_DOCUMENTS:
@@ -280,7 +299,8 @@ class MainnetInfrastructureContractTests(unittest.TestCase):
                     "B402 capabilities may be partial",
                     "`extra.signerAddress` is facilitator EOA metadata; it is not the Permit2 spender and is not part of `permit2-exact` typed data.",
                     f"`extra.spenderAddress` is the live B402 proxy and the `permit2-exact` typed-data spender; the ERC-20 approval target remains canonical Permit2 `{CANONICAL_PERMIT2}`.",
-                    "Permit2 recovery is settle-only and reuses the exact same persisted proof; it does not call `/verify` again and creates no new signature, nonce, or approval.",
+                    "When `pendingSettlementReference` has been durably recorded, Permit2 recovery is settle-only with the identical persisted proof and does not call `/verify` again.",
+                    "Without a durable `pendingSettlementReference`, other retryable create/recovery cases reuse the identical proof but may repeat verify-and-settle under B402 idempotency with the same nonce; they create no new signature, nonce, or approval.",
                     "Both approve and revoke require confirmation; `--yes` is an explicit noninteractive bypass.",
                     "In promotional mode, `paymentRequired=false` and the active `accepts=[]`; `supportedAssets` may still list all four tokens as registry metadata and is not an active payment requirement.",
                     "There is no USDC/USDT promotional proof, B402 verify/settle, or automatic approval.",
@@ -290,19 +310,42 @@ class MainnetInfrastructureContractTests(unittest.TestCase):
     def test_tracked_guidance_rejects_stale_or_unsafe_payment_advice(self) -> None:
         for path in TRACKED_X402_GUIDANCE:
             with self.subTest(path=path.relative_to(ROOT)):
-                documentation = " ".join(path.read_text(encoding="utf-8").split())
+                source = path.read_text(encoding="utf-8")
+                documentation = " ".join(source.split())
                 for forbidden in (
                     r"(?i)USDC(?:/| and )USDT.{0,80}(?:defer|暂缓)",
                     r"(?i)(?:only|strict).{0,24}U.{0,16}(?:or|/).{0,16}USD1",
                     r"(?i)fixed U/USD1(?:\s+mainnet)? registry",
                     r"买家可以用\s+`X402_PAYMENT_TOKEN=U`（默认）\s+或\s+`X402_PAYMENT_TOKEN=USD1`\s+严格选择",
-                    r"(?i)approve MaxUint(?:256)?",
-                    r"(?i)approve unlimited",
-                    r"(?i)set an unlimited allowance",
-                    r"(?i)automatic Permit2 approval",
-                    r"(?i)(?<!never )automatically approves Permit2",
                 ):
                     self.assertNotRegex(documentation, forbidden)
+                self.assertEqual(affirmative_payment_guidance_violations(source), [])
+
+    def test_payment_guidance_safety_patterns_are_affirmative_only(self) -> None:
+        safe_guidance = (
+            "The client must never approve unlimited allowances.",
+            "There is no automatic approval.",
+            "Normal x402 never automatically approves Permit2.",
+            "Do not use an unlimited allowance.",
+            "x402:async does not automatically approve Permit2.",
+            "Never call approve(token, MaxUint256).",
+            "Do not set allowance to MaxUint256.",
+        )
+        prohibited_guidance = (
+            "Call approve(token, MaxUint256) before paying.",
+            "Set allowance to MaxUint256 for convenience.",
+            "Use unlimited allowance to avoid another transaction.",
+            "Normal x402 automatically approves Permit2.",
+        )
+
+        for guidance in safe_guidance:
+            with self.subTest(safe=guidance):
+                self.assertEqual(affirmative_payment_guidance_violations(guidance), [])
+        for guidance in prohibited_guidance:
+            with self.subTest(prohibited=guidance):
+                self.assertNotEqual(
+                    affirmative_payment_guidance_violations(guidance), []
+                )
 
     def test_runtime_secret_name_contract_remains_the_existing_26_names(self) -> None:
         declared = declared_runtime_secret_names(STUDIO.read_text(encoding="utf-8"))

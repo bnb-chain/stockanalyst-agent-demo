@@ -70,14 +70,19 @@ needed.
    private job token. Neither proof, signature, job token, nor private report
    URL is printed.
 
-If a POST response is lost or a process restarts, Permit2 recovery is
-settle-only and reuses the exact same persisted proof; it does not call
-`/verify` again and creates no new signature, nonce, or approval. The proof
-includes the original requirement metadata and request body. Pending
-and receipt recovery also run before current token/RPC configuration is read,
-so recovery is not blocked by a later environment change. A stale lock may be
-removed only after confirming no async client process is running; never delete
-the pending record merely to bypass recovery.
+When `pendingSettlementReference` has been durably recorded, Permit2 recovery
+is settle-only with the identical persisted proof and does not call `/verify`
+again. Without a durable `pendingSettlementReference`, other retryable
+create/recovery cases reuse the identical proof but may repeat verify-and-settle
+under B402 idempotency with the same nonce; they create no new signature, nonce,
+or approval. This distinction applies after either a lost POST response or a
+process restart: only the durable server-side pending settlement reference
+proves verification already completed. The proof includes the original
+requirement metadata and request body. Pending and receipt recovery also run
+before current token/RPC configuration is read, so recovery is not blocked by
+a later environment change. A stale lock may be removed only after confirming
+no async client process is running; never delete the pending record merely to
+bypass recovery.
 
 ## Promotional mode
 

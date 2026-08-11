@@ -45,10 +45,13 @@ not an active payment requirement. There is no USDC/USDT promotional proof,
 B402 verify/settle, or automatic approval. On a genuinely new CLI run with
 `X402_PAYMENT_TOKEN=USDC` or `USDT`, the zero-POST safety policy may perform a
 read-only Permit2 preflight before discovering the proofless promotional
-response; it still performs no approval. Permit2 recovery is settle-only and
-reuses the exact same persisted proof; it does not call `/verify` again and
-creates no new signature, nonce, or approval. The complete buyer and HTTP
-runbook is in [`docs/x402-api-usage.md`](../docs/x402-api-usage.md).
+response; it still performs no approval. When `pendingSettlementReference` has
+been durably recorded, Permit2 recovery is settle-only with the identical
+persisted proof and does not call `/verify` again. Without a durable
+`pendingSettlementReference`, other retryable create/recovery cases reuse the
+identical proof but may repeat verify-and-settle under B402 idempotency with the
+same nonce; they create no new signature, nonce, or approval. The complete buyer
+and HTTP runbook is in [`docs/x402-api-usage.md`](../docs/x402-api-usage.md).
 
 ---
 
