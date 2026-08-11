@@ -22,6 +22,13 @@ from Crypto.Hash import SHA256
 from Crypto.PublicKey import RSA
 from Crypto.Signature import pkcs1_15
 
+try:
+    from .x402_settlement import SettlementOutcome, valid_settlement_reference
+    from .x402_tokens import PaymentToken, token_by_asset
+except ImportError:  # Direct imports from stockanalyst/app/agent.
+    from x402_settlement import SettlementOutcome, valid_settlement_reference
+    from x402_tokens import PaymentToken, token_by_asset
+
 
 class B402Error(RuntimeError):
     """Base class for B402 integration failures."""
@@ -193,49 +200,56 @@ class B402Client:
             raise B402IndeterminateError("B402 returned a malformed response")
         return parsed
 
-    async def payment_extra(
-        self,
-        network: str,
-        name: str,
-        version: str,
-    ) -> dict[str, Any]:
-        domain = (name, version)
-        selected = await self.payment_extras(network, (domain,))
-        if domain in selected:
-            return selected[domain]
-        raise B402RejectedError(
-            f"B402 does not support exact eip3009 {name} {version} on {network}"
-        )
-
     async def payment_extras(
         self,
         network: str,
-        domains: Sequence[tuple[str, str]],
-    ) -> dict[tuple[str, str], dict[str, Any]]:
+        tokens: Sequence[PaymentToken],
+    ) -> dict[str, dict[str, Any]]:
         kinds = await self._get_supported_kinds()
-        selected: dict[tuple[str, str], dict[str, Any]] = {}
-        for domain in domains:
-            name, version = domain
+        selected: dict[str, dict[str, Any]] = {}
+        for token in tokens:
+            matches: list[dict[str, Any]] = []
             for kind in kinds:
                 extra = kind.get("extra")
+                if not isinstance(extra, dict):
+                    continue
+                valid_addresses = _is_evm_address(extra.get("signerAddress"))
+                if token.transfer_method == "permit2-exact":
+                    valid_addresses = valid_addresses and _is_evm_address(
+                        extra.get("spenderAddress")
+                    )
                 if (
                     kind.get("x402Version") == 2
                     and kind.get("scheme") == "exact"
                     and kind.get("network") == network
-                    and isinstance(extra, dict)
-                    and extra.get("name") == name
-                    and extra.get("version") == version
-                    and extra.get("assetTransferMethod") == "eip3009"
-                    and _is_evm_address(extra.get("signerAddress"))
+                    and extra.get("name") == token.domain_name
+                    and extra.get("version") == token.domain_version
+                    and extra.get("assetTransferMethod") == token.transfer_method
+                    and valid_addresses
                 ):
-                    selected[domain] = copy.deepcopy(extra)
-                    break
+                    matches.append(extra)
+            if len(matches) == 1:
+                selected[token.symbol] = copy.deepcopy(matches[0])
         return selected
 
     async def verify_and_settle(
         self,
         payment_payload: Mapping[str, Any],
-    ) -> str:
+    ) -> SettlementOutcome:
+        return await self._settle(payment_payload, verify_first=True)
+
+    async def settle_only(
+        self,
+        payment_payload: Mapping[str, Any],
+    ) -> SettlementOutcome:
+        return await self._settle(payment_payload, verify_first=False)
+
+    async def _settle(
+        self,
+        payment_payload: Mapping[str, Any],
+        *,
+        verify_first: bool,
+    ) -> SettlementOutcome:
         accepted = payment_payload.get("accepted")
         if not isinstance(accepted, dict):
             raise B402RejectedError("payment requirement is missing")
@@ -243,11 +257,14 @@ class B402Client:
         if not isinstance(extra, dict):
             raise B402RejectedError("payment requirement extra is missing")
 
-        current_extra = await self.payment_extra(
-            str(accepted.get("network") or ""),
-            str(extra.get("name") or ""),
-            str(extra.get("version") or ""),
-        )
+        token = token_by_asset(accepted.get("asset"))
+        if token is None:
+            raise B402RejectedError("payment requirement asset is unsupported")
+        network = accepted.get("network")
+        if not isinstance(network, str):
+            raise B402RejectedError("payment requirement network is missing")
+        current_extras = await self.payment_extras(network, (token,))
+        current_extra = current_extras.get(token.symbol)
         if current_extra != extra:
             raise B402RejectedError("payment requirement is no longer supported")
 
@@ -256,39 +273,42 @@ class B402Client:
             "paymentPayload": copy.deepcopy(dict(payment_payload)),
             "paymentRequirements": copy.deepcopy(accepted),
         }
-        verification = await self.post("/papi/v2/b402/verify", envelope)
-        verification_data = _success_data(verification, operation="verify")
-        is_valid = verification_data.get("isValid")
-        if is_valid is False:
-            reason = _reason(
-                verification_data,
-                "invalidReason",
-                "payment verification rejected",
-            )
-            raise B402RejectedError(reason)
-        if is_valid is not True:
-            raise B402IndeterminateError(
-                "B402 returned a malformed verification result"
-            )
+        if verify_first:
+            verification = await self.post("/papi/v2/b402/verify", envelope)
+            verification_data = _success_data(verification, operation="verify")
+            is_valid = verification_data.get("isValid")
+            if is_valid is False:
+                return SettlementOutcome(
+                    "rejected",
+                    reason=_reason(
+                        verification_data,
+                        "invalidReason",
+                        "payment verification rejected",
+                    ),
+                )
+            if is_valid is not True:
+                raise B402IndeterminateError(
+                    "B402 returned a malformed verification result"
+                )
 
         settlement = await self.post("/papi/v2/b402/settle", envelope)
         settlement_data = _success_data(settlement, operation="settle")
         success = settlement_data.get("success")
         transaction = settlement_data.get("transaction")
-        if success is True and isinstance(transaction, str) and transaction:
-            return transaction
-        if success is False and isinstance(transaction, str):
-            if transaction:
-                raise B402IndeterminateError(
-                    "B402 settlement was broadcast but is not confirmed"
+        if success is True and valid_settlement_reference(transaction):
+            return SettlementOutcome("settled", transaction=transaction)
+        if success is False:
+            if valid_settlement_reference(transaction):
+                return SettlementOutcome("pending", transaction=transaction)
+            if transaction == "":
+                return SettlementOutcome(
+                    "rejected",
+                    reason=_reason(
+                        settlement_data,
+                        "errorReason",
+                        "payment settlement rejected",
+                    ),
                 )
-            raise B402RejectedError(
-                _reason(
-                    settlement_data,
-                    "errorReason",
-                    "payment settlement rejected",
-                )
-            )
         raise B402IndeterminateError(
             "B402 returned a malformed settlement result"
         )

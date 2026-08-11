@@ -17,6 +17,15 @@ from stockanalyst.app.agent.b402_client import (
     B402IndeterminateError,
     B402RejectedError,
 )
+from stockanalyst.app.agent.x402_settlement import (
+    SettlementOutcome,
+    valid_settlement_reference,
+)
+from stockanalyst.app.agent.x402_tokens import (
+    TOKENS,
+    USDC_TOKEN,
+    USDT_TOKEN,
+)
 
 _PRIVATE_KEY = RSA.generate(1024)
 PRIVATE_KEY_B64 = base64.b64encode(_PRIVATE_KEY.export_key(format="DER", pkcs=8)).decode()
@@ -65,15 +74,21 @@ class B402ConfigTests(unittest.TestCase):
 @dataclass
 class _FakeResponse:
     status_code: int
-    body: dict[str, Any]
+    body: Any
 
-    def json(self) -> dict[str, Any]:
+    def json(self) -> Any:
         return self.body
 
 
 class _RecordingHttpClient:
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        response: _FakeResponse | None = None,
+        error: Exception | None = None,
+    ) -> None:
         self.requests: list[dict[str, Any]] = []
+        self.response = response
+        self.error = error
 
     async def __aenter__(self) -> Self:
         return self
@@ -93,9 +108,11 @@ class _RecordingHttpClient:
             "content": content,
             "headers": headers,
         })
-        return _FakeResponse(
-            200,
-            {"code": "000000", "message": "success", "data": {}},
+        if self.error is not None:
+            raise self.error
+        return self.response or _FakeResponse(
+            status_code=200,
+            body={"code": "000000", "message": "success", "data": {}},
         )
 
 
@@ -148,6 +165,20 @@ USD1_SUPPORTED_EXTRA = {
     "assetTransferMethod": "eip3009",
     "signerAddress": "0x2222222222222222222222222222222222222222",
 }
+USDC_SUPPORTED_EXTRA = {
+    "name": "USD Coin",
+    "version": "2",
+    "assetTransferMethod": "permit2-exact",
+    "signerAddress": "0x3333333333333333333333333333333333333333",
+    "spenderAddress": "0x4444444444444444444444444444444444444444",
+}
+USDT_SUPPORTED_EXTRA = {
+    "name": "Tether USD",
+    "version": "1",
+    "assetTransferMethod": "permit2-exact",
+    "signerAddress": "0x5555555555555555555555555555555555555555",
+    "spenderAddress": "0x6666666666666666666666666666666666666666",
+}
 
 
 def _supported_response(
@@ -182,30 +213,7 @@ class B402SupportedKindTests(unittest.IsolatedAsyncioTestCase):
         assert config is not None
         return B402Client(config, monotonic=lambda: now[0])
 
-    async def test_selects_and_defensively_copies_eip3009_kind(self) -> None:
-        now = [100.0]
-        client = self.client(now)
-        client.post = AsyncMock(return_value=_supported_response())
-
-        first = await client.payment_extra(
-            "eip155:56",
-            "United Stables",
-            "1",
-        )
-        first["signerAddress"] = "changed"
-        second = await client.payment_extra(
-            "eip155:56",
-            "United Stables",
-            "1",
-        )
-
-        self.assertEqual(second, SUPPORTED_EXTRA)
-        client.post.assert_awaited_once_with(
-            "/papi/v2/b402/supported",
-            {},
-        )
-
-    async def test_selects_supported_domains_in_requested_order(self) -> None:
+    async def test_selects_exact_capabilities_in_token_order_and_copies(self) -> None:
         now = [100.0]
         client = self.client(now)
         client.post = AsyncMock(return_value=_supported_response(kinds=[
@@ -213,162 +221,208 @@ class B402SupportedKindTests(unittest.IsolatedAsyncioTestCase):
                 "x402Version": 2,
                 "scheme": "exact",
                 "network": "eip155:56",
-                "extra": USD1_SUPPORTED_EXTRA,
+                "extra": SUPPORTED_EXTRA,
+            },
+            {
+                "x402Version": 2,
+                "scheme": "exact",
+                "network": "eip155:56",
+                "extra": USDC_SUPPORTED_EXTRA,
+            },
+            {
+                "x402Version": 2,
+                "scheme": "exact",
+                "network": "eip155:56",
+                "extra": {**USDT_SUPPORTED_EXTRA, "spenderAddress": "malformed"},
+            },
+            {
+                "x402Version": 2,
+                "scheme": "exact",
+                "network": "eip155:1",
+                "extra": USDT_SUPPORTED_EXTRA,
+            },
+            {
+                "x402Version": 2,
+                "scheme": "exact",
+                "network": "eip155:56",
+                "extra": USDT_SUPPORTED_EXTRA,
+            },
+            {
+                "x402Version": 2,
+                "scheme": "exact",
+                "network": "eip155:56",
+                "extra": copy.deepcopy(USDT_SUPPORTED_EXTRA),
             },
             {
                 "x402Version": 2,
                 "scheme": "exact",
                 "network": "eip155:56",
                 "extra": {
-                    **SUPPORTED_EXTRA,
-                    "assetTransferMethod": "permit2",
+                    **USDC_SUPPORTED_EXTRA,
+                    "assetTransferMethod": "permit2-upto",
                 },
+            },
+        ]))
+
+        selected = await client.payment_extras("eip155:56", TOKENS)
+
+        self.assertEqual(list(selected), ["U", "USDC"])
+        self.assertEqual(selected["USDC"], USDC_SUPPORTED_EXTRA)
+        selected["USDC"]["spenderAddress"] = "changed"
+        self.assertEqual(
+            (await client.payment_extras("eip155:56", TOKENS))["USDC"],
+            USDC_SUPPORTED_EXTRA,
+        )
+        client.post.assert_awaited_once_with("/papi/v2/b402/supported", {})
+
+    async def test_omits_permit2_capability_with_invalid_exact_key(self) -> None:
+        now = [100.0]
+        invalid_extras = (
+            {**USDC_SUPPORTED_EXTRA, "signerAddress": "invalid"},
+            {**USDC_SUPPORTED_EXTRA, "spenderAddress": "invalid"},
+            {**USDC_SUPPORTED_EXTRA, "assetTransferMethod": "permit2-upto"},
+            {**USDC_SUPPORTED_EXTRA, "name": "USDC"},
+            {**USDC_SUPPORTED_EXTRA, "version": "1"},
+        )
+
+        for extra in invalid_extras:
+            with self.subTest(extra=extra):
+                client = self.client(now)
+                client.post = AsyncMock(return_value=_supported_response(kinds=[{
+                    "x402Version": 2,
+                    "scheme": "exact",
+                    "network": "eip155:56",
+                    "extra": extra,
+                }]))
+
+                self.assertEqual(
+                    await client.payment_extras("eip155:56", (USDC_TOKEN,)),
+                    {},
+                )
+
+    async def test_omits_duplicate_full_capability_key(self) -> None:
+        now = [100.0]
+        client = self.client(now)
+        client.post = AsyncMock(return_value=_supported_response(kinds=[
+            {
+                "x402Version": 2,
+                "scheme": "exact",
+                "network": "eip155:56",
+                "extra": USDT_SUPPORTED_EXTRA,
             },
             {
                 "x402Version": 2,
                 "scheme": "exact",
                 "network": "eip155:56",
-                "extra": SUPPORTED_EXTRA,
-            },
-            {
-                "x402Version": 1,
-                "scheme": "exact",
-                "network": "eip155:56",
-                "extra": {**SUPPORTED_EXTRA, "name": "Unrelated"},
+                "extra": copy.deepcopy(USDT_SUPPORTED_EXTRA),
             },
         ]))
 
-        domains = (
-            ("United Stables", "1"),
-            ("World Liberty Financial USD", "1"),
-        )
-        extras = await client.payment_extras("eip155:56", domains)
-
-        self.assertEqual(list(extras), list(domains))
-        self.assertEqual(extras[domains[0]], SUPPORTED_EXTRA)
-        self.assertEqual(extras[domains[1]], USD1_SUPPORTED_EXTRA)
-        self.assertEqual(client.post.await_count, 1)
-
-    async def test_returns_only_supported_domain_or_empty_result(self) -> None:
-        now = [100.0]
-        domains = (
-            ("United Stables", "1"),
-            ("World Liberty Financial USD", "1"),
-        )
-        client = self.client(now)
-        client.post = AsyncMock(return_value=_supported_response(kinds=[{
-            "x402Version": 2,
-            "scheme": "exact",
-            "network": "eip155:56",
-            "extra": USD1_SUPPORTED_EXTRA,
-        }]))
-
         self.assertEqual(
-            await client.payment_extras("eip155:56", domains),
-            {domains[1]: USD1_SUPPORTED_EXTRA},
-        )
-
-        empty_client = self.client(now)
-        empty_client.post = AsyncMock(
-            return_value=_supported_response(kinds=[])
-        )
-        self.assertEqual(
-            await empty_client.payment_extras("eip155:56", domains),
+            await client.payment_extras("eip155:56", (USDT_TOKEN,)),
             {},
         )
-
-    async def test_payment_extras_returns_defensive_copies_from_cache(self) -> None:
-        now = [100.0]
-        client = self.client(now)
-        client.post = AsyncMock(return_value=_supported_response(kinds=[{
-            "x402Version": 2,
-            "scheme": "exact",
-            "network": "eip155:56",
-            "extra": SUPPORTED_EXTRA,
-        }]))
-        domain = ("United Stables", "1")
-
-        first = await client.payment_extras("eip155:56", (domain,))
-        first[domain]["signerAddress"] = "changed"
-        second = await client.payment_extras("eip155:56", (domain,))
-
-        self.assertEqual(second[domain], SUPPORTED_EXTRA)
-        self.assertEqual(client.post.await_count, 1)
 
     async def test_refreshes_supported_kinds_after_one_hour(self) -> None:
         now = [100.0]
         client = self.client(now)
         client.post = AsyncMock(return_value=_supported_response())
 
-        await client.payment_extra("eip155:56", "United Stables", "1")
+        await client.payment_extras("eip155:56", TOKENS)
         now[0] += 3_601
-        await client.payment_extra("eip155:56", "United Stables", "1")
+        await client.payment_extras("eip155:56", TOKENS)
 
         self.assertEqual(client.post.await_count, 2)
 
-    async def test_rejects_missing_matching_kind(self) -> None:
+    async def test_returns_empty_when_no_capability_matches(self) -> None:
         now = [100.0]
         client = self.client(now)
         client.post = AsyncMock(return_value=_supported_response(kinds=[]))
 
-        with self.assertRaisesRegex(B402RejectedError, "does not support"):
-            await client.payment_extra("eip155:56", "United Stables", "1")
-
-    async def test_requires_a_valid_signer_address(self) -> None:
-        now = [100.0]
-        client = self.client(now)
-        extra = {
-            **SUPPORTED_EXTRA,
-            "signerAddress": "invalid",
-        }
-        client.post = AsyncMock(return_value=_supported_response(kinds=[{
-            "x402Version": 2,
-            "scheme": "exact",
-            "network": "eip155:56",
-            "extra": extra,
-        }]))
-
-        with self.assertRaisesRegex(B402RejectedError, "does not support"):
-            await client.payment_extra("eip155:56", "United Stables", "1")
+        self.assertEqual(await client.payment_extras("eip155:56", TOKENS), {})
 
 
-PAYMENT_REQUIREMENT = {
+PERMIT2_PAYMENT_REQUIREMENT = {
     "scheme": "exact",
     "network": "eip155:56",
     "amount": "210000000000000000",
-    "asset": "0xcE24439F2D9C6a2289F741120FE202248B666666",
+    "asset": USDC_TOKEN.address,
     "payTo": "0xd10bddc20e4dc42a1a19a9653e994991e25b8153",
     "maxTimeoutSeconds": 600,
-    "extra": SUPPORTED_EXTRA,
+    "extra": USDC_SUPPORTED_EXTRA,
 }
-PAYMENT_PAYLOAD = {
+PERMIT2_PAYMENT_PAYLOAD = {
     "x402Version": 2,
     "resource": {
         "url": "https://api.example.test/x402/analyze/async",
         "description": "Stock analysis report",
         "mimeType": "application/json",
     },
-    "accepted": PAYMENT_REQUIREMENT,
+    "accepted": PERMIT2_PAYMENT_REQUIREMENT,
     "payload": {
-        "signature": "0x" + "12" * 65,
-        "authorization": {
-            "from": "0x2222222222222222222222222222222222222222",
-            "to": PAYMENT_REQUIREMENT["payTo"],
-            "value": PAYMENT_REQUIREMENT["amount"],
-            "validAfter": "0",
-            "validBefore": "1785485400",
-            "nonce": "0x" + "34" * 32,
+        "permit2Authorization": {
+            "from": "0x7777777777777777777777777777777777777777",
+            "to": PERMIT2_PAYMENT_REQUIREMENT["payTo"],
+            "value": PERMIT2_PAYMENT_REQUIREMENT["amount"],
+            "nonce": "123",
+            "deadline": "1785485400",
         },
+        "signature": "0x" + "12" * 65,
     },
 }
 
 
+class SettlementOutcomeTests(unittest.TestCase):
+    def test_accepts_typed_settlement_outcomes(self) -> None:
+        self.assertEqual(
+            SettlementOutcome("settled", transaction="0xsettled"),
+            SettlementOutcome("settled", transaction="0xsettled"),
+        )
+        self.assertEqual(
+            SettlementOutcome("pending", transaction="0xpending").status,
+            "pending",
+        )
+        self.assertEqual(
+            SettlementOutcome("rejected", reason="insufficient_funds").reason,
+            "insufficient_funds",
+        )
+
+    def test_rejects_inconsistent_or_invalid_outcomes(self) -> None:
+        invalid = (
+            ("settled", None),
+            ("pending", ""),
+            ("pending", "contains space"),
+            ("rejected", "0xunexpected"),
+        )
+        for status, transaction in invalid:
+            with self.subTest(status=status, transaction=transaction):
+                with self.assertRaises(ValueError):
+                    SettlementOutcome(status, transaction=transaction)  # type: ignore[arg-type]
+
+    def test_validates_bounded_printable_settlement_references(self) -> None:
+        self.assertTrue(valid_settlement_reference("!"))
+        self.assertTrue(valid_settlement_reference("~" * 4096))
+        self.assertFalse(valid_settlement_reference(""))
+        self.assertFalse(valid_settlement_reference("a" * 4097))
+        self.assertFalse(valid_settlement_reference("contains space"))
+        self.assertFalse(valid_settlement_reference(True))
+
+
 class B402SettlementTests(unittest.IsolatedAsyncioTestCase):
-    def client(self) -> B402Client:
+    def client(
+        self,
+        *,
+        http: _RecordingHttpClient | None = None,
+    ) -> B402Client:
         config = B402Config.from_env(_environment())
         assert config is not None
-        client = B402Client(config)
-        client.payment_extra = AsyncMock(return_value=SUPPORTED_EXTRA)
+        client = B402Client(
+            config,
+            http_client_factory=(lambda: http) if http is not None else None,
+        )
+        client.payment_extras = AsyncMock(return_value={
+            "USDC": USDC_SUPPORTED_EXTRA,
+        })
         return client
 
     async def test_verifies_before_settling_the_identical_envelope(self) -> None:
@@ -390,14 +444,17 @@ class B402SettlementTests(unittest.IsolatedAsyncioTestCase):
                     "transaction": "0x" + "12" * 32,
                     "payer": "0x2222222222222222222222222222222222222222",
                     "network": "eip155:56",
-                    "amount": PAYMENT_REQUIREMENT["amount"],
+                    "amount": PERMIT2_PAYMENT_REQUIREMENT["amount"],
                 },
             },
         ])
 
-        transaction = await client.verify_and_settle(PAYMENT_PAYLOAD)
+        outcome = await client.verify_and_settle(PERMIT2_PAYMENT_PAYLOAD)
 
-        self.assertEqual(transaction, "0x" + "12" * 32)
+        self.assertEqual(
+            outcome,
+            SettlementOutcome("settled", transaction="0x" + "12" * 32),
+        )
         self.assertEqual(
             [call.args[0] for call in client.post.await_args_list],
             ["/papi/v2/b402/verify", "/papi/v2/b402/settle"],
@@ -405,13 +462,42 @@ class B402SettlementTests(unittest.IsolatedAsyncioTestCase):
         verify_body = client.post.await_args_list[0].args[1]
         settle_body = client.post.await_args_list[1].args[1]
         self.assertEqual(verify_body, settle_body)
-        self.assertEqual(verify_body["paymentPayload"], PAYMENT_PAYLOAD)
+        self.assertEqual(verify_body["paymentPayload"], PERMIT2_PAYMENT_PAYLOAD)
         self.assertEqual(
             verify_body["paymentRequirements"],
-            PAYMENT_REQUIREMENT,
+            PERMIT2_PAYMENT_REQUIREMENT,
+        )
+        client.payment_extras.assert_awaited_once_with(
+            "eip155:56",
+            (USDC_TOKEN,),
         )
 
-    async def test_explicit_verification_rejection_stops_settlement(self) -> None:
+    async def test_settle_only_skips_verify(self) -> None:
+        client = self.client()
+        client.post = AsyncMock(return_value={
+            "code": "000000",
+            "message": "success",
+            "data": {
+                "success": True,
+                "transaction": "0xsettled",
+                "payer": "0x" + "22" * 20,
+                "network": "eip155:56",
+                "amount": PERMIT2_PAYMENT_REQUIREMENT["amount"],
+            },
+        })
+
+        settled = await client.settle_only(PERMIT2_PAYMENT_PAYLOAD)
+
+        self.assertEqual(
+            settled,
+            SettlementOutcome("settled", transaction="0xsettled"),
+        )
+        self.assertEqual(
+            [call.args[0] for call in client.post.await_args_list],
+            ["/papi/v2/b402/settle"],
+        )
+
+    async def test_explicit_verification_rejection_is_typed(self) -> None:
         client = self.client()
         client.post = AsyncMock(return_value={
             "code": "000000",
@@ -423,15 +509,18 @@ class B402SettlementTests(unittest.IsolatedAsyncioTestCase):
             },
         })
 
-        with self.assertRaisesRegex(B402RejectedError, "insufficient_funds"):
-            await client.verify_and_settle(PAYMENT_PAYLOAD)
+        outcome = await client.verify_and_settle(PERMIT2_PAYMENT_PAYLOAD)
 
+        self.assertEqual(
+            outcome,
+            SettlementOutcome("rejected", reason="insufficient_funds"),
+        )
         client.post.assert_awaited_once()
 
-    async def test_substituted_valid_signer_is_rejected_before_verify(self) -> None:
+    async def test_substituted_exact_extra_is_rejected_before_verify(self) -> None:
         client = self.client()
         client.post = AsyncMock()
-        substituted = copy.deepcopy(PAYMENT_PAYLOAD)
+        substituted = copy.deepcopy(PERMIT2_PAYMENT_PAYLOAD)
         substituted["accepted"]["extra"]["signerAddress"] = "0x" + "22" * 20
 
         with self.assertRaisesRegex(
@@ -442,55 +531,69 @@ class B402SettlementTests(unittest.IsolatedAsyncioTestCase):
 
         client.post.assert_not_awaited()
 
-    async def test_prebroadcast_settlement_failure_is_explicit(self) -> None:
+    async def test_prebroadcast_settlement_failure_is_rejected(self) -> None:
         client = self.client()
-        client.post = AsyncMock(side_effect=[
-            {
-                "code": "000000",
-                "message": "success",
-                "data": {"isValid": True, "payer": "0x" + "22" * 20},
+        client.post = AsyncMock(return_value={
+            "code": "000000",
+            "message": "success",
+            "data": {
+                "success": False,
+                "transaction": "",
+                "payer": "0x" + "22" * 20,
+                "network": "",
+                "errorReason": "insufficient_funds",
             },
-            {
-                "code": "000000",
-                "message": "success",
-                "data": {
-                    "success": False,
-                    "transaction": "",
-                    "payer": "0x" + "22" * 20,
-                    "network": "",
-                    "errorReason": "insufficient_funds",
-                },
-            },
-        ])
+        })
 
-        with self.assertRaisesRegex(B402RejectedError, "insufficient_funds"):
-            await client.verify_and_settle(PAYMENT_PAYLOAD)
+        outcome = await client.settle_only(PERMIT2_PAYMENT_PAYLOAD)
 
-    async def test_broadcast_pending_settlement_is_indeterminate(self) -> None:
+        self.assertEqual(
+            outcome,
+            SettlementOutcome("rejected", reason="insufficient_funds"),
+        )
+
+    async def test_broadcast_settlement_is_pending(self) -> None:
         client = self.client()
-        client.post = AsyncMock(side_effect=[
-            {
-                "code": "000000",
-                "message": "success",
-                "data": {"isValid": True, "payer": "0x" + "22" * 20},
+        client.post = AsyncMock(return_value={
+            "code": "000000",
+            "message": "success",
+            "data": {
+                "success": False,
+                "transaction": "0xpending",
+                "payer": "0x" + "22" * 20,
+                "network": "eip155:56",
+                "errorReason": "invalid_transaction_state",
             },
-            {
-                "code": "000000",
-                "message": "success",
-                "data": {
-                    "success": False,
-                    "transaction": "0x" + "56" * 32,
-                    "payer": "0x" + "22" * 20,
-                    "network": "eip155:56",
-                    "errorReason": "invalid_transaction_state",
-                },
-            },
-        ])
+        })
 
-        with self.assertRaises(B402IndeterminateError):
-            await client.verify_and_settle(PAYMENT_PAYLOAD)
+        outcome = await client.settle_only(PERMIT2_PAYMENT_PAYLOAD)
 
-    async def test_malformed_verify_envelope_is_indeterminate(self) -> None:
+        self.assertEqual(
+            outcome,
+            SettlementOutcome("pending", transaction="0xpending"),
+        )
+
+    async def test_malformed_settlement_results_are_indeterminate(self) -> None:
+        malformed_data = (
+            {},
+            {"success": True, "transaction": ""},
+            {"success": True, "transaction": "contains space"},
+            {"success": False, "transaction": None},
+            {"success": "true", "transaction": "0xsettled"},
+        )
+        for data in malformed_data:
+            with self.subTest(data=data):
+                client = self.client()
+                client.post = AsyncMock(return_value={
+                    "code": "000000",
+                    "message": "success",
+                    "data": data,
+                })
+
+                with self.assertRaises(B402IndeterminateError):
+                    await client.settle_only(PERMIT2_PAYMENT_PAYLOAD)
+
+    async def test_malformed_verify_result_is_indeterminate(self) -> None:
         client = self.client()
         client.post = AsyncMock(return_value={
             "code": "000000",
@@ -499,7 +602,21 @@ class B402SettlementTests(unittest.IsolatedAsyncioTestCase):
         })
 
         with self.assertRaises(B402IndeterminateError):
-            await client.verify_and_settle(PAYMENT_PAYLOAD)
+            await client.verify_and_settle(PERMIT2_PAYMENT_PAYLOAD)
+
+    async def test_transport_auth_and_server_failures_are_indeterminate(self) -> None:
+        failures = (
+            _RecordingHttpClient(error=OSError("connection reset")),
+            _RecordingHttpClient(_FakeResponse(401, {})),
+            _RecordingHttpClient(_FakeResponse(403, {})),
+            _RecordingHttpClient(_FakeResponse(500, {})),
+        )
+        for http in failures:
+            with self.subTest(http=http):
+                client = self.client(http=http)
+
+                with self.assertRaises(B402IndeterminateError):
+                    await client.settle_only(PERMIT2_PAYMENT_PAYLOAD)
 
 
 if __name__ == "__main__":
