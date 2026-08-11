@@ -10,7 +10,10 @@
     "start": "node --env-file=.env dist/index.js",
     "dev": "npx tsx --env-file=.env src/index.ts",
     "x402:async": "npx tsx --env-file=.env src/x402-async.ts",
-    "x402:free": "npx tsx --env-file=.env src/x402free.ts"
+    "x402:free": "npx tsx --env-file=.env src/x402free.ts",
+    "x402:allowance": "npx tsx --env-file=.env src/x402-permit2.ts allowance",
+    "x402:approve": "npx tsx --env-file=.env src/x402-permit2.ts approve",
+    "x402:revoke": "npx tsx --env-file=.env src/x402-permit2.ts revoke"
   },
   "dependencies": {
     "ethers": "^6.13.0",

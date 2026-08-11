@@ -11,7 +11,19 @@ import {
   type PaidPaymentChallenge,
   type PaymentTokenSymbol,
 } from "./x402-payment.js";
-import { buildPermit2PaymentProof } from "./x402-permit2.js";
+import {
+  PERMIT2_ALLOWANCE_TARGET,
+  PERMIT2_PAYMENT_MINIMUM,
+  approvePermit2Allowance,
+  assertPermit2PaymentReady,
+  buildPermit2PaymentProof,
+  readPermit2Allowance,
+  revokePermit2Allowance,
+  runPermit2AllowanceCli,
+  type Permit2AllowanceContext,
+  type Permit2CliDependencies,
+  type Permit2TokenContract,
+} from "./x402-permit2.js";
 
 const NOW = 1_785_484_800;
 const TTL_SECONDS = 600;
@@ -269,9 +281,220 @@ test("buildPaymentProof dispatches Permit2 without provider or typed-data metada
     PAYMENT_TOKENS.USDT.asset,
   );
 
-  const permit2Module = readFileSync(
-    new URL("./x402-permit2.js", import.meta.url),
+  const paymentModule = readFileSync(
+    new URL("./x402-payment.js", import.meta.url),
     "utf8",
   );
-  assert.doesNotMatch(permit2Module, /JsonRpcProvider|BrowserProvider|new Provider/);
+  assert.doesNotMatch(paymentModule, /\.approve\s*\(/);
+});
+
+const WALLET = "0x3333333333333333333333333333333333333333";
+const RPC_URL = "https://bsc.example.test";
+
+interface FakeAllowanceRuntime {
+  context: Permit2AllowanceContext;
+  approvals: Array<{ spender: string; amount: bigint }>;
+  prompts: string[];
+  logs: string[];
+}
+
+function fakeAllowanceRuntime(options: {
+  allowance?: unknown;
+  chainId?: bigint | number;
+  receiptStatuses?: Array<bigint | number | null>;
+  answer?: string;
+  yes?: boolean;
+  token?: string;
+} = {}): FakeAllowanceRuntime {
+  const approvals: Array<{ spender: string; amount: bigint }> = [];
+  const prompts: string[] = [];
+  const logs: string[] = [];
+  const statuses = [...(options.receiptStatuses ?? [1])];
+  const contract: Permit2TokenContract = {
+    allowance: async () => options.allowance ?? 0n,
+    approve: async (spender, amount) => {
+      approvals.push({ spender, amount });
+      const status = statuses.shift() ?? 1;
+      return { wait: async () => ({ status }) };
+    },
+  };
+  return {
+    approvals,
+    prompts,
+    logs,
+    context: {
+      token: options.token ?? "USDC",
+      walletAddress: WALLET,
+      rpcUrl: RPC_URL,
+      provider: {
+        getNetwork: async () => ({ chainId: options.chainId ?? 56n }),
+      },
+      contract,
+      yes: options.yes ?? false,
+      confirm: async (question) => {
+        prompts.push(question);
+        return options.answer ?? "yes";
+      },
+      log: (message) => logs.push(message),
+    },
+  };
+}
+
+test("Permit2 allowance policy uses exact 0.21 minimum and 50-token target", () => {
+  assert.equal(PERMIT2_PAYMENT_MINIMUM, 210000000000000000n);
+  assert.equal(PERMIT2_ALLOWANCE_TARGET, 50000000000000000000n);
+  assert.throws(
+    () => assertPermit2PaymentReady(PERMIT2_PAYMENT_MINIMUM - 1n),
+    /below 0\.21/,
+  );
+  assert.doesNotThrow(() => assertPermit2PaymentReady(PERMIT2_PAYMENT_MINIMUM));
+  assert.doesNotThrow(() => assertPermit2PaymentReady(49790000000000000000n));
+  assert.doesNotThrow(() => assertPermit2PaymentReady(PERMIT2_ALLOWANCE_TARGET));
+  assert.throws(
+    () => assertPermit2PaymentReady(PERMIT2_ALLOWANCE_TARGET + 1n),
+    /exceeds 50/,
+  );
+});
+
+test("readPermit2Allowance checks chain 56 and canonical Permit2 spender", async () => {
+  const runtime = fakeAllowanceRuntime({ allowance: PERMIT2_ALLOWANCE_TARGET });
+  let actualOwner = "";
+  let actualSpender = "";
+  runtime.context.contract.allowance = async (owner, spender) => {
+    actualOwner = owner;
+    actualSpender = spender;
+    return PERMIT2_ALLOWANCE_TARGET;
+  };
+
+  assert.equal(await readPermit2Allowance(runtime.context), PERMIT2_ALLOWANCE_TARGET);
+  assert.equal(actualOwner, WALLET);
+  assert.equal(actualSpender, PERMIT2_ADDRESS);
+});
+
+test("readPermit2Allowance rejects non-BSC networks, invalid RPC URLs, and non-bigint reads", async () => {
+  await assert.rejects(
+    readPermit2Allowance(fakeAllowanceRuntime({ chainId: 97n }).context),
+    /chain ID 56/,
+  );
+  const badUrl = fakeAllowanceRuntime().context;
+  badUrl.rpcUrl = "not a URL";
+  await assert.rejects(readPermit2Allowance(badUrl), /BSC_RPC_URL/);
+  await assert.rejects(
+    readPermit2Allowance(fakeAllowanceRuntime({ allowance: "50000000000000000000" }).context),
+    /bigint/,
+  );
+});
+
+test("allowance commands reject U and USD1", async () => {
+  for (const token of ["U", "USD1"]) {
+    await assert.rejects(
+      readPermit2Allowance(fakeAllowanceRuntime({ token }).context),
+      /exactly USDC or USDT/,
+    );
+  }
+});
+
+test("approve sends one exact 50-token approval from zero", async () => {
+  const runtime = fakeAllowanceRuntime({ allowance: 0n, yes: true });
+
+  await approvePermit2Allowance(runtime.context);
+
+  assert.deepEqual(runtime.approvals, [{
+    spender: PERMIT2_ADDRESS,
+    amount: PERMIT2_ALLOWANCE_TARGET,
+  }]);
+  assert.match(runtime.logs.join("\n"), /Transaction count: 1/);
+});
+
+test("approve resets non-zero 49.79 allowance to zero before exact 50", async () => {
+  const runtime = fakeAllowanceRuntime({
+    allowance: 49790000000000000000n,
+    yes: true,
+    receiptStatuses: [1n, 1n],
+  });
+
+  await approvePermit2Allowance(runtime.context);
+
+  assert.deepEqual(runtime.approvals, [
+    { spender: PERMIT2_ADDRESS, amount: 0n },
+    { spender: PERMIT2_ADDRESS, amount: PERMIT2_ALLOWANCE_TARGET },
+  ]);
+  assert.match(runtime.logs.join("\n"), /Transaction count: 2/);
+});
+
+test("approve resets an above-50 allowance instead of extending it", async () => {
+  const runtime = fakeAllowanceRuntime({
+    allowance: PERMIT2_ALLOWANCE_TARGET + 1n,
+    yes: true,
+  });
+
+  await approvePermit2Allowance(runtime.context);
+
+  assert.deepEqual(runtime.approvals.map(({ amount }) => amount), [
+    0n,
+    PERMIT2_ALLOWANCE_TARGET,
+  ]);
+});
+
+test("approve is a no-op when allowance is exactly 50", async () => {
+  const runtime = fakeAllowanceRuntime({ allowance: PERMIT2_ALLOWANCE_TARGET });
+
+  await approvePermit2Allowance(runtime.context);
+
+  assert.deepEqual(runtime.approvals, []);
+  assert.deepEqual(runtime.prompts, []);
+  assert.match(runtime.logs.join("\n"), /Transaction count: 0/);
+});
+
+test("approve refuses a failed transaction receipt and does not continue", async () => {
+  const runtime = fakeAllowanceRuntime({
+    allowance: 1n,
+    yes: true,
+    receiptStatuses: [0],
+  });
+
+  await assert.rejects(approvePermit2Allowance(runtime.context), /receipt status 1/);
+  assert.deepEqual(runtime.approvals.map(({ amount }) => amount), [0n]);
+});
+
+test("approve requires the exact interactive answer yes", async () => {
+  for (const answer of ["y", "YES", " yes ", "no"]) {
+    const runtime = fakeAllowanceRuntime({ allowance: 0n, answer });
+    await assert.rejects(approvePermit2Allowance(runtime.context), /declined/);
+    assert.deepEqual(runtime.approvals, []);
+  }
+});
+
+test("approve --yes bypasses the interactive prompt", async () => {
+  const runtime = fakeAllowanceRuntime({ allowance: 0n, answer: "no", yes: true });
+
+  await approvePermit2Allowance(runtime.context);
+
+  assert.deepEqual(runtime.prompts, []);
+  assert.equal(runtime.approvals.length, 1);
+});
+
+test("revoke sends only a zero approval to canonical Permit2", async () => {
+  const runtime = fakeAllowanceRuntime({ allowance: PERMIT2_ALLOWANCE_TARGET, yes: true });
+
+  await revokePermit2Allowance(runtime.context);
+
+  assert.deepEqual(runtime.approvals, [{ spender: PERMIT2_ADDRESS, amount: 0n }]);
+  assert.match(runtime.logs.join("\n"), /Transaction count: 1/);
+});
+
+test("CLI dispatches allowance, approve --yes, and revoke with injected mocks", async () => {
+  const actions: string[] = [];
+  const dependencies: Permit2CliDependencies = {
+    createContext: async ({ token, yes }) => {
+      actions.push(`${token}:${yes}`);
+      return fakeAllowanceRuntime({ token, yes, allowance: 0n }).context;
+    },
+  };
+
+  await runPermit2AllowanceCli(["allowance", "USDC"], {}, dependencies);
+  await runPermit2AllowanceCli(["approve", "USDT", "--yes"], {}, dependencies);
+  await runPermit2AllowanceCli(["revoke", "USDC", "--yes"], {}, dependencies);
+
+  assert.deepEqual(actions, ["USDC:false", "USDT:true", "USDC:true"]);
 });
