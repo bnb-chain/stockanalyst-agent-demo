@@ -5,8 +5,8 @@ import unittest
 from concurrent.futures import ThreadPoolExecutor
 
 from x402_promo import (
-    PromoRateLimitExceeded,
     PromoRateLimiter,
+    PromoRateLimitExceeded,
     promo_free_mode,
 )
 

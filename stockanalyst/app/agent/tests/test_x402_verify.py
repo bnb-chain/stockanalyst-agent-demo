@@ -10,9 +10,9 @@ from eth_account import Account
 from eth_utils import keccak, to_checksum_address
 from stockanalyst.app.agent import x402_verify as verify
 from stockanalyst.app.agent.x402_tokens import (
-    PaymentToken,
     U_TOKEN,
     USD1_TOKEN,
+    PaymentToken,
 )
 
 NOW = 1_785_340_800
@@ -122,11 +122,10 @@ class NetworkConfigurationTests(unittest.TestCase):
 
     def test_rejects_invalid_explicit_token_address(self) -> None:
         for value in ("", "0x1234", "not-an-address", "0x" + "gg" * 20):
-            with self.subTest(value=value):
-                with self.assertRaisesRegex(RuntimeError, "X402_TOKEN_ADDRESS"):
-                    verify._resolve_x402_token_address(
-                        {"X402_TOKEN_ADDRESS": value}
-                    )
+            with self.subTest(value=value), self.assertRaisesRegex(
+                RuntimeError, "X402_TOKEN_ADDRESS"
+            ):
+                verify._resolve_x402_token_address({"X402_TOKEN_ADDRESS": value})
 
     def test_requirement_and_domain_use_the_same_mainnet_config(self) -> None:
         requirement = verify.build_payment_requirement(

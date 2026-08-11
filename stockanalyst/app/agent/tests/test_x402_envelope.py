@@ -395,6 +395,7 @@ class X402EnvelopeTests(unittest.IsolatedAsyncioTestCase):
 class X402EnvelopeExecutorTests(unittest.IsolatedAsyncioTestCase):
     async def test_executor_log_and_error_exclude_malformed_source_ip(self) -> None:
         from a2a.utils.errors import ServerError
+
         from executor import SellerAgentExecutor
 
         marker = "198.51.100.8-attacker-marker"

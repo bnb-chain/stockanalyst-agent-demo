@@ -8,6 +8,13 @@ from unittest.mock import AsyncMock, Mock, patch
 
 from stockanalyst.app.agent import x402_handler as handler_module
 from stockanalyst.app.agent import x402_verify
+from stockanalyst.app.agent.tests.test_x402_verify import (
+    NOW as SIGNED_NOW,
+)
+from stockanalyst.app.agent.tests.test_x402_verify import (
+    signed_free_proof,
+    signed_proof,
+)
 from stockanalyst.app.agent.x402_handler import X402Handler
 from stockanalyst.app.agent.x402_job_service import (
     CreateJobResult,
@@ -15,11 +22,6 @@ from stockanalyst.app.agent.x402_job_service import (
     X402JobError,
 )
 from stockanalyst.app.agent.x402_tokens import TOKENS, U_TOKEN, USD1_TOKEN
-from stockanalyst.app.agent.tests.test_x402_verify import (
-    NOW as SIGNED_NOW,
-    signed_free_proof,
-    signed_proof,
-)
 
 JOB_ID = "x402_" + "a" * 32
 EXPIRES_AT = 1_785_945_600_123

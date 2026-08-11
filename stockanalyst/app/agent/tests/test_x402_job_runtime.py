@@ -17,6 +17,15 @@ from unittest.mock import AsyncMock, patch
 from eth_utils import to_checksum_address
 from web3 import Web3
 
+from report_renderer import render_report
+from report_schema import StockReport
+from tests.test_x402_job_service import (
+    NOW as JOB_NOW,
+)
+from tests.test_x402_job_service import (
+    MemoryJobStore,
+    seed_settling_job,
+)
 from x402_job_service import (
     X402JobError,
     X402JobService,
@@ -24,16 +33,8 @@ from x402_job_service import (
 )
 from x402_job_store import X402JobStore
 from x402_promo import promo_free_mode
-from x402_verify import U_TOKEN_ADDRESS, VerifiedPayment
 from x402_tokens import U_TOKEN, USD1_TOKEN, token_by_asset
-from report_renderer import render_report
-from report_schema import StockReport
-
-from tests.test_x402_job_service import (
-    MemoryJobStore,
-    NOW as JOB_NOW,
-    seed_settling_job,
-)
+from x402_verify import U_TOKEN_ADDRESS, VerifiedPayment
 
 MAIN_PATH = Path(__file__).parents[1] / "main.py"
 STUDIO_PATH = Path(__file__).parents[1] / "studio.toml"
@@ -217,8 +218,10 @@ class X402JobRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             captured.output,
             [
-                "WARNING:test.x402.stream:report parse/validation failed "
-                "(ValidationError)"
+                (
+                    "WARNING:test.x402.stream:report parse/validation failed "
+                    "(ValidationError)"
+                )
             ],
         )
 
@@ -372,11 +375,19 @@ class X402JobRuntimeTests(unittest.IsolatedAsyncioTestCase):
                         self,
                         address: str,
                         nonce: bytes,
+                        observed_calls: list[tuple[str, bytes]] = observed_calls,
                     ) -> AuthorizationState:
                         observed_calls.append((address, nonce))
                         return AuthorizationState(self._used)
 
-                def contract(*, address: str, abi: list[dict]) -> Any:
+                def contract(
+                    *,
+                    address: str,
+                    abi: list[dict],
+                    real_web3: Web3 = real_web3,
+                    observed_contracts: list[str] = observed_contracts,
+                    states: dict[str, bool] = states,
+                ) -> Any:
                     self.assertTrue(abi)
                     validated = real_web3.eth.contract(
                         address=address,
@@ -400,7 +411,7 @@ class X402JobRuntimeTests(unittest.IsolatedAsyncioTestCase):
                 )
                 build = _load_runtime_functions(
                     settle=settle,
-                    get_client=lambda: client,
+                    get_client=lambda client=client: client,
                 )["build_x402_job_service"]
                 service = build(
                     {

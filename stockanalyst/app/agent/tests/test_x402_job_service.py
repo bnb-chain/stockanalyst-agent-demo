@@ -24,8 +24,8 @@ from x402_job_service import (
 )
 from x402_job_store import JobConflict, StoredJob
 from x402_promo import PromoRateLimiter
-from x402_verify import CHAIN_ID, VerifiedPayment, validate_payment_proof
 from x402_tokens import U_TOKEN, USD1_TOKEN
+from x402_verify import CHAIN_ID, VerifiedPayment, validate_payment_proof
 
 ADDRESS = "0x1111111111111111111111111111111111111111"
 NONCE = "0x" + "22" * 32

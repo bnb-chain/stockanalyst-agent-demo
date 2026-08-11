@@ -28,9 +28,9 @@ from typing import Any
 from eth_account import Account
 
 try:
-    from .x402_tokens import PaymentToken, U_TOKEN, token_by_asset
+    from .x402_tokens import U_TOKEN, PaymentToken, token_by_asset
 except ImportError:  # Direct imports from stockanalyst/app/agent.
-    from x402_tokens import PaymentToken, U_TOKEN, token_by_asset
+    from x402_tokens import U_TOKEN, PaymentToken, token_by_asset
 
 _log = logging.getLogger("seller-agent.x402.verify")
 

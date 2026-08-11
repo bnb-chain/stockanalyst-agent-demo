@@ -26,18 +26,8 @@ from urllib.parse import parse_qs
 import httpx
 
 from competition_reporting import report_competition_call
+
 if __package__:
-    from .x402_verify import (
-        CHAIN_ID,
-        FREE_TIER_LIMIT,
-        PRICE_WEI,
-        build_free_payment_challenge,
-        build_payment_challenge,
-        build_payment_requirement,
-        decode_payment_signature,
-        verify_free_payment_proof,
-    )
-    from .x402_tokens import TOKENS, U_TOKEN, supported_assets
     from .b402_client import (
         B402Client,
         B402Config,
@@ -52,8 +42,8 @@ if __package__:
         X402JobService,
         is_valid_settlement_reference,
     )
-else:
-    from x402_verify import (
+    from .x402_tokens import TOKENS, U_TOKEN, supported_assets
+    from .x402_verify import (
         CHAIN_ID,
         FREE_TIER_LIMIT,
         PRICE_WEI,
@@ -63,7 +53,7 @@ else:
         decode_payment_signature,
         verify_free_payment_proof,
     )
-    from x402_tokens import TOKENS, U_TOKEN, supported_assets
+else:
     from b402_client import (
         B402Client,
         B402Config,
@@ -77,6 +67,17 @@ else:
         X402JobError,
         X402JobService,
         is_valid_settlement_reference,
+    )
+    from x402_tokens import TOKENS, U_TOKEN, supported_assets
+    from x402_verify import (
+        CHAIN_ID,
+        FREE_TIER_LIMIT,
+        PRICE_WEI,
+        build_free_payment_challenge,
+        build_payment_challenge,
+        build_payment_requirement,
+        decode_payment_signature,
+        verify_free_payment_proof,
     )
 
 logger = logging.getLogger("seller-agent.x402")

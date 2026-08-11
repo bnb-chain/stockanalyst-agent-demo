@@ -17,7 +17,7 @@ from typing import Any
 
 from prompt_builder import _build_stock_analysis_prompt
 from x402_job_store import JobConflict, StoredJob, X402JobStore
-from x402_promo import PromoRateLimitExceeded, PromoRateLimiter
+from x402_promo import PromoRateLimiter, PromoRateLimitExceeded
 from x402_tokens import U_TOKEN, token_by_asset
 from x402_verify import CHAIN_ID, VerifiedPayment, validate_payment_proof
 
