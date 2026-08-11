@@ -43,6 +43,7 @@ if __package__:
         is_valid_settlement_reference,
     )
     from .x402_tokens import TOKENS, U_TOKEN, supported_assets
+    from .x402_settlement import SettlementOutcome
     from .x402_verify import (
         CHAIN_ID,
         FREE_TIER_LIMIT,
@@ -69,6 +70,7 @@ else:
         is_valid_settlement_reference,
     )
     from x402_tokens import TOKENS, U_TOKEN, supported_assets
+    from x402_settlement import SettlementOutcome
     from x402_verify import (
         CHAIN_ID,
         FREE_TIER_LIMIT,
@@ -142,21 +144,37 @@ else:
     )
 
 
-async def _settle_via_facilitator(proof_b64: str) -> tuple[bool, str]:
+async def _settle_via_facilitator(
+    proof_b64: str,
+    mode: str,
+) -> SettlementOutcome:
     """Execute on-chain settlement via configured backend.
 
     Priority: B402 V2 (RSA-SHA256) → generic facilitator → demo mode → fail closed.
 
-    Returns (True, txHash) on success, (False, error_reason) on failure.
+    Returns a typed settlement outcome; unknown remote outcomes stay retryable.
     """
     # Decode proof (shared by all settlement paths)
     proof = decode_payment_signature(proof_b64)
     if proof is None:
-        return False, "Payment-Signature is not valid base64 JSON"
+        return SettlementOutcome(
+            "rejected",
+            reason="Payment-Signature is not valid base64 JSON",
+        )
 
     accepted = proof.get("accepted")
     if not isinstance(accepted, dict):
-        return False, "payment not settled: missing V2 accepted requirement"
+        return SettlementOutcome(
+            "rejected",
+            reason="payment not settled: missing V2 accepted requirement",
+        )
+    extra = accepted.get("extra")
+    if not isinstance(extra, dict):
+        return SettlementOutcome(
+            "rejected",
+            reason="payment not settled: missing transfer method",
+        )
+    transfer_method = extra.get("assetTransferMethod")
     payload = {
         "x402Version": 2,
         "paymentPayload": proof,
@@ -166,31 +184,56 @@ async def _settle_via_facilitator(proof_b64: str) -> tuple[bool, str]:
     # ── 1. Binance B402 V2 (RSA-SHA256) ────────────────────────────────────────
     if _B402_CLIENT is not None:
         try:
-            transaction = await _B402_CLIENT.verify_and_settle(proof)
-            logger.info("x402 facilitator outcome=settled backend=b402")
-            return True, transaction
+            if mode == "verify-and-settle":
+                outcome = await _B402_CLIENT.verify_and_settle(proof)
+            elif mode == "settle-only":
+                outcome = await _B402_CLIENT.settle_only(proof)
+            else:
+                return SettlementOutcome(
+                    "rejected",
+                    reason="payment not settled: invalid settlement mode",
+                )
+            if not isinstance(outcome, SettlementOutcome):
+                raise SettlementIndeterminate()
+            logger.info(
+                "x402 facilitator outcome=%s backend=b402",
+                outcome.status,
+            )
+            return outcome
         except B402RejectedError as exc:
             logger.warning("x402 facilitator outcome=rejected backend=b402")
-            return False, str(exc)
+            return SettlementOutcome("rejected", reason=str(exc))
         except B402IndeterminateError as exc:
             raise SettlementIndeterminate() from exc
 
+    if transfer_method != "eip3009":
+        return SettlementOutcome(
+            "rejected",
+            reason="payment not settled: transfer method requires B402",
+        )
+
     # ── 2. Generic x402 facilitator (unauthenticated POST) ─────────────────────
     if FACILITATOR_URL:
-        return await _settle_generic(payload)
+        settled, detail = await _settle_generic(payload)
+        if settled:
+            return SettlementOutcome("settled", transaction=detail)
+        return SettlementOutcome("rejected", reason=detail)
 
     # ── 3. Demo mode (local testing only) ──────────────────────────────────────
     if X402_DEMO_MODE:
         logger.warning(
             "x402: demo mode — EIP-712 sig OK but no on-chain transfer (X402_DEMO_MODE=1)"
         )
-        return True, "demo"
+        return SettlementOutcome("settled", transaction="demo")
 
     # ── 4. Fail closed ─────────────────────────────────────────────────────────
-    return False, (
-        "payment not settled: no settlement backend configured. "
-        "Configure all four B402 V2 settings for production, or "
-        "X402_DEMO_MODE=1 for local testing."
+    return SettlementOutcome(
+        "rejected",
+        reason=(
+            "payment not settled: no settlement backend configured. "
+            "Configure all four B402 V2 settings for production, or "
+            "X402_DEMO_MODE=1 for local testing."
+        ),
     )
 
 
@@ -365,6 +408,7 @@ class X402Handler:
                 "accepts": [],
                 "supportedAssets": supported_assets(),
                 "signingScheme": None,
+                "signingSchemes": [],
                 "facilitator": None,
             })
             return
@@ -380,15 +424,10 @@ class X402Handler:
             requirements,
         )
         accepts = challenge.get("accepts") or []
-        accept = next(
-            (
-                item
-                for item in accepts
-                if str(item.get("asset", "")).lower()
-                == U_TOKEN.address.lower()
-            ),
-            accepts[0],
-        )
+        accept = accepts[0]
+        schemes = list(dict.fromkeys(
+            item["extra"]["assetTransferMethod"] for item in accepts
+        ))
         await _send_json(send, 200, {
             "x402Version":  2,
             "promoFree":    False,
@@ -400,7 +439,8 @@ class X402Handler:
             "payTo":        accept.get("payTo"),
             "accepts":      accepts,
             "supportedAssets": supported_assets(),
-            "signingScheme": "eip3009",
+            "signingScheme": schemes[0],
+            "signingSchemes": schemes,
             "facilitator": (
                 "binance-b402-v2"
                 if self._b402_client is not None
@@ -413,12 +453,12 @@ class X402Handler:
             raise B402IndeterminateError("payment backend unavailable")
         extras = await self._b402_client.payment_extras(
             f"eip155:{CHAIN_ID}",
-            tuple(token.domain for token in TOKENS),
+            TOKENS,
         )
         requirements = [
-            build_payment_requirement(token, extras[token.domain])
+            build_payment_requirement(token, extras[token.symbol])
             for token in TOKENS
-            if token.domain in extras
+            if token.symbol in extras
         ]
         if not requirements:
             raise B402RejectedError(

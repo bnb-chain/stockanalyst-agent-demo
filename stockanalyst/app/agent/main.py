@@ -172,6 +172,10 @@ def build_x402_job_service(
     )
 
     async def authorization_used(payment: VerifiedPayment) -> bool:
+        if payment.transfer_method != "eip3009":
+            raise RuntimeError(
+                "authorizationState is only valid for eip3009"
+            )
         payment_token = token_by_asset(payment.asset)
         if payment_token is None:
             raise X402JobError("invalid_payment_asset")

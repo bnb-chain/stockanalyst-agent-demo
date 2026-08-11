@@ -33,7 +33,7 @@ from x402_job_service import (
 )
 from x402_job_store import X402JobStore
 from x402_promo import promo_free_mode
-from x402_tokens import U_TOKEN, USD1_TOKEN, token_by_asset
+from x402_tokens import U_TOKEN, USDT_TOKEN, USD1_TOKEN, token_by_asset
 from x402_verify import U_TOKEN_ADDRESS, VerifiedPayment
 
 MAIN_PATH = Path(__file__).parents[1] / "main.py"
@@ -495,6 +495,46 @@ class X402JobRuntimeTests(unittest.IsolatedAsyncioTestCase):
 
         with self.assertRaisesRegex(X402JobError, "invalid_payment_asset"):
             await service._authorization_used(payment)
+
+    async def test_authorization_reader_rejects_permit2_before_web3_access(
+        self,
+    ) -> None:
+        get_client = AsyncMock(
+            side_effect=AssertionError("Permit2 must not query authorizationState")
+        )
+        build = _load_runtime_functions(
+            get_client=get_client,
+        )["build_x402_job_service"]
+        service = build(
+            {
+                "X402_JOB_S3_BUCKET": "private-jobs",
+                "X402_JOB_TOKEN_SECRET": "x" * 32,
+            },
+            stream_work=AsyncMock(),
+            s3_client=FakeS3(),
+        )
+        assert service is not None
+        payment = VerifiedPayment(
+            proof={},
+            from_address="0xabcdef1234567890abcdef1234567890abcdef12",
+            to_address="0x" + "34" * 20,
+            value=210_000_000_000_000_000,
+            valid_after=0,
+            valid_before=JOB_NOW // 1000 + 600,
+            nonce="0x" + "56" * 32,
+            nonce_bytes=bytes.fromhex("56" * 32),
+            asset=USDT_TOKEN.address.lower(),
+            token_symbol=USDT_TOKEN.symbol,
+            transfer_method=USDT_TOKEN.transfer_method,
+        )
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "authorizationState is only valid for eip3009",
+        ):
+            await service._authorization_used(payment)
+
+        get_client.assert_not_called()
 
     def test_runtime_busy_combines_erc8183_and_x402_activity(self) -> None:
         runtime_is_busy = _load_runtime_functions()["_runtime_is_busy"]
