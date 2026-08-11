@@ -91,6 +91,21 @@ export class AsyncJobClientError extends Error {
   }
 }
 
+export class PaymentTokenUnavailableError extends AsyncJobClientError {
+  readonly availableTokens: readonly PaymentTokenSymbol[];
+
+  constructor(availableTokens: Iterable<PaymentTokenSymbol>) {
+    const supplied = new Set(availableTokens);
+    const registryOrdered = (
+      Object.keys(PAYMENT_TOKENS) as PaymentTokenSymbol[]
+    ).filter((symbol) => supplied.has(symbol));
+    super("payment_token_unavailable");
+    this.name = "PaymentTokenUnavailableError";
+    this.availableTokens = Object.freeze(registryOrdered);
+    this.message += `; available tokens: ${registryOrdered.join(", ")}`;
+  }
+}
+
 interface JobResponse {
   status: AsyncJobStatus;
   retryAfterMilliseconds: number;
@@ -437,7 +452,9 @@ function parsePaymentChallenge(
     });
   }
   const selected = acceptedBySymbol.get(preferredToken);
-  if (selected === undefined) invalidPaymentChallenge();
+  if (selected === undefined) {
+    throw new PaymentTokenUnavailableError(acceptedBySymbol.keys());
+  }
   const resource: B402PaymentResource = {
     url: resourceUrl,
     description,
@@ -839,7 +856,10 @@ export async function fetchPaymentChallenge(
   } catch (error) {
     if (
       error instanceof AsyncJobClientError
-      && error.code === "invalid_payment_challenge"
+      && (
+        error.code === "invalid_payment_challenge"
+        || error.code === "payment_token_unavailable"
+      )
     ) {
       throw error;
     }
@@ -896,7 +916,10 @@ export async function beginAsyncAnalysis(
   } catch (error) {
     if (
       error instanceof AsyncJobClientError
-      && error.code === "invalid_payment_challenge"
+      && (
+        error.code === "invalid_payment_challenge"
+        || error.code === "payment_token_unavailable"
+      )
     ) {
       throw error;
     }

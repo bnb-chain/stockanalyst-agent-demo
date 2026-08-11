@@ -29,6 +29,69 @@ the Permit2 spender and is not part of `permit2-exact` typed data.
 typed-data spender; the ERC-20 approval target remains canonical Permit2
 `0x000000000022D473030F116dDEE9F6B43aC78BA3`.
 
+## Price and challenge metadata
+
+The active `accepts` list is authoritative. `signingSchemes` is additive and
+lists the deduplicated active methods in `accepts` order. The legacy
+`signingScheme` describes the highest-priority active accept. Clients that do
+not understand `signingSchemes` can continue reading `signingScheme`, while
+new clients should validate the method on their selected exact accept.
+
+## Permit2 exact signature contract
+
+The Permit2 EIP-712 domain is exactly the following three fields and has no
+`version` field:
+
+```json
+{
+  "name": "Permit2",
+  "chainId": 56,
+  "verifyingContract": "0x000000000022D473030F116dDEE9F6B43aC78BA3"
+}
+```
+
+The primary and nested types have this exact field order:
+
+```text
+PermitWitnessTransferFrom(
+  TokenPermissions permitted,
+  address spender,
+  uint256 nonce,
+  uint256 deadline,
+  Witness witness
+)
+TokenPermissions(address token, uint256 amount)
+Witness(address to, uint256 validAfter)
+```
+
+For Permit2, the exact `payload` value on the wire is:
+
+```json
+{
+  "signature": "0x<65-byte signature>",
+  "permit2Authorization": {
+    "permitted": {
+      "token": "<accepted.asset>",
+      "amount": "210000000000000000"
+    },
+    "from": "<payer wallet>",
+    "spender": "<lowercase accepted.extra.spenderAddress>",
+    "nonce": "<uint256 decimal string>",
+    "deadline": "<unix seconds decimal string>",
+    "witness": {
+      "to": "<accepted.payTo>",
+      "validAfter": "<unix seconds decimal string>"
+    }
+  }
+}
+```
+
+Every uint256 wire value (`amount`, `nonce`, `deadline`, and `validAfter`) is a
+canonical decimal string. The authorization `spender` is the lowercase
+canonical form of `accepted.extra.spenderAddress`; the complete
+`accepted.extra` object remains unchanged on the wire. This includes additive
+facilitator metadata.
+
 ## Explicit Permit2 allowance management
 
 Set `BSC_RPC_URL` to an HTTP(S) BSC Mainnet (chain ID 56) RPC URL only when
@@ -70,14 +133,14 @@ needed.
    private job token. Neither proof, signature, job token, nor private report
    URL is printed.
 
-When `pendingSettlementReference` has been durably recorded, Permit2 recovery
-is settle-only with the identical persisted proof and does not call `/verify`
-again. Without a durable `pendingSettlementReference`, other retryable
-create/recovery cases reuse the identical proof but may repeat verify-and-settle
-under B402 idempotency with the same nonce; they create no new signature, nonce,
-or approval. This distinction applies after either a lost POST response or a
-process restart: only the durable server-side pending settlement reference
-proves verification already completed. The proof includes the original
+Only a freshly created Permit2 reservation in the same request uses
+verify-and-settle. Every pre-existing stale Permit2 reservation is recovered
+settle-only with the identical persisted proof, regardless of
+`pendingSettlementReference` or deadline; recovery does not call `/verify`.
+This applies after response loss before a pending marker, response loss before
+the terminal settled transition, a lost POST response, or a process restart.
+Recovery creates no new signature, nonce, or approval and never starts
+analysis before terminal settlement. The proof includes the original
 requirement metadata and request body. Pending and receipt recovery also run
 before current token/RPC configuration is read, so recovery is not blocked by
 a later environment change. A stale lock may be removed only after confirming

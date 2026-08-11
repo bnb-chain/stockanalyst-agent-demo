@@ -190,6 +190,50 @@ test("buildPermit2PaymentProof emits the exact local Permit2 wire proof", async 
   );
 });
 
+test("Permit2 signing canonicalizes a mixed-case spender without changing accepted extra", async () => {
+  const wallet = new Wallet(PRIVATE_KEY);
+  const challenge = permit2Challenge("USDC");
+  const mixedCaseSpender = `0x${"Cd".repeat(20)}`;
+  challenge.accepted.extra.spenderAddress = mixedCaseSpender;
+
+  const proof = decodeProof(await buildPermit2PaymentProof(
+    wallet,
+    challenge,
+    TTL_SECONDS,
+    () => NOW,
+  ));
+  const authorization = proof.payload.permit2Authorization;
+  const domain = {
+    name: "Permit2",
+    chainId: BSC_MAINNET_CHAIN_ID,
+    verifyingContract: PERMIT2_ADDRESS,
+  };
+
+  assert.equal(proof.accepted.extra.spenderAddress, mixedCaseSpender);
+  assert.equal(authorization.spender, mixedCaseSpender.toLowerCase());
+  assert.equal(
+    verifyTypedData(
+      domain,
+      PERMIT2_TYPES,
+      {
+        permitted: {
+          token: authorization.permitted.token,
+          amount: BigInt(authorization.permitted.amount),
+        },
+        spender: authorization.spender,
+        nonce: BigInt(authorization.nonce),
+        deadline: BigInt(authorization.deadline),
+        witness: {
+          to: authorization.witness.to,
+          validAfter: BigInt(authorization.witness.validAfter),
+        },
+      },
+      proof.payload.signature,
+    ),
+    wallet.address,
+  );
+});
+
 test("Permit2 proofs use fresh independent 256-bit nonce values", async () => {
   const wallet = new Wallet(PRIVATE_KEY);
   const challenge = permit2Challenge("USDT");
@@ -344,15 +388,31 @@ function fakeAllowanceRuntime(options: {
 test("Permit2 allowance policy uses exact 0.21 minimum and 50-token target", () => {
   assert.equal(PERMIT2_PAYMENT_MINIMUM, 210000000000000000n);
   assert.equal(PERMIT2_ALLOWANCE_TARGET, 50000000000000000000n);
+  for (const token of ["USDC", "USDT"] as const) {
+    assert.throws(
+      () => assertPermit2PaymentReady(PERMIT2_PAYMENT_MINIMUM - 1n, token),
+      {
+        message: `Permit2 allowance is below 0.21; run npm run x402:approve -- ${token}`,
+      },
+    );
+    assert.doesNotThrow(() => assertPermit2PaymentReady(
+      PERMIT2_PAYMENT_MINIMUM,
+      token,
+    ));
+  }
+  assert.doesNotThrow(() => assertPermit2PaymentReady(
+    49790000000000000000n,
+    "USDC",
+  ));
+  assert.doesNotThrow(() => assertPermit2PaymentReady(
+    PERMIT2_ALLOWANCE_TARGET,
+    "USDT",
+  ));
   assert.throws(
-    () => assertPermit2PaymentReady(PERMIT2_PAYMENT_MINIMUM - 1n),
-    /below 0\.21/,
-  );
-  assert.doesNotThrow(() => assertPermit2PaymentReady(PERMIT2_PAYMENT_MINIMUM));
-  assert.doesNotThrow(() => assertPermit2PaymentReady(49790000000000000000n));
-  assert.doesNotThrow(() => assertPermit2PaymentReady(PERMIT2_ALLOWANCE_TARGET));
-  assert.throws(
-    () => assertPermit2PaymentReady(PERMIT2_ALLOWANCE_TARGET + 1n),
+    () => assertPermit2PaymentReady(
+      PERMIT2_ALLOWANCE_TARGET + 1n,
+      "USDC",
+    ),
     /exceeds 50/,
   );
 });
@@ -568,6 +628,28 @@ test("CLI main redacts unknown provider and transaction errors and exits nonzero
       `${runtime.logs.join("\n")}\n${stderr.join("\n")}`,
       /API_KEY_MARKER|RAW_TX_MARKER|SIGNATURE_MARKER|NESTED_JSON_MARKER|requestUrl|eth_sendRawTransaction/,
     );
+  }
+});
+
+test("CLI main safely preserves exact selected-token approve guidance", async () => {
+  for (const token of ["USDC", "USDT"] as const) {
+    const expected = `Permit2 allowance is below 0.21; run npm run x402:approve -- ${token}`;
+    const stderr: string[] = [];
+    const exitCodes: number[] = [];
+
+    await runPermit2AllowanceCliMain(
+      ["allowance", token],
+      {},
+      { createContext: async () => { throw new Error(expected); } },
+      {
+        writeError: (message) => stderr.push(message),
+        setExitCode: (code) => exitCodes.push(code),
+      },
+    );
+
+    assert.deepEqual(stderr, [expected]);
+    assert.deepEqual(exitCodes, [1]);
+    assert.doesNotMatch(stderr.join("\n"), /<USDC\|USDT>/);
   }
 });
 

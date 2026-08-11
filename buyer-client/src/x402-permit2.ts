@@ -116,9 +116,15 @@ async function requireBscMainnet(provider: Permit2Provider): Promise<void> {
   }
 }
 
-export function assertPermit2PaymentReady(allowance: bigint): void {
+export function assertPermit2PaymentReady(
+  allowance: bigint,
+  token: Permit2TokenSymbol,
+): void {
+  const symbol = requirePermit2Token(token);
   if (allowance < PERMIT2_PAYMENT_MINIMUM) {
-    throw new Error("Permit2 allowance is below 0.21; run npm run x402:approve -- <USDC|USDT>");
+    throw new Error(
+      `Permit2 allowance is below 0.21; run npm run x402:approve -- ${symbol}`,
+    );
   }
   if (allowance > PERMIT2_ALLOWANCE_TARGET) {
     throw new Error("Permit2 allowance exceeds 50; reset it to 50 or revoke it");
@@ -242,7 +248,7 @@ export async function buildPermit2PaymentProof(
       amount: accepted.amount,
     },
     from: wallet.address.toLowerCase(),
-    spender,
+    spender: spender.toLowerCase(),
     nonce: BigInt(`0x${randomBytes(32).toString("hex")}`).toString(10),
     deadline: String(now + ttlSeconds),
     witness: {
@@ -360,7 +366,8 @@ const SAFE_CLI_ERROR_MESSAGES = new Set([
   "KEYSTORE_PATH is required for Permit2 allowance operations",
   "WALLET_PASSWORD is required for Permit2 allowance operations",
   "ERC-20 allowance read must return bigint",
-  "Permit2 allowance is below 0.21; run npm run x402:approve -- <USDC|USDT>",
+  "Permit2 allowance is below 0.21; run npm run x402:approve -- USDC",
+  "Permit2 allowance is below 0.21; run npm run x402:approve -- USDT",
   "Permit2 allowance exceeds 50; reset it to 50 or revoke it",
   'Permit2 approve declined: exact answer "yes" is required',
   'Permit2 revoke declined: exact answer "yes" is required',

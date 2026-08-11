@@ -90,14 +90,19 @@ def permit2_proof(
     signed_domain: dict[str, Any] | None = None,
     signed_types: dict[str, list[dict[str, str]]] | None = None,
     signed_primary_type: str = "PermitWitnessTransferFrom",
+    extra_fields: dict[str, Any] | None = None,
+    accepted_spender: str = SPENDER,
+    authorization_spender: str | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     extra = {
         "name": token.domain_name,
         "version": token.domain_version,
         "assetTransferMethod": "permit2-exact",
         "signerAddress": "0x3333333333333333333333333333333333333333",
-        "spenderAddress": SPENDER,
+        "spenderAddress": accepted_spender,
     }
+    if extra_fields is not None:
+        extra.update(copy.deepcopy(extra_fields))
     accepted = verify.build_payment_requirement(token, extra)
     authorization = {
         "permitted": {
@@ -105,7 +110,7 @@ def permit2_proof(
             "amount": accepted["amount"],
         },
         "from": PAYER,
-        "spender": SPENDER,
+        "spender": authorization_spender or accepted_spender,
         "nonce": nonce,
         "deadline": deadline,
         "witness": {
@@ -170,6 +175,69 @@ def test_real_permit2_signatures_recover_both_registered_payers(token) -> None:
     assert payment.valid_after == NOW - 60
     assert payment.valid_before == NOW + 600
     assert payment.promotional is False
+
+
+def test_nested_additive_extra_survives_challenge_proof_and_verification() -> None:
+    additive = {
+        "futureFlag": {
+            "enabled": True,
+            "metadata": {
+                "revision": 3,
+                "modes": ["exact", {"batch": False}],
+            },
+        },
+    }
+    proof, requirement = permit2_proof(extra_fields=additive)
+    challenge = verify.build_payment_challenge(
+        [],
+        "https://api.example.test/x402/analyze/async",
+        [requirement],
+    )
+    accepted = challenge["accepts"][0]
+    proof["accepted"] = copy.deepcopy(accepted)
+
+    payment, reason = verify.validate_payment_proof(
+        encoded_proof(proof),
+        expected_requirement=accepted,
+        now=NOW,
+    )
+
+    assert reason == ""
+    assert payment is not None
+    assert accepted["extra"] == {
+        "name": USDC_TOKEN.domain_name,
+        "version": USDC_TOKEN.domain_version,
+        "assetTransferMethod": "permit2-exact",
+        "signerAddress": "0x3333333333333333333333333333333333333333",
+        "spenderAddress": SPENDER,
+        **additive,
+    }
+    assert payment.proof["accepted"] == accepted
+
+
+def test_canonical_spender_authorization_preserves_mixed_case_accepted_extra(
+) -> None:
+    mixed_case_spender = "0x" + "Cd" * 20
+    canonical_spender = mixed_case_spender.lower()
+    proof, expected = permit2_proof(
+        accepted_spender=mixed_case_spender,
+        authorization_spender=canonical_spender,
+    )
+
+    payment, reason = verify.validate_payment_proof(
+        encoded_proof(proof),
+        expected_requirement=expected,
+        now=NOW,
+    )
+
+    assert reason == ""
+    assert payment is not None
+    assert proof["accepted"]["extra"]["spenderAddress"] == mixed_case_spender
+    assert (
+        proof["payload"]["permit2Authorization"]["spender"]
+        == canonical_spender
+    )
+    assert payment.proof["accepted"] == expected
 
 
 def _mutate(path: tuple[str, ...], value: object) -> Callable[[dict[str, Any]], None]:

@@ -304,8 +304,8 @@ class MainnetInfrastructureContractTests(unittest.TestCase):
                     "B402 capabilities may be partial",
                     "`extra.signerAddress` is facilitator EOA metadata; it is not the Permit2 spender and is not part of `permit2-exact` typed data.",
                     f"`extra.spenderAddress` is the live B402 proxy and the `permit2-exact` typed-data spender; the ERC-20 approval target remains canonical Permit2 `{CANONICAL_PERMIT2}`.",
-                    "When `pendingSettlementReference` has been durably recorded, Permit2 recovery is settle-only with the identical persisted proof and does not call `/verify` again.",
-                    "Without a durable `pendingSettlementReference`, other retryable create/recovery cases reuse the identical proof but may repeat verify-and-settle under B402 idempotency with the same nonce; they create no new signature, nonce, or approval.",
+                    "Only a freshly created Permit2 reservation in the same request uses verify-and-settle.",
+                    "Every pre-existing stale Permit2 reservation is recovered settle-only with the identical persisted proof, regardless of `pendingSettlementReference` or deadline; recovery does not call `/verify`.",
                     "Both approve and revoke require confirmation; `--yes` is an explicit noninteractive bypass.",
                     "In promotional mode, `paymentRequired=false` and the active `accepts=[]`; `supportedAssets` may still list all four tokens as registry metadata and is not an active payment requirement.",
                     "There is no USDC/USDT promotional proof, B402 verify/settle, or automatic approval.",
@@ -325,6 +325,80 @@ class MainnetInfrastructureContractTests(unittest.TestCase):
                 ):
                     self.assertNotRegex(documentation, forbidden)
                 self.assertEqual(affirmative_payment_guidance_violations(source), [])
+
+    def test_public_api_usage_freezes_mixed_scheme_and_permit2_wire_contract(
+        self,
+    ) -> None:
+        documentation = X402_API_USAGE.read_text(encoding="utf-8")
+        normalized = " ".join(documentation.split())
+
+        self.assertIn(
+            "`signingSchemes` is additive and lists the deduplicated active "
+            "methods in `accepts` order.",
+            normalized,
+        )
+        self.assertIn(
+            "The legacy `signingScheme` describes the highest-priority active "
+            "accept.",
+            normalized,
+        )
+        self.assertIn(
+            """```json
+{
+  "name": "Permit2",
+  "chainId": 56,
+  "verifyingContract": "0x000000000022D473030F116dDEE9F6B43aC78BA3"
+}
+```""",
+            documentation,
+        )
+        self.assertIn(
+            """```text
+PermitWitnessTransferFrom(
+  TokenPermissions permitted,
+  address spender,
+  uint256 nonce,
+  uint256 deadline,
+  Witness witness
+)
+TokenPermissions(address token, uint256 amount)
+Witness(address to, uint256 validAfter)
+```""",
+            documentation,
+        )
+        self.assertIn(
+            """```json
+{
+  "signature": "0x<65-byte signature>",
+  "permit2Authorization": {
+    "permitted": {
+      "token": "<accepted.asset>",
+      "amount": "210000000000000000"
+    },
+    "from": "<payer wallet>",
+    "spender": "<lowercase accepted.extra.spenderAddress>",
+    "nonce": "<uint256 decimal string>",
+    "deadline": "<unix seconds decimal string>",
+    "witness": {
+      "to": "<accepted.payTo>",
+      "validAfter": "<unix seconds decimal string>"
+    }
+  }
+}
+```""",
+            documentation,
+        )
+        self.assertIn(
+            "Every uint256 wire value (`amount`, `nonce`, `deadline`, and "
+            "`validAfter`) is a canonical decimal string.",
+            normalized,
+        )
+        self.assertIn(
+            "The authorization `spender` is the lowercase canonical form of "
+            "`accepted.extra.spenderAddress`; the complete `accepted.extra` "
+            "object remains unchanged on the wire.",
+            normalized,
+        )
 
     def test_payment_guidance_safety_patterns_are_affirmative_only(self) -> None:
         safe_guidance = (

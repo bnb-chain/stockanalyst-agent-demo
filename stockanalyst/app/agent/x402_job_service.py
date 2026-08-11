@@ -767,13 +767,7 @@ class X402JobService:
                 raise X402JobError("payment_rejected")
             mode: SettlementMode = "verify-and-settle"
         elif payment.transfer_method == "permit2-exact":
-            if stored.record.get("pendingSettlementReference") is None:
-                if now // 1000 >= payment.valid_before:
-                    await self._fail_settlement(stored)
-                    raise X402JobError("payment_rejected")
-                mode = "verify-and-settle"
-            else:
-                mode = "settle-only"
+            mode = "settle-only"
         else:
             raise X402JobError("payment_rejected")
 

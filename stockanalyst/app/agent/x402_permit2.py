@@ -104,7 +104,7 @@ def _wire_uint256(value: object) -> int | None:
 def _valid_extra(extra: object, token: PaymentToken) -> bool:
     return bool(
         isinstance(extra, Mapping)
-        and extra.keys() == _EXTRA_KEYS
+        and _EXTRA_KEYS.issubset(extra.keys())
         and extra.get("name") == token.domain_name
         and extra.get("version") == token.domain_version
         and extra.get("assetTransferMethod") == token.transfer_method

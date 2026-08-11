@@ -296,6 +296,17 @@ type RunAsyncStartup = (options: {
   }>;
 }) => Promise<{ receipt: AsyncJobReceipt; symbols: string[] }>;
 
+interface AsyncCliProcess {
+  writeError(message: string): void;
+  setExitCode(code: number): void;
+}
+
+type RunAsyncCliMain = (
+  operation: () => Promise<void>,
+  cliProcess: AsyncCliProcess,
+  recoveryMessage?: () => string,
+) => Promise<void>;
+
 function preparePaidPendingCreate(): PreparePaidPendingCreate {
   const candidate = (
     x402AsyncModule as unknown as Record<string, unknown>
@@ -318,6 +329,18 @@ function runAsyncStartup(): RunAsyncStartup {
     "x402 async must expose its real startup orchestration seam",
   );
   return candidate as RunAsyncStartup;
+}
+
+function runAsyncCliMain(): RunAsyncCliMain {
+  const candidate = (
+    x402AsyncModule as unknown as Record<string, unknown>
+  )["runAsyncCliMain"];
+  assert.equal(
+    typeof candidate,
+    "function",
+    "x402 async must expose its real CLI output boundary",
+  );
+  return candidate as RunAsyncCliMain;
 }
 
 function decodeProof(proof: string): {
@@ -383,7 +406,7 @@ test("real CLI startup rejects unsafe Permit2 preflight before every fetch and s
       read: async () => {
         throw new Error("BSC_RPC_URL is required for Permit2 allowance operations");
       },
-      expected: /BSC_RPC_URL is required/,
+      expected: /Permit2 preflight failed; verify BSC_RPC_URL, BSC mainnet chain ID 56, and the USDC allowance/,
     },
     {
       name: "wrong chain",
@@ -392,7 +415,7 @@ test("real CLI startup rejects unsafe Permit2 preflight before every fetch and s
       read: async () => {
         throw new Error("BSC_RPC_URL provider network must have chain ID 56");
       },
-      expected: /chain ID 56/,
+      expected: /Permit2 preflight failed; verify BSC_RPC_URL, BSC mainnet chain ID 56, and the USDT allowance/,
     },
   ];
 
@@ -447,6 +470,289 @@ test("real CLI startup rejects unsafe Permit2 preflight before every fetch and s
     } finally {
       rmSync(directory, { recursive: true, force: true });
     }
+  }
+});
+
+test("real async CLI output redacts hostile Permit2 preflight failures and exits nonzero", async () => {
+  const runStartup = runAsyncStartup();
+  const runCli = runAsyncCliMain();
+  const wallet = { address: "0x3333333333333333333333333333333333333333" } as Wallet;
+  const throwingMessage = new Error();
+  Object.defineProperty(throwingMessage, "message", {
+    configurable: true,
+    get: () => {
+      throw new Error("HOSTILE_GETTER_MARKER");
+    },
+  });
+  const failures: Array<{
+    token: "USDC" | "USDT";
+    createReader(): () => Promise<bigint>;
+  }> = [
+    {
+      token: "USDC",
+      createReader: () => {
+        throw new Error([
+          "https://buyer:URL_CREDENTIAL_MARKER@bsc.example/v1?api_key=API_KEY_MARKER",
+          '{"body":{"nested":"RESPONSE_BODY_MARKER"}}',
+          "\rFORGED_LINE_MARKER\nRAW_TX_MARKER SIGNATURE_MARKER",
+        ].join("\n"));
+      },
+    },
+    {
+      token: "USDT",
+      createReader: () => async () => {
+        throw {
+          message: "API_KEY_MARKER RESPONSE_BODY_MARKER",
+          error: {
+            transaction: "RAW_TX_MARKER",
+            signature: "SIGNATURE_MARKER",
+          },
+          toString: () => "FORGED_LINE_MARKER",
+        };
+      },
+    },
+    {
+      token: "USDC",
+      createReader: () => async () => {
+        throw throwingMessage;
+      },
+    },
+  ];
+
+  for (const failure of failures) {
+    const directory = mkdtempSync(join(tmpdir(), "x402-preflight-output-privacy-"));
+    const stderr: string[] = [];
+    const exitCodes: number[] = [];
+    let fetches = 0;
+    let signatures = 0;
+    try {
+      await runCli(
+        async () => {
+          await runStartup({
+            endpoint: ENDPOINT,
+            receiptPath: join(directory, "receipt.json"),
+            pendingPath: join(directory, "pending.json"),
+            env: {
+              X402_SELLER_WALLET: SELLER,
+              X402_PAYMENT_TOKEN: failure.token,
+              BSC_RPC_URL: "https://buyer:URL_CREDENTIAL_MARKER@bsc.example/v1?api_key=API_KEY_MARKER",
+            },
+            dependencies: {
+              loadContext: async () => ({ symbols: ["AAPL"] }),
+              loadWallet: async () => wallet,
+              createPermit2AllowanceReader: failure.createReader,
+              fetch: async () => {
+                fetches += 1;
+                throw new Error("unexpected fetch");
+              },
+              buildPaymentProof: async () => {
+                signatures += 1;
+                throw new Error("unexpected signature");
+              },
+              log: () => undefined,
+            },
+          });
+        },
+        {
+          writeError: (message) => stderr.push(message),
+          setExitCode: (code) => exitCodes.push(code),
+        },
+        () => "No durable x402 retry state was created.",
+      );
+
+      assert.equal(
+        stderr[0],
+        "x402 asynchronous flow failed: Permit2 preflight failed; "
+          + `verify BSC_RPC_URL, BSC mainnet chain ID 56, and the ${failure.token} allowance`,
+      );
+      assert.deepEqual(stderr.slice(1), [
+        "No durable x402 retry state was created.",
+      ]);
+      assert.deepEqual(exitCodes, [1]);
+      assert.equal(fetches, 0);
+      assert.equal(signatures, 0);
+      assert.doesNotMatch(
+        stderr.join("\n"),
+        /URL_CREDENTIAL_MARKER|API_KEY_MARKER|RESPONSE_BODY_MARKER|FORGED_LINE_MARKER|RAW_TX_MARKER|SIGNATURE_MARKER|HOSTILE_GETTER_MARKER|buyer:/,
+      );
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  }
+});
+
+test("real async CLI output preserves exact insufficient-allowance guidance", async () => {
+  const runStartup = runAsyncStartup();
+  const runCli = runAsyncCliMain();
+  const wallet = { address: "0x3333333333333333333333333333333333333333" } as Wallet;
+
+  for (const token of ["USDC", "USDT"] as const) {
+    const directory = mkdtempSync(join(tmpdir(), "x402-preflight-output-guidance-"));
+    const stderr: string[] = [];
+    const exitCodes: number[] = [];
+    try {
+      await runCli(
+        async () => {
+          await runStartup({
+            endpoint: ENDPOINT,
+            receiptPath: join(directory, "receipt.json"),
+            pendingPath: join(directory, "pending.json"),
+            env: {
+              X402_SELLER_WALLET: SELLER,
+              X402_PAYMENT_TOKEN: token,
+              BSC_RPC_URL: "https://rpc.invalid",
+            },
+            dependencies: {
+              loadContext: async () => ({ symbols: ["AAPL"] }),
+              loadWallet: async () => wallet,
+              createPermit2AllowanceReader: () => async () => (
+                210000000000000000n - 1n
+              ),
+              fetch: async () => {
+                throw new Error("unexpected fetch");
+              },
+              buildPaymentProof: async () => {
+                throw new Error("unexpected signature");
+              },
+              log: () => undefined,
+            },
+          });
+        },
+        {
+          writeError: (message) => stderr.push(message),
+          setExitCode: (code) => exitCodes.push(code),
+        },
+        () => "No durable x402 retry state was created.",
+      );
+
+      assert.equal(
+        stderr[0],
+        "x402 asynchronous flow failed: Permit2 allowance is below 0.21; "
+          + `run npm run x402:approve -- ${token}`,
+      );
+      assert.deepEqual(stderr.slice(1), [
+        "No durable x402 retry state was created.",
+      ]);
+      assert.deepEqual(exitCodes, [1]);
+      assert.doesNotMatch(stderr.join("\n"), /<USDC\|USDT>/);
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  }
+});
+
+test("real async CLI output replaces every unclassified error with a fixed message", async () => {
+  const runCli = runAsyncCliMain();
+  const throwingMessage = new Error();
+  Object.defineProperty(throwingMessage, "message", {
+    configurable: true,
+    get: () => {
+      throw new Error("HOSTILE_GETTER_MARKER");
+    },
+  });
+  const failures: unknown[] = [
+    new Error(
+      "https://buyer:URL_CREDENTIAL_MARKER@bsc.example API_KEY_MARKER "
+        + "RESPONSE_BODY_MARKER RAW_TX_MARKER SIGNATURE_MARKER",
+    ),
+    {
+      message: "FORGED_LINE_MARKER",
+      nested: { apiKey: "API_KEY_MARKER" },
+      toString: () => "RESPONSE_BODY_MARKER",
+    },
+    throwingMessage,
+  ];
+
+  for (const failure of failures) {
+    const stderr: string[] = [];
+    const exitCodes: number[] = [];
+    await runCli(
+      async () => { throw failure; },
+      {
+        writeError: (message) => stderr.push(message),
+        setExitCode: (code) => exitCodes.push(code),
+      },
+      () => "No durable x402 retry state was created.",
+    );
+
+    assert.deepEqual(stderr, [
+      "x402 asynchronous flow failed: unexpected client failure",
+      "No durable x402 retry state was created.",
+    ]);
+    assert.deepEqual(exitCodes, [1]);
+    assert.doesNotMatch(
+      stderr.join("\n"),
+      /URL_CREDENTIAL_MARKER|API_KEY_MARKER|RESPONSE_BODY_MARKER|FORGED_LINE_MARKER|RAW_TX_MARKER|SIGNATURE_MARKER|HOSTILE_GETTER_MARKER|buyer:/,
+    );
+  }
+});
+
+test("real async CLI output reconstructs registry-derived unavailable-token alternatives", async () => {
+  const runStartup = runAsyncStartup();
+  const runCli = runAsyncCliMain();
+  const wallet = { address: "0x3333333333333333333333333333333333333333" } as Wallet;
+  const required = paymentRequired([
+    paymentChallenge({
+      token: "USDT",
+      extra: { serverLabel: "EVIL_LABEL_MARKER" },
+    }),
+    paymentChallenge({
+      token: "U",
+      extra: { arbitraryField: "EVIL_FIELD_MARKER" },
+    }),
+  ]);
+  const directory = mkdtempSync(join(tmpdir(), "x402-unavailable-output-"));
+  const stderr: string[] = [];
+  const exitCodes: number[] = [];
+  let signatures = 0;
+  try {
+    await runCli(
+      async () => {
+        await runStartup({
+          endpoint: ENDPOINT,
+          receiptPath: join(directory, "receipt.json"),
+          pendingPath: join(directory, "pending.json"),
+          env: {
+            X402_SELLER_WALLET: SELLER,
+            X402_PAYMENT_TOKEN: "USDC",
+            BSC_RPC_URL: "https://rpc.invalid",
+          },
+          dependencies: {
+            loadContext: async () => ({ symbols: ["AAPL"] }),
+            loadWallet: async () => wallet,
+            createPermit2AllowanceReader: () => async () => 50n * 10n ** 18n,
+            fetch: async () => json(
+              { paymentRequired: required },
+              { status: 402, headers: { "PAYMENT-REQUIRED": base64Json(required) } },
+            ),
+            buildPaymentProof: async () => {
+              signatures += 1;
+              throw new Error("unexpected signature");
+            },
+            log: () => undefined,
+          },
+        });
+      },
+      {
+        writeError: (message) => stderr.push(message),
+        setExitCode: (code) => exitCodes.push(code),
+      },
+      () => "No durable x402 retry state was created.",
+    );
+
+    assert.deepEqual(stderr, [
+      "x402 asynchronous flow failed: x402 asynchronous job failed: "
+        + "payment_token_unavailable; available tokens: U, USDT",
+      "No durable x402 retry state was created.",
+    ]);
+    assert.deepEqual(exitCodes, [1]);
+    assert.equal(signatures, 0);
+    assert.doesNotMatch(
+      stderr.join("\n"),
+      /EVIL_LABEL_MARKER|EVIL_FIELD_MARKER/,
+    );
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
   }
 });
 
@@ -1364,6 +1670,110 @@ test("fetchPaymentChallenge selects every exact token symbol and defaults to U",
   }
 });
 
+test("unavailable requested tokens report only registry-derived alternatives in registry order", async () => {
+  const cases: Array<{
+    preferred: PaymentTokenSymbol;
+    challenges: PaidPaymentChallenge[];
+    available: string;
+  }> = [
+    {
+      preferred: "USDC",
+      challenges: [
+        paymentChallenge({ token: "USDT", extra: { serverLabel: "EVIL_LABEL_MARKER" } }),
+        paymentChallenge({ token: "U", extra: { arbitraryField: "EVIL_FIELD_MARKER" } }),
+      ],
+      available: "U, USDT",
+    },
+    {
+      preferred: "U",
+      challenges: [
+        paymentChallenge({ token: "USDC" }),
+        paymentChallenge({ token: "USD1" }),
+      ],
+      available: "USD1, USDC",
+    },
+    {
+      preferred: "USD1",
+      challenges: [
+        paymentChallenge({ token: "USDT" }),
+        paymentChallenge({ token: "USDC" }),
+      ],
+      available: "USDC, USDT",
+    },
+  ];
+
+  for (const testCase of cases) {
+    const required = paymentRequired(testCase.challenges);
+    await assert.rejects(
+      fetchPaymentChallenge(
+        ENDPOINT,
+        { symbols: ["AAPL"] },
+        SELLER,
+        async () => json(
+          { paymentRequired: required },
+          { status: 402, headers: { "PAYMENT-REQUIRED": base64Json(required) } },
+        ),
+        testCase.preferred,
+      ),
+      (error: unknown) => {
+        assert.equal(
+          (error as AsyncJobClientError).code,
+          "payment_token_unavailable",
+        );
+        assert.equal(
+          (error as Error).message,
+          "x402 asynchronous job failed: payment_token_unavailable; "
+            + `available tokens: ${testCase.available}`,
+        );
+        assert.doesNotMatch(
+          (error as Error).message,
+          /EVIL_LABEL_MARKER|EVIL_FIELD_MARKER/,
+        );
+        return true;
+      },
+      testCase.preferred,
+    );
+  }
+});
+
+test("unavailable-token alternatives are withheld until every capability validates", async () => {
+  const malformed = paymentChallenge({
+    token: "USDT",
+    extra: {
+      spenderAddress: "not-an-address",
+      serverLabel: "EVIL_LABEL_MARKER",
+    },
+  });
+  const required = paymentRequired([
+    paymentChallenge({ token: "U" }),
+    malformed,
+  ]);
+
+  await assert.rejects(
+    fetchPaymentChallenge(
+      ENDPOINT,
+      { symbols: ["AAPL"] },
+      SELLER,
+      async () => json(
+        { paymentRequired: required },
+        { status: 402, headers: { "PAYMENT-REQUIRED": base64Json(required) } },
+      ),
+      "USDC",
+    ),
+    (error: unknown) => {
+      assert.equal(
+        (error as AsyncJobClientError).code,
+        "invalid_payment_challenge",
+      );
+      assert.doesNotMatch(
+        (error as Error).message,
+        /available tokens|EVIL_LABEL_MARKER/,
+      );
+      return true;
+    },
+  );
+});
+
 test("fetchPaymentChallenge preserves unknown Permit2 extras defensively", async () => {
   const unknown = {
     futureFlag: true,
@@ -1545,6 +1955,37 @@ test("beginAsyncAnalysis preserves the paid 402 challenge", async () => {
   });
 });
 
+test("beginAsyncAnalysis preserves the safe requested-token availability error", async () => {
+  const required = paymentRequired([
+    paymentChallenge({ token: "USDT" }),
+    paymentChallenge({ token: "U" }),
+  ]);
+
+  await assert.rejects(
+    beginAsyncAnalysis(
+      ENDPOINT,
+      { symbols: ["AAPL"] },
+      SELLER,
+      async () => json(
+        { paymentRequired: required },
+        { status: 402, headers: { "PAYMENT-REQUIRED": base64Json(required) } },
+      ),
+      "USDC",
+    ),
+    (error: unknown) => {
+      assert.equal(
+        (error as AsyncJobClientError).code,
+        "payment_token_unavailable",
+      );
+      assert.equal(
+        (error as Error).message,
+        "x402 asynchronous job failed: payment_token_unavailable; available tokens: U, USDT",
+      );
+      return true;
+    },
+  );
+});
+
 test("beginAsyncAnalysis rejects malformed promotional receipts", async () => {
   await assert.rejects(
     beginAsyncAnalysis(
@@ -1652,7 +2093,6 @@ test("fetchPaymentChallenge validates every entry and rejects ambiguity", async 
       [validU, paymentChallenge({ token: "USD1", accepted: { amount: "1000000" } })],
       "U",
     ],
-    ["preferred token absent", [validU], "USD1"],
   ];
 
   for (const [name, challenges, preferred] of cases) {
