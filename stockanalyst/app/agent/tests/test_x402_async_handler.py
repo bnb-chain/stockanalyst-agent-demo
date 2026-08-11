@@ -21,7 +21,12 @@ from stockanalyst.app.agent.x402_job_service import (
     JobView,
     X402JobError,
 )
-from stockanalyst.app.agent.x402_tokens import TOKENS, U_TOKEN, USD1_TOKEN
+from stockanalyst.app.agent.x402_tokens import (
+    PROMOTIONAL_TOKENS,
+    TOKENS,
+    U_TOKEN,
+    USD1_TOKEN,
+)
 
 JOB_ID = "x402_" + "a" * 32
 EXPIRES_AT = 1_785_945_600_123
@@ -43,8 +48,13 @@ SUPPORTED_EXTRAS = {
     USD1_TOKEN.domain: USD1_SUPPORTED_EXTRA,
 }
 SUPPORTED_ASSETS = [
-    {"symbol": "U", "asset": U_TOKEN.address, "decimals": 18},
-    {"symbol": "USD1", "asset": USD1_TOKEN.address, "decimals": 18},
+    {
+        "symbol": token.symbol,
+        "asset": token.address,
+        "decimals": token.decimals,
+        "transferMethod": token.transfer_method,
+    }
+    for token in TOKENS
 ]
 
 
@@ -187,7 +197,7 @@ class X402AsyncHandlerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.json["payTo"], pay_to.lower())
         self.assertEqual(
             [item["asset"] for item in response.json["accepts"]],
-            [U_TOKEN.address, USD1_TOKEN.address],
+            [token.address for token in PROMOTIONAL_TOKENS],
         )
         self.assertEqual(
             [item["amount"] for item in response.json["accepts"]],
@@ -210,7 +220,7 @@ class X402AsyncHandlerTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(
             [item["asset"] for item in requirements],
-            [U_TOKEN.address, USD1_TOKEN.address],
+            [token.address for token in PROMOTIONAL_TOKENS],
         )
         client.payment_extras.assert_awaited_once_with(
             "eip155:56",
@@ -475,7 +485,7 @@ class X402AsyncHandlerTests(unittest.IsolatedAsyncioTestCase):
                 item["asset"]
                 for item in response.json["paymentRequired"]["accepts"]
             ],
-            [U_TOKEN.address, USD1_TOKEN.address],
+            [token.address for token in PROMOTIONAL_TOKENS],
         )
         self.assertEqual(
             [
