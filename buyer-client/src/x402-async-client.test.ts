@@ -65,6 +65,7 @@ const OLD_REPORT_URL = "https://reports-bucket.s3.us-east-1.amazonaws.com/old.md
 const NEW_REPORT_URL = "https://reports-bucket.s3.us-east-1.amazonaws.com/new.md?X-Amz-Signature=new";
 const SELLER = "0xd10BdDC20E4DC42A1a19a9653e994991e25b8153";
 const SIGNER = "0x1111111111111111111111111111111111111111";
+const SPENDER = "0x2222222222222222222222222222222222222222";
 
 function paymentChallenge(
   overrides: {
@@ -84,8 +85,11 @@ function paymentChallenge(
   const extra = {
     name: token.name,
     version: token.version,
-    assetTransferMethod: "eip3009",
+    assetTransferMethod: token.transferMethod,
     signerAddress: SIGNER,
+    ...(token.transferMethod === "permit2-exact"
+      ? { spenderAddress: SPENDER }
+      : {}),
     ...overrides.extra,
   };
   const accepted = {
@@ -285,7 +289,7 @@ test("pending-create recovery retains the correct paid and promotional access su
   }
 });
 
-test("uses the mainnet U and USD1 registry", () => {
+test("uses the four-token mainnet payment registry", () => {
   assert.equal(
     PAYMENT_TOKENS.U.asset,
     "0xcE24439F2D9C6a2289F741120FE202248B666666",
@@ -293,6 +297,18 @@ test("uses the mainnet U and USD1 registry", () => {
   assert.equal(
     PAYMENT_TOKENS.USD1.asset,
     "0x8d0D000Ee44948FC98c9B98A4FA4921476f08B0d",
+  );
+  assert.equal(
+    PAYMENT_TOKENS.USDC.asset,
+    "0x8AC76a51cc950d9822D68b83fE1Ad97B32Cd580d",
+  );
+  assert.equal(
+    PAYMENT_TOKENS.USDT.asset,
+    "0x55d398326f99059fF775485246999027B3197955",
+  );
+  assert.deepEqual(
+    Object.values(PAYMENT_TOKENS).map((token) => token.transferMethod),
+    ["eip3009", "eip3009", "permit2-exact", "permit2-exact"],
   );
   assert.equal(PAID_AMOUNT, "210000000000000000");
   assert.equal(paymentChallenge().accepted.amount, PAID_AMOUNT);
@@ -549,16 +565,20 @@ test("buildPaymentProof signs an exact zero-value promotional authorization", as
   assert.equal(recovered, wallet.address);
 });
 
-test("fetchPaymentChallenge selects U by default and USD1 explicitly", async () => {
-  const expected = paymentChallenge();
-  const expectedUsd1 = paymentChallenge({ token: "USD1" });
+test("fetchPaymentChallenge selects every exact token symbol and defaults to U", async () => {
+  const expectedByToken = Object.fromEntries(
+    (["U", "USD1", "USDC", "USDT"] as const).map((token) => [
+      token,
+      paymentChallenge({ token }),
+    ]),
+  ) as Record<PaymentTokenSymbol, PaidPaymentChallenge>;
   const calls: Array<{ url: string; headers: Headers }> = [];
   const fetchImpl: FetchImpl = async (input, init) => {
     calls.push({
       url: String(input),
       headers: new Headers(init?.headers),
     });
-    const required = paymentRequired([expected, expectedUsd1]);
+    const required = paymentRequired(Object.values(expectedByToken));
     return json({
       error: "Payment Required",
       paymentRequired: required,
@@ -575,31 +595,145 @@ test("fetchPaymentChallenge selects U by default and USD1 explicitly", async () 
     fetchImpl,
   );
 
-  assert.deepEqual(actual, expected);
+  assert.deepEqual(actual, expectedByToken.U);
   assert.equal(calls.length, 1);
   assert.equal(calls[0]?.url, `${ENDPOINT}/x402/analyze/async`);
   assert.equal(calls[0]?.headers.has("PAYMENT-SIGNATURE"), false);
 
-  const usd1 = await fetchPaymentChallenge(
+  for (const token of ["U", "USD1", "USDC", "USDT"] as const) {
+    const selected = await fetchPaymentChallenge(
+      ENDPOINT,
+      { symbols: ["AAPL"] },
+      SELLER,
+      fetchImpl,
+      token,
+    );
+    assert.deepEqual(selected, expectedByToken[token], token);
+  }
+
+  for (const value of ["u", "usd1", "usdc", "usdt", " USDC ", "USDT "]) {
+    await assert.rejects(
+      fetchPaymentChallenge(
+        ENDPOINT,
+        { symbols: ["AAPL"] },
+        SELLER,
+        fetchImpl,
+        value as PaymentTokenSymbol,
+      ),
+      (error: unknown) => (
+        (error as AsyncJobClientError).code === "invalid_payment_challenge"
+      ),
+      value,
+    );
+  }
+});
+
+test("fetchPaymentChallenge preserves unknown Permit2 extras defensively", async () => {
+  const unknown = {
+    futureFlag: true,
+    nested: { values: [1, "two", null] },
+  };
+  const expected = paymentChallenge({
+    token: "USDC",
+    extra: unknown,
+  });
+  const required = paymentRequired([expected]);
+
+  const actual = await fetchPaymentChallenge(
     ENDPOINT,
     { symbols: ["AAPL"] },
     SELLER,
-    fetchImpl,
-    "USD1",
+    async () => json(
+      { paymentRequired: required },
+      { status: 402, headers: { "PAYMENT-REQUIRED": base64Json(required) } },
+    ),
+    "USDC",
   );
-  assert.equal(
-    usd1.accepted.asset.toLowerCase(),
-    PAYMENT_TOKENS.USD1.asset.toLowerCase(),
-  );
-  assert.equal(usd1.accepted.amount, PAID_AMOUNT);
+
+  assert.deepEqual(actual.accepted.extra, expected.accepted.extra);
+  assert.notEqual(actual.accepted.extra, expected.accepted.extra);
+  assert.deepEqual(actual.accepted.extra["nested"], unknown.nested);
+});
+
+test("fetchPaymentChallenge rejects Permit2 method, domain, address, promo, and upto mismatches", async () => {
+  const missingSigner = paymentChallenge({ token: "USDC" });
+  delete missingSigner.accepted.extra.signerAddress;
+  const missingSpender = paymentChallenge({ token: "USDC" });
+  delete missingSpender.accepted.extra.spenderAddress;
+  const invalid: Array<[string, PaidPaymentChallenge]> = [
+    ["USDC eip3009", paymentChallenge({
+      token: "USDC",
+      extra: { assetTransferMethod: "eip3009" },
+    })],
+    ["USDT permit2-upto", paymentChallenge({
+      token: "USDT",
+      extra: { assetTransferMethod: "permit2-upto" },
+    })],
+    ["USDC wrong name", paymentChallenge({
+      token: "USDC",
+      extra: { name: PAYMENT_TOKENS.USDT.name },
+    })],
+    ["USDT wrong version", paymentChallenge({
+      token: "USDT",
+      extra: { version: PAYMENT_TOKENS.USDC.version },
+    })],
+    ["missing signer", missingSigner],
+    ["malformed signer", paymentChallenge({
+      token: "USDC",
+      extra: { signerAddress: "invalid" },
+    })],
+    ["missing spender", missingSpender],
+    ["malformed spender", paymentChallenge({
+      token: "USDT",
+      extra: { spenderAddress: "invalid" },
+    })],
+    ["USDC promo", promotionalPaymentChallenge("USDC")],
+    ["USDT promo", promotionalPaymentChallenge("USDT")],
+  ];
+
+  for (const [name, challenge] of invalid) {
+    const required = paymentRequired([challenge]);
+    await assert.rejects(
+      fetchPaymentChallenge(
+        ENDPOINT,
+        { symbols: ["AAPL"] },
+        SELLER,
+        async () => json(
+          { paymentRequired: required },
+          { status: 402, headers: { "PAYMENT-REQUIRED": base64Json(required) } },
+        ),
+        challenge.accepted.asset.toLowerCase()
+          === PAYMENT_TOKENS.USDT.asset.toLowerCase()
+          ? "USDT"
+          : "USDC",
+      ),
+      (error: unknown) => (
+        (error as AsyncJobClientError).code === "invalid_payment_challenge"
+      ),
+      name,
+    );
+  }
+});
+
+test("fetchPaymentChallenge rejects duplicate Permit2 assets before selection", async () => {
+  const first = paymentChallenge({ token: "USDC" });
+  const duplicate = paymentChallenge({
+    token: "USDC",
+    accepted: { asset: PAYMENT_TOKENS.USDC.asset.toLowerCase() },
+    extra: { signerAddress: "0x3333333333333333333333333333333333333333" },
+  });
+  const required = paymentRequired([first, duplicate]);
 
   await assert.rejects(
     fetchPaymentChallenge(
       ENDPOINT,
       { symbols: ["AAPL"] },
       SELLER,
-      fetchImpl,
-      "USDT" as never,
+      async () => json(
+        { paymentRequired: required },
+        { status: 402, headers: { "PAYMENT-REQUIRED": base64Json(required) } },
+      ),
+      "USDC",
     ),
     (error: unknown) => (
       (error as AsyncJobClientError).code === "invalid_payment_challenge"

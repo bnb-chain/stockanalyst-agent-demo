@@ -2,17 +2,33 @@ import { randomBytes } from "node:crypto";
 import { getAddress, type Wallet } from "ethers";
 
 // These values must match stockanalyst/app/agent/x402_tokens.py.
-export type PaymentTokenSymbol = "U" | "USD1";
+export type PaymentTokenSymbol = "U" | "USD1" | "USDC" | "USDT";
+export type PaymentTransferMethod = "eip3009" | "permit2-exact";
+export const PERMIT2_ADDRESS = "0x000000000022D473030F116dDEE9F6B43aC78BA3";
 export const PAYMENT_TOKENS = {
   U: {
     asset: "0xcE24439F2D9C6a2289F741120FE202248B666666",
     name: "United Stables",
     version: "1",
+    transferMethod: "eip3009",
   },
   USD1: {
     asset: "0x8d0D000Ee44948FC98c9B98A4FA4921476f08B0d",
     name: "World Liberty Financial USD",
     version: "1",
+    transferMethod: "eip3009",
+  },
+  USDC: {
+    asset: "0x8AC76a51cc950d9822D68b83fE1Ad97B32Cd580d",
+    name: "USD Coin",
+    version: "2",
+    transferMethod: "permit2-exact",
+  },
+  USDT: {
+    asset: "0x55d398326f99059fF775485246999027B3197955",
+    name: "Tether USD",
+    version: "1",
+    transferMethod: "permit2-exact",
   },
 } as const;
 export const BSC_MAINNET_CHAIN_ID = 56;
@@ -26,8 +42,9 @@ export const U_TOKEN_DOMAIN_VERSION = PAYMENT_TOKENS.U.version;
 export interface B402PaymentExtra {
   name: string;
   version: string;
-  assetTransferMethod: "eip3009";
+  assetTransferMethod: PaymentTransferMethod;
   signerAddress?: string;
+  spenderAddress?: string;
   [key: string]: unknown;
 }
 
@@ -67,7 +84,7 @@ export function resolveX402SellerWallet(
 }
 
 /**
- * Build and EIP-712 sign an x402 v2 TransferWithAuthorization proof.
+ * Build and locally sign an x402 v2 payment proof for the selected method.
  *
  * This module has no command-line side effects, so the asynchronous client can
  * build the payment wire format without importing a runnable CLI module.
@@ -77,6 +94,11 @@ export async function buildPaymentProof(
   challenge: PaidPaymentChallenge,
   ttlSeconds: number = 600,
 ): Promise<string> {
+  if (challenge.accepted.extra.assetTransferMethod === "permit2-exact") {
+    const { buildPermit2PaymentProof } = await import("./x402-permit2.js");
+    return buildPermit2PaymentProof(wallet, challenge, ttlSeconds);
+  }
+
   const { accepted, resource } = challenge;
   const now = Math.floor(Date.now() / 1000);
   const nonce = `0x${randomBytes(32).toString("hex")}`;

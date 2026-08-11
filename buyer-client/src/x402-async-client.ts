@@ -371,14 +371,21 @@ function parsePaymentChallenge(
     const amount = acceptedValue["amount"];
     const promotional = amount === "0";
     const signerAddress = extraValue["signerAddress"];
+    const spenderAddress = extraValue["spenderAddress"];
     const hasSignerAddress = Object.prototype.hasOwnProperty.call(
       extraValue,
       "signerAddress",
     );
+    const hasSpenderAddress = Object.prototype.hasOwnProperty.call(
+      extraValue,
+      "spenderAddress",
+    );
+    const transferMethod = token.transferMethod;
     if (
       acceptedValue["scheme"] !== "exact"
       || acceptedValue["network"] !== BSC_MAINNET_NETWORK
       || (!promotional && amount !== PAID_AMOUNT)
+      || (promotional && transferMethod !== "eip3009")
       || typeof payTo !== "string"
       || payTo.toLowerCase() !== seller
       || !Number.isSafeInteger(timeout)
@@ -386,7 +393,7 @@ function parsePaymentChallenge(
       || (timeout as number) > 3_600
       || extraValue["name"] !== token.name
       || extraValue["version"] !== token.version
-      || extraValue["assetTransferMethod"] !== "eip3009"
+      || extraValue["assetTransferMethod"] !== transferMethod
       || (
         promotional
           ? hasSignerAddress
@@ -396,6 +403,14 @@ function parsePaymentChallenge(
             || !EVM_ADDRESS_PATTERN.test(signerAddress)
           )
       )
+      || (
+        transferMethod === "permit2-exact"
+        && (
+          !hasSpenderAddress
+          || typeof spenderAddress !== "string"
+          || !EVM_ADDRESS_PATTERN.test(spenderAddress)
+        )
+      )
     ) {
       invalidPaymentChallenge();
     }
@@ -403,9 +418,12 @@ function parsePaymentChallenge(
       ...extraValue,
       name: token.name,
       version: token.version,
-      assetTransferMethod: "eip3009",
+      assetTransferMethod: transferMethod,
     };
     if (!promotional) extra.signerAddress = signerAddress as string;
+    if (transferMethod === "permit2-exact") {
+      extra.spenderAddress = spenderAddress as string;
+    }
     acceptedBySymbol.set(symbol, {
       promotional,
       accepted: {
