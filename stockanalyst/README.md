@@ -31,7 +31,13 @@ The agent aggregates data from five sources before writing a single word of anal
 | **Alpha Vantage** | AI-scored news sentiment per ticker (–1 bearish → +1 bullish) | `ALPHA_VANTAGE_API_KEY` |
 | **GNews** | Top 5 recent headlines by company name | `GNEWS_API_KEY` |
 
-If an API key is absent, that data block is skipped — the agent continues with what it has. SEC EDGAR and yfinance always run.
+If an API key is absent, that data block is skipped — the agent continues with
+what it has. SEC EDGAR and yfinance always run. When Alpha Vantage or GNews is
+configured, transient transport failures, timeouts, HTTP 5xx responses, and
+provider rate limits are retried three times after the initial request, with a
+fixed 30-second delay. Non-rate-limit failures still degrade gracefully after
+the retries. If rate limiting remains after all retries, the paid analysis job
+fails with the stable public error described below.
 
 ### Technical Indicators
 
@@ -127,13 +133,13 @@ Every report is a structured Markdown document with these sections:
 
 ### ERC-8183: Trustless Payment Settlement
 
-The buyer's 1.0 U payment is locked in a smart contract escrow. The agent receives it only after submitting a verifiable deliverable URL on-chain and the 24-hour dispute window passes without a challenge.
+The buyer's 0.21 U payment is locked in a smart contract escrow. The agent receives it only after submitting a verifiable deliverable URL on-chain and the 24-hour dispute window passes without a challenge.
 
 ```
 Buyer                        Chain (BSC Testnet)              Seller Agent
   │                               │                               │
   ├── negotiate (A2A) ────────────────────────────────────────── │
-  │◄─ signed quote (1.0 U) ───────────────────────────────────── │
+  │◄─ signed quote (0.21 U) ──────────────────────────────────── │
   │                               │                               │
   ├── createJob ─────────────────►│                               │
   ├── registerJob ───────────────►│                               │
@@ -217,28 +223,97 @@ UOMP solves two problems ERC-8183 alone cannot:
 
 ### Public x402 gateway endpoint
 
-For the deployed testnet x402 gateway, buyers configure the API Gateway base
-URL rather than the raw AgentCore invocation URL:
+For the deployed mainnet x402 gateway, buyers configure the public base URL
+rather than the raw AgentCore invocation URL:
 
 ```dotenv
-X402_ENDPOINT=https://<api-id>.execute-api.us-east-1.amazonaws.com/testnet
+X402_ENDPOINT=https://stock-agent.bnbchain.org
 X402_SELLER_WALLET=0xd10BdDC20E4DC42A1a19a9653e994991e25b8153
+X402_PAYMENT_TOKEN=U  # strict U (default) or USD1
 ```
 
-Six x402 method/path pairs are public through that gateway:
-`GET /x402/price`, `GET /x402/free`, `POST /x402/free`,
-`POST /x402/analyze/async`,
-`GET /x402/jobs/{jobId}`, and `POST /x402/jobs/{jobId}/resume`. The gateway
+Append `/x402/price`, `/x402/analyze/async`, or private job paths to that base;
+it contains neither `/mainnet` nor a trailing `/x402`. The old execute-api endpoint remains enabled during certificate/DNS/custom-domain validation and is disabled only after successful final cutover verification. Four x402 method/path pairs
+are public through that gateway:
+`GET /x402/price`, `POST /x402/analyze/async`, `GET /x402/jobs/{jobId}`, and
+`POST /x402/jobs/{jobId}/resume`. `/x402/free` remains retired and is absent
+from the OpenAPI routes. The gateway
 uses its Lambda `live` alias and trusted API Gateway request context; it does
 not expose the AgentCore invocation URL. See
 [`docs/x402-lambda-gateway.md`](../docs/x402-lambda-gateway.md) for operation
 and rollback procedures.
-The free POST returns buffered JSON (`content` plus `format`), not SSE.
+
+The fixed BSC Mainnet (chain ID 56) EIP-3009 registry is:
+
+| Symbol | Domain name | Version | Decimals | Exact paid amount | Contract |
+|--------|-------------|---------|----------|-------------------|----------|
+| U | United Stables | 1 | 18 | `210000000000000000` (`0.21 × 10^18`) | `0xcE24439F2D9C6a2289F741120FE202248B666666` |
+| USD1 | World Liberty Financial USD | 1 | 18 | `210000000000000000` (`0.21 × 10^18`) | `0x8d0D000Ee44948FC98c9B98A4FA4921476f08B0d` |
+
+`X402_TOKEN_ADDRESS`, `U_TOKEN_DOMAIN_NAME`, and
+`U_TOKEN_DOMAIN_VERSION` are legacy compatibility settings; they cannot add,
+replace, or override this registry. USDC and USDT are deferred because their
+supported flow requires Permit2.
+
+`GET /x402/price` always exposes the ordered U/USD1 registry in
+`supportedAssets`. This field is capability metadata only. In promotional
+mode, `paymentRequired` remains `false` and `accepts` remains empty, so clients
+must not interpret `supportedAssets` as a payment request or try to sign it.
+
+Promotional mode uses the same async route but sits outside the payment
+protocol. When `X402_PROMO_FREE_MODE=1`, callers POST directly without a wallet
+or `Payment-Signature`. Promotional access is free. The Runtime does not parse an incoming payment header or call
+B402 verify, settlement, authorization-used RPC, or any blockchain RPC. Enable
+and disable it manually, then redeploy:
+
+```bash
+bag env set X402_PROMO_FREE_MODE 1
+bag env set X402_PROMO_FREE_MODE 0
+```
+
+Every accepted POST creates a new job and consumes one of the 30 requests per
+trusted IP in the rolling 24-hour window, including an identical retry. The
+limiter is process-local, so restarts clear counters and multiple replicas do
+not share state. Only API Gateway `requestContext` is trusted for the source
+IP; forwarding headers supplied by callers are ignored. This is an explicitly
+limited promotional control, not a durable distributed quota. Setting
+`X402_PROMO_FREE_MODE=0` restores the paid U/USD1 HTTP 402 flow. That paid flow costs
+0.21 U or 0.21 USD1.
+
+The paid V2 exchange is `402 PAYMENT-REQUIRED: base64(PaymentRequired)`, then
+a retry with `PAYMENT-SIGNATURE: base64(PaymentPayload)`, followed by
+`202 PAYMENT-RESPONSE: base64(SettlementResponse)`. The settled job performs
+two automatic retries when its provider returns empty output. If all three
+attempts are empty, polling returns:
+
+```json
+{
+  "status": "failed",
+  "errorCode": "analysis_empty_response",
+  "retryable": true
+}
+```
+
+`resume` reuses that settled job and never verifies or settles payment again.
+
+If Alpha Vantage or GNews remains rate-limited after the initial request and
+three retries, authenticated job polling returns a retryable failure without
+exposing provider details or credentials:
+
+```json
+{
+  "jobId": "x402_...",
+  "status": "failed",
+  "errorCode": "too_many_users",
+  "error": "Too many users now. Please try again later",
+  "retryable": true
+}
+```
 
 ### Prerequisites
 
 - Node.js 18+, [cloudflared](https://github.com/cloudflare/cloudflared) installed
-- Buyer wallet: ≥ 0.01 tBNB (gas) + ≥ 1.0 U (escrow)
+- Buyer wallet: ≥ 0.01 tBNB (gas) + ≥ 0.21 U (escrow)
 - Seller deployed to BNB Chain platform (see below)
 
 ### Deploy the seller
@@ -440,6 +515,11 @@ ALPHA_VANTAGE_API_KEY=...   # alphavantage.co — free, 25 req/day
 GNEWS_API_KEY=...           # gnews.io — free, 100 req/day
 ```
 
+`.env.local` configures local runs only. For AgentCore deployments, ensure the
+JSON secret referenced by `BNBAGENT_RUNTIME_SECRET_ID` contains
+`ALPHA_VANTAGE_API_KEY` and `GNEWS_API_KEY`; the runtime loads that secret into
+the process environment before constructing the agent tools.
+
 SEC EDGAR and yfinance (price, technicals, options) require no key and always run.
 
 ### Install buyer dependencies
@@ -486,7 +566,7 @@ npm run dev
 | Step | Action | Detail |
 |------|--------|--------|
 | 1 | Load UOMP context | Guard → AAPL ×50 @ $185, NVDA ×20 @ $420, risk=moderate |
-| 2 | `negotiate` | OAuth2 token → A2A → signed quote 1.0 U |
+| 2 | `negotiate` | OAuth2 token → A2A → signed quote 0.21 U |
 | 3 | On-chain buy | createJob → registerJob → setBudget → approve → fund |
 | 4 | `notify_funded` | Job-client EIP-712 authorization over exact gateway + portfolio context → seller ACK |
 | 5 | Seller works | Stage 1: data collection → Stage 2: kimi-k2.6 extended thinking + report (~5–15 min) |
@@ -568,7 +648,11 @@ Agent 在写任何分析之前，会先聚合来自五个数据源的数据。�
 | **Alpha Vantage** | AI 新闻情绪评分（–1 看空 → +1 看多） | `ALPHA_VANTAGE_API_KEY` |
 | **GNews** | 按公司名搜索的最新 5 条头条 | `GNEWS_API_KEY` |
 
-如果某个 Key 未配置，对应数据块跳过，Agent 继续用现有数据完成报告。SEC EDGAR 和 yfinance 始终可用。
+如果某个 Key 未配置，对应数据块跳过，Agent 继续用现有数据完成报告。SEC EDGAR
+和 yfinance 始终可用。配置 Alpha Vantage 或 GNews 后，网络异常、超时、HTTP
+5xx 和供应商限流会在首次请求失败后再重试 3 次，每次固定间隔 30 秒。非限流
+错误在重试耗尽后仍按原逻辑降级；如果最终仍为限流，付费分析任务会使用下方稳定
+错误结束。
 
 ### 技术指标
 
@@ -662,13 +746,13 @@ Agent 使用 **Kimi K2.6**（`kimi-k2.6`，256k 上下文窗口）通过 `api.mo
 
 ### ERC-8183：无需信任的付款结算
 
-买家的 1.0 U 付款锁在智能合约托管中。Agent 只有在将可验证的交付物 URL 提交到链上、且 24 小时争议窗口期过去后，才能收款。
+买家的 0.21 U 付款锁在智能合约托管中。Agent 只有在将可验证的交付物 URL 提交到链上、且 24 小时争议窗口期过去后，才能收款。
 
 ```
 买家                         链上合约（BSC 测试网）              卖家 Agent
   │                               │                               │
   ├── negotiate（A2A）────────────────────────────────────────── │
-  │◄─ 签名报价（1.0 U）──────────────────────────────────────── │
+  │◄─ 签名报价（0.21 U）─────────────────────────────────────── │
   │                               │                               │
   ├── createJob ─────────────────►│                               │
   ├── registerJob ───────────────►│                               │
@@ -750,7 +834,7 @@ Agent 使用 **Kimi K2.6**（`kimi-k2.6`，256k 上下文窗口）通过 `api.mo
 ### 前置条件
 
 - Node.js 18+，已安装 [cloudflared](https://github.com/cloudflare/cloudflared)
-- 买家钱包：≥ 0.01 tBNB（Gas）+ ≥ 1.0 U（托管）
+- 买家钱包：≥ 0.01 tBNB（Gas）+ ≥ 0.21 U（托管）
 - 卖家已部署到 BNB Chain 平台（见下文）
 
 ### 部署卖家
@@ -766,6 +850,38 @@ bag deploy agent --force-deploy-broken-storage
 
 部署完成后，`studio.toml` 记录 `[deploy.platform]`，包含 `agent_id` 和 `invoke_url`。从平台控制台创建 OAuth2 客户端，获取 `client_id` 和 `client_secret`。
 
+### 主网 x402 促销模式
+
+公网 API Gateway 只发布 price、async create、私有 job status 和 resume 四个
+路由；`/x402/free` 仍已退役。买家可以用 `X402_PAYMENT_TOKEN=U`（默认）
+或 `X402_PAYMENT_TOKEN=USD1` 严格选择 token。U 的主网合约为
+`0xcE24439F2D9C6a2289F741120FE202248B666666`，EIP-712 domain 名为
+`United Stables`；USD1 为 `0x8d0D000Ee44948FC98c9B98A4FA4921476f08B0d`，
+domain 名为 `World Liberty Financial USD`。两者 version 均为 `1`、均为 18 位
+小数，付费数量必须精确为 `210000000000000000` (`0.21 × 10^18`)。USDC/USDT
+因需要 Permit2 而暂缓。旧的 `X402_TOKEN_ADDRESS` 和 U domain 环境变量只用于
+兼容，不能覆盖固定 registry。
+
+`GET /x402/price` 始终通过 `supportedAssets` 按 U、USD1 顺序公布能力元数据。
+该字段只表示服务支持哪些资产，不是付款要求。促销模式下
+`paymentRequired=false` 且 `accepts=[]` 保持不变，客户端不得把
+`supportedAssets` 当作支付结构或尝试签名。
+
+`X402_PROMO_FREE_MODE=1` 时，调用方免费直接 POST，不需要钱包或
+`Payment-Signature`；服务端不解析付款证明，也不调用 B402 verify/settle、RPC 或链上
+接口。手动开启/关闭命令为：
+
+```bash
+bag env set X402_PROMO_FREE_MODE 1
+bag env set X402_PROMO_FREE_MODE 0
+```
+
+每次成功 POST 都创建新任务并消耗一次额度，相同请求的重试也不去重。限额是
+单 IP 滚动 24 小时内 30 次，且只保存在当前进程：重启会清空，多副本不共享。
+可信 IP 只来自 API Gateway `requestContext`，不接受请求头伪造的来源地址。
+设回 `X402_PROMO_FREE_MODE=0` 后恢复 U/USD1 的 HTTP 402 付费流程；恢复后的价格为
+0.21 U 或 0.21 USD1。
+
 ### 为异步 x402 任务配置私有存储
 
 异步接口把任务状态和个性化报告保存在 S3。任务创建 7 天到达 `expiresAt` 后，
@@ -774,6 +890,20 @@ URL 仍可独立使用到其自身过期时间，最长 30 分钟。S3 Lifecycle
 `LastModified` 时间计算，满 7 天后仅将对象标记为可过期；实际物理删除由 AWS
 异步调度。本操作手册只支持一个从未启用 S3 Versioning 的独立私有 x402 任务
 bucket。
+
+如果 Alpha Vantage 或 GNews 在首次请求及 3 次重试后仍然限流，鉴权轮询返回：
+
+```json
+{
+  "jobId": "x402_...",
+  "status": "failed",
+  "errorCode": "too_many_users",
+  "error": "Too many users now. Please try again later",
+  "retryable": true
+}
+```
+
+响应不会暴露供应商原始错误、API Key 或其他凭证。
 
 先在操作者本地设置变量，不要提交真实值：
 
@@ -939,6 +1069,11 @@ ALPHA_VANTAGE_API_KEY=...   # alphavantage.co — 免费，25 次/天
 GNEWS_API_KEY=...           # gnews.io — 免费，100 次/天
 ```
 
+`.env.local` 只用于本地运行。部署到 AgentCore 时，需要确保
+`BNBAGENT_RUNTIME_SECRET_ID` 指向的 JSON Secret 包含
+`ALPHA_VANTAGE_API_KEY` 和 `GNEWS_API_KEY`；运行时会在初始化 Agent 工具前将其
+载入进程环境。
+
 ### 安装买家依赖
 
 ```bash
@@ -983,7 +1118,7 @@ npm run dev
 | 步骤 | 操作 | 说明 |
 |------|------|------|
 | 1 | 加载 UOMP 上下文 | Guard → AAPL ×50 @ $185、NVDA ×20 @ $420，risk=moderate |
-| 2 | `negotiate`（A2A） | OAuth2 Token → A2A → 签名报价 1.0 U |
+| 2 | `negotiate`（A2A） | OAuth2 Token → A2A → 签名报价 0.21 U |
 | 3 | 链上买入 | createJob → registerJob → setBudget → approve → fund |
 | 4 | `notify_funded` | job client 对精确网关 + 持仓上下文的 EIP-712 授权 → 卖家 ACK |
 | 5 | 卖家分析 | 第一阶段：5源数据采集 → 第二阶段：结构化报告撰写 |
