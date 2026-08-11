@@ -23,6 +23,7 @@ from stockanalyst.app.agent.x402_settlement import (
 )
 from stockanalyst.app.agent.x402_tokens import (
     TOKENS,
+    U_TOKEN,
     USDC_TOKEN,
     USDT_TOKEN,
 )
@@ -299,6 +300,76 @@ class B402SupportedKindTests(unittest.IsolatedAsyncioTestCase):
                     await client.payment_extras("eip155:56", (USDC_TOKEN,)),
                     {},
                 )
+
+    async def test_omits_numeric_separator_and_non_hex_signer_addresses(self) -> None:
+        now = [100.0]
+        malformed_addresses = (
+            "0x" + "1" * 38 + "_1",
+            "0x" + "1" * 39 + "g",
+        )
+
+        for signer_address in malformed_addresses:
+            with self.subTest(signer_address=signer_address):
+                client = self.client(now)
+                client.post = AsyncMock(return_value=_supported_response(kinds=[{
+                    "x402Version": 2,
+                    "scheme": "exact",
+                    "network": "eip155:56",
+                    "extra": {
+                        **SUPPORTED_EXTRA,
+                        "signerAddress": signer_address,
+                    },
+                }]))
+
+                self.assertEqual(
+                    await client.payment_extras("eip155:56", (U_TOKEN,)),
+                    {},
+                )
+
+    async def test_omits_numeric_separator_and_non_hex_permit2_spenders(self) -> None:
+        now = [100.0]
+        malformed_addresses = (
+            "0x" + "2" * 38 + "_2",
+            "0x" + "2" * 39 + "g",
+        )
+
+        for spender_address in malformed_addresses:
+            with self.subTest(spender_address=spender_address):
+                client = self.client(now)
+                client.post = AsyncMock(return_value=_supported_response(kinds=[{
+                    "x402Version": 2,
+                    "scheme": "exact",
+                    "network": "eip155:56",
+                    "extra": {
+                        **USDC_SUPPORTED_EXTRA,
+                        "spenderAddress": spender_address,
+                    },
+                }]))
+
+                self.assertEqual(
+                    await client.payment_extras("eip155:56", (USDC_TOKEN,)),
+                    {},
+                )
+
+    async def test_accepts_mixed_case_hex_addresses(self) -> None:
+        now = [100.0]
+        extra = {
+            **USDC_SUPPORTED_EXTRA,
+            "signerAddress": "0x" + "aB" * 20,
+            "spenderAddress": "0x" + "Cd" * 20,
+        }
+        client = self.client(now)
+        client.post = AsyncMock(return_value=_supported_response(kinds=[{
+            "x402Version": 2,
+            "scheme": "exact",
+            "network": "eip155:56",
+            "extra": extra,
+        }]))
+
+        self.assertEqual(
+            await client.payment_extras("eip155:56", (USDC_TOKEN,)),
+            {"USDC": extra},
+        )
 
     async def test_omits_duplicate_full_capability_key(self) -> None:
         now = [100.0]

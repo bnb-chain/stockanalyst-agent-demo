@@ -11,6 +11,7 @@ import base64
 import copy
 import json
 import os
+import re
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
@@ -28,6 +29,8 @@ try:
 except ImportError:  # Direct imports from stockanalyst/app/agent.
     from x402_settlement import SettlementOutcome, valid_settlement_reference
     from x402_tokens import PaymentToken, token_by_asset
+
+_EVM_ADDRESS = re.compile(r"0x[0-9a-fA-F]{40}", flags=re.ASCII)
 
 
 class B402Error(RuntimeError):
@@ -344,15 +347,7 @@ class B402Client:
 
 
 def _is_evm_address(value: object) -> bool:
-    if not isinstance(value, str) or len(value) != 42:
-        return False
-    if not value.startswith("0x"):
-        return False
-    try:
-        int(value, 0)
-    except ValueError:
-        return False
-    return True
+    return isinstance(value, str) and _EVM_ADDRESS.fullmatch(value) is not None
 
 
 def _success_data(
