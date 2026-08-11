@@ -164,11 +164,17 @@ LEGACY_X402_HEADER = re.compile(
 )
 UNSAFE_PAYMENT_GUIDANCE_PATTERNS = (
     r"(?i)\bapprove\s*\([^)]*(?:\b[A-Za-z_$][\w$]*\.)*MaxUint(?:256)?\b",
+    r"(?i)\bapprove\s+(?:(?:an?|the)\s+)?(?:[A-Za-z_$][\w$]*\.)*MaxUint(?:256)?\b",
     r"(?i)\bset(?:\s+the)?\s+allowance\s+to\s+(?:[A-Za-z_$][\w$]*\.)*MaxUint(?:256)?\b",
-    r"(?i)\buse\s+(?:an?\s+)?unlimited\s+allowance\b",
-    r"(?i)\b(?:normal\s+)?x402(?::async|\s+(?:client|flow|run|CLI))?\s+automatically\s+approves\b",
+    r"(?i)\bapprove(?:\s+[A-Za-z][\w'-]*){0,3}\s+unlimited\s+allowance\b",
+    r"(?i)\b(?:set|grant|use)(?:\s+[A-Za-z][\w'-]*){0,4}\s+unlimited\s+allowance\b",
+    r"(?i)\bautomatically\s+approves?\b",
+    r"(?i)\b(?:enable|use|configure)\s+(?:an?\s+)?automatic\s+(?:Permit2\s+)?approval\b",
+    r"(?i)\bauto-approv(?:e|es|ed|ing|al)\b",
 )
-GUIDANCE_NEGATION = re.compile(r"(?i)\b(?:never|no|not|without)\b")
+DIRECT_ACTION_NEGATION = re.compile(
+    r"(?i)(?:\bnever|\bno|\b(?:do|does|must|should)\s+not)\s+(?:call\s+)?$"
+)
 
 
 def iter_x402_python_sources(
@@ -273,8 +279,7 @@ def affirmative_payment_guidance_violations(documentation: str) -> list[str]:
     for pattern in UNSAFE_PAYMENT_GUIDANCE_PATTERNS:
         for match in re.finditer(pattern, documentation):
             prefix = documentation[: match.start()]
-            clause_start = max(prefix.rfind(boundary) for boundary in ".!?;,:\n") + 1
-            if GUIDANCE_NEGATION.search(prefix[clause_start:]):
+            if DIRECT_ACTION_NEGATION.search(prefix):
                 continue
             violations.append(match.group(0))
     return violations
@@ -330,12 +335,17 @@ class MainnetInfrastructureContractTests(unittest.TestCase):
             "x402:async does not automatically approve Permit2.",
             "Never call approve(token, MaxUint256).",
             "Do not set allowance to MaxUint256.",
+            "There is no promotional proof or automatic approval.",
         )
         prohibited_guidance = (
             "Call approve(token, MaxUint256) before paying.",
             "Set allowance to MaxUint256 for convenience.",
             "Use unlimited allowance to avoid another transaction.",
             "Normal x402 automatically approves Permit2.",
+            "Approve MaxUint256 before paying.",
+            "Approve an unlimited allowance for convenience.",
+            "Enable automatic Permit2 approval for x402.",
+            "Without user intervention normal x402 automatically approves Permit2.",
         )
 
         for guidance in safe_guidance:
