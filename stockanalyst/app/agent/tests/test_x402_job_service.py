@@ -171,6 +171,47 @@ class ReconciliationRaceStore(MemoryJobStore):
         return await super().replace(stored, record)
 
 
+class PendingPersistenceStore(MemoryJobStore):
+    def __init__(
+        self,
+        *,
+        actions: list[str],
+        concurrent_update: dict[str, Any] | None = None,
+    ) -> None:
+        super().__init__()
+        self.actions = list(actions)
+        self.concurrent_update = dict(concurrent_update or {})
+        self.pending_replace_calls = 0
+
+    async def replace(
+        self,
+        stored: StoredJob,
+        record: dict[str, Any],
+    ) -> StoredJob:
+        is_pending_write = (
+            record.get("pendingSettlementReference") == "0xpending"
+            and stored.record.get("pendingSettlementReference") is None
+        )
+        if is_pending_write:
+            self.pending_replace_calls += 1
+            action = self.actions.pop(0) if self.actions else "success"
+            if action == "conflict":
+                raise JobConflict("pending marker changed concurrently")
+            if action == "apply-conflict":
+                await super().replace(stored, record)
+                raise JobConflict("same pending marker won concurrently")
+            if action == "state-conflict":
+                current = self.jobs[str(record["jobId"])]
+                self.jobs[str(record["jobId"])] = StoredJob(
+                    record={**current.record, **self.concurrent_update},
+                    etag=self._next_etag(),
+                )
+                raise JobConflict("pending state changed concurrently")
+            if action == "transient":
+                raise RuntimeError("transient pending marker write failure")
+        return await super().replace(stored, record)
+
+
 class AccountingMarkerFailureStore(MemoryJobStore):
     async def create_accounting_marker(
         self,
@@ -993,6 +1034,292 @@ class X402JobSettlementTests(unittest.IsolatedAsyncioTestCase):
         authorization_used.assert_not_awaited()
         stream_work.assert_not_called()
         self.assertFalse(service._tasks)
+
+    async def test_malformed_stored_permit2_pending_reference_fails_closed(
+        self,
+    ) -> None:
+        invalid_references: tuple[tuple[str, Any], ...] = (
+            ("empty", ""),
+            ("boolean", True),
+            ("object", {}),
+            ("control-character", "0xpending\n"),
+            ("overlong", "x" * 4_097),
+        )
+        for label, invalid_reference in invalid_references:
+            with self.subTest(label=label):
+                store = MemoryJobStore()
+                payment = verified_payment(
+                    token=USDC_TOKEN,
+                    valid_before=STALE_TIME // 1000,
+                )
+                settle = AsyncMock(
+                    return_value=SettlementOutcome(
+                        "settled",
+                        transaction="0xmust-not-settle",
+                    )
+                )
+                authorization_used = AsyncMock()
+                stream_work = Mock(
+                    side_effect=AssertionError("work must not start")
+                )
+                service = make_service(
+                    store=store,
+                    settle=settle,
+                    authorization_used=authorization_used,
+                    stream_work=stream_work,
+                    clock=lambda: STALE_TIME,
+                )
+                await seed_settling_job(
+                    service,
+                    store,
+                    lease_expires_at=NOW,
+                    payment=payment,
+                    proof_header=PROOF,
+                    pending_settlement_reference=invalid_reference,
+                )
+
+                caught: Exception | None = None
+                with (
+                    patch(
+                        "x402_job_service.validate_payment_proof",
+                        return_value=(payment, ""),
+                    ),
+                    patch.object(service, "_spawn") as spawn,
+                ):
+                    try:
+                        await service.create_job(PROOF, REQUEST)
+                    except Exception as exc:
+                        caught = exc
+
+                self.assertEqual(
+                    getattr(caught, "code", None),
+                    "job_state_unavailable",
+                )
+                self.assertIs(getattr(caught, "retryable", None), True)
+                settle.assert_not_awaited()
+                authorization_used.assert_not_awaited()
+                stream_work.assert_not_called()
+                spawn.assert_not_called()
+                self.assertEqual(store.replace_calls, 0)
+
+    async def test_pending_marker_retries_one_conflict_without_resettling(
+        self,
+    ) -> None:
+        store = PendingPersistenceStore(actions=["conflict"])
+        settle = AsyncMock(
+            return_value=SettlementOutcome(
+                "pending",
+                transaction="0xpending",
+            )
+        )
+        authorization_used = AsyncMock()
+        stream_work = Mock(side_effect=AssertionError("work must not start"))
+        payment = verified_payment(token=USDC_TOKEN)
+        service = make_service(
+            store=store,
+            settle=settle,
+            authorization_used=authorization_used,
+            stream_work=stream_work,
+        )
+
+        caught: Exception | None = None
+        with (
+            patch(
+                "x402_job_service.validate_payment_proof",
+                return_value=(payment, ""),
+            ),
+            patch.object(service, "_spawn") as spawn,
+        ):
+            try:
+                await service.create_job(PROOF, REQUEST)
+            except Exception as exc:
+                caught = exc
+
+        self.assertEqual(getattr(caught, "code", None), "settlement_pending")
+        self.assertIs(getattr(caught, "retryable", None), True)
+        durable = store.jobs[service.derive_identity(payment).job_id].record
+        self.assertEqual(durable["pendingSettlementReference"], "0xpending")
+        self.assertEqual(store.pending_replace_calls, 2)
+        settle.assert_awaited_once_with(PROOF, "verify-and-settle")
+        authorization_used.assert_not_awaited()
+        stream_work.assert_not_called()
+        spawn.assert_not_called()
+
+    async def test_pending_marker_retries_one_transient_write(
+        self,
+    ) -> None:
+        store = PendingPersistenceStore(actions=["transient"])
+        settle = AsyncMock(
+            return_value=SettlementOutcome(
+                "pending",
+                transaction="0xpending",
+            )
+        )
+        payment = verified_payment(token=USDC_TOKEN)
+        service = make_service(store=store, settle=settle)
+
+        caught: Exception | None = None
+        with (
+            patch(
+                "x402_job_service.validate_payment_proof",
+                return_value=(payment, ""),
+            ),
+            patch.object(service, "_spawn") as spawn,
+        ):
+            try:
+                await service.create_job(PROOF, REQUEST)
+            except Exception as exc:
+                caught = exc
+
+        self.assertEqual(getattr(caught, "code", None), "settlement_pending")
+        self.assertEqual(store.pending_replace_calls, 2)
+        durable = store.jobs[service.derive_identity(payment).job_id].record
+        self.assertEqual(durable["pendingSettlementReference"], "0xpending")
+        settle.assert_awaited_once_with(PROOF, "verify-and-settle")
+        spawn.assert_not_called()
+
+    async def test_pending_marker_accepts_same_concurrent_marker(
+        self,
+    ) -> None:
+        store = PendingPersistenceStore(actions=["apply-conflict"])
+        settle = AsyncMock(
+            return_value=SettlementOutcome(
+                "pending",
+                transaction="0xpending",
+            )
+        )
+        payment = verified_payment(token=USDC_TOKEN)
+        service = make_service(store=store, settle=settle)
+
+        caught: Exception | None = None
+        with (
+            patch(
+                "x402_job_service.validate_payment_proof",
+                return_value=(payment, ""),
+            ),
+            patch.object(service, "_spawn") as spawn,
+        ):
+            try:
+                await service.create_job(PROOF, REQUEST)
+            except Exception as exc:
+                caught = exc
+
+        self.assertEqual(getattr(caught, "code", None), "settlement_pending")
+        self.assertEqual(store.pending_replace_calls, 1)
+        durable = store.jobs[service.derive_identity(payment).job_id].record
+        self.assertEqual(durable["pendingSettlementReference"], "0xpending")
+        settle.assert_awaited_once_with(PROOF, "verify-and-settle")
+        spawn.assert_not_called()
+
+    async def test_pending_marker_conflicting_state_fails_without_overwrite(
+        self,
+    ) -> None:
+        cases = (
+            (
+                "different-marker",
+                {"pendingSettlementReference": "0xdifferent"},
+            ),
+            ("malformed-marker", {"pendingSettlementReference": True}),
+            (
+                "terminal",
+                {
+                    "status": "failed",
+                    "paymentStatus": "failed",
+                    "pendingSettlementReference": "0xpending",
+                },
+            ),
+            ("identity-mismatch", {"paymentKey": "different-payment-key"}),
+            ("digest-mismatch", {"paymentProofDigest": "00" * 32}),
+        )
+        for label, concurrent_update in cases:
+            with self.subTest(label=label):
+                store = PendingPersistenceStore(
+                    actions=["state-conflict"],
+                    concurrent_update=concurrent_update,
+                )
+                settle = AsyncMock(
+                    return_value=SettlementOutcome(
+                        "pending",
+                        transaction="0xpending",
+                    )
+                )
+                authorization_used = AsyncMock()
+                payment = verified_payment(token=USDC_TOKEN)
+                service = make_service(
+                    store=store,
+                    settle=settle,
+                    authorization_used=authorization_used,
+                )
+
+                caught: Exception | None = None
+                with (
+                    patch(
+                        "x402_job_service.validate_payment_proof",
+                        return_value=(payment, ""),
+                    ),
+                    patch.object(service, "_spawn") as spawn,
+                ):
+                    try:
+                        await service.create_job(PROOF, REQUEST)
+                    except Exception as exc:
+                        caught = exc
+
+                self.assertEqual(
+                    getattr(caught, "code", None),
+                    "job_state_unavailable",
+                )
+                durable = store.jobs[
+                    service.derive_identity(payment).job_id
+                ].record
+                for key, value in concurrent_update.items():
+                    self.assertEqual(durable[key], value)
+                self.assertEqual(store.pending_replace_calls, 1)
+                settle.assert_awaited_once_with(PROOF, "verify-and-settle")
+                authorization_used.assert_not_awaited()
+                spawn.assert_not_called()
+
+    async def test_pending_marker_persistent_failure_is_bounded_and_retryable(
+        self,
+    ) -> None:
+        store = PendingPersistenceStore(actions=["transient"] * 10)
+        settle = AsyncMock(
+            return_value=SettlementOutcome(
+                "pending",
+                transaction="0xpending",
+            )
+        )
+        authorization_used = AsyncMock()
+        stream_work = Mock(side_effect=AssertionError("work must not start"))
+        payment = verified_payment(token=USDC_TOKEN)
+        service = make_service(
+            store=store,
+            settle=settle,
+            authorization_used=authorization_used,
+            stream_work=stream_work,
+        )
+
+        caught: Exception | None = None
+        with (
+            patch(
+                "x402_job_service.validate_payment_proof",
+                return_value=(payment, ""),
+            ),
+            patch.object(service, "_spawn") as spawn,
+        ):
+            try:
+                await service.create_job(PROOF, REQUEST)
+            except Exception as exc:
+                caught = exc
+
+        self.assertEqual(getattr(caught, "code", None), "settlement_pending")
+        self.assertIs(getattr(caught, "retryable", None), True)
+        self.assertEqual(store.pending_replace_calls, 3)
+        durable = store.jobs[service.derive_identity(payment).job_id].record
+        self.assertIsNone(durable["pendingSettlementReference"])
+        settle.assert_awaited_once_with(PROOF, "verify-and-settle")
+        authorization_used.assert_not_awaited()
+        stream_work.assert_not_called()
+        spawn.assert_not_called()
 
     async def test_stale_permit2_pending_recovery_is_settle_only(self) -> None:
         store = MemoryJobStore()
