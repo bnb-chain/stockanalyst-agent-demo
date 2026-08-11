@@ -30,7 +30,7 @@ import {
 } from "node:crypto";
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { Wallet } from "ethers";
+import { Contract, JsonRpcProvider, Wallet } from "ethers";
 import { saveReport } from "./pdf-report.js";
 import { GuardUserMemory, buildTaskFromMemory } from "./uomp.js";
 import {
@@ -56,6 +56,12 @@ import {
   type PaidPaymentChallenge,
   type PaymentTokenSymbol,
 } from "./x402-payment.js";
+import {
+  assertPermit2PaymentReady,
+  readPermit2Allowance,
+  type Permit2AllowanceContext,
+  type Permit2TokenSymbol,
+} from "./x402-permit2.js";
 
 const MODULE_DIRECTORY = dirname(fileURLToPath(import.meta.url));
 const KEYSTORE_PATH = process.env["KEYSTORE_PATH"] ?? "";
@@ -85,13 +91,21 @@ const PENDING_RECOVERY_MILLISECONDS = 7 * 24 * 60 * 60 * 1_000;
 const MAX_CREATE_ATTEMPTS = 3;
 const CREATE_RETRY_MILLISECONDS = 1_000;
 const MAX_CREATE_RETRY_MILLISECONDS = 8_000;
+const ERC20_ALLOWANCE_ABI = [
+  "function allowance(address owner, address spender) view returns (uint256)",
+] as const;
 
 export function resolveX402PaymentToken(
   env: Readonly<Record<string, string | undefined>> = process.env,
 ): PaymentTokenSymbol {
   const value = env["X402_PAYMENT_TOKEN"] ?? "U";
-  if (value !== "U" && value !== "USD1") {
-    throw new Error("X402_PAYMENT_TOKEN must be U or USD1");
+  if (
+    value !== "U"
+    && value !== "USD1"
+    && value !== "USDC"
+    && value !== "USDT"
+  ) {
+    throw new Error("X402_PAYMENT_TOKEN must be U, USD1, USDC, or USDT");
   }
   return value;
 }
@@ -118,7 +132,12 @@ function parseX402PaymentAccess(value: unknown): X402PaymentAccess {
   const promotional = value["promotional"];
   const payTo = value["payTo"];
   if (
-    (token !== "U" && token !== "USD1")
+    (
+      token !== "U"
+      && token !== "USD1"
+      && token !== "USDC"
+      && token !== "USDT"
+    )
     || typeof promotional !== "boolean"
     || typeof payTo !== "string"
     || !/^0x[0-9a-f]{40}$/.test(payTo)
@@ -158,18 +177,25 @@ function paymentAccessFromAccepted(
   const token = PAYMENT_TOKENS[symbol];
   const promotional = amount === "0";
   const signerAddress = extra["signerAddress"];
+  const spenderAddress = extra["spenderAddress"];
   const signerPresent = Object.prototype.hasOwnProperty.call(
     extra,
     "signerAddress",
   );
+  const spenderPresent = Object.prototype.hasOwnProperty.call(
+    extra,
+    "spenderAddress",
+  );
+  const transferMethod = token.transferMethod;
   if (
     (expectedPromotional !== undefined && expectedPromotional !== promotional)
     || (!promotional && amount !== PAID_AMOUNT)
+    || (promotional && transferMethod !== "eip3009")
     || typeof payTo !== "string"
     || !/^0x[0-9a-fA-F]{40}$/.test(payTo)
     || extra["name"] !== token.name
     || extra["version"] !== token.version
-    || extra["assetTransferMethod"] !== "eip3009"
+    || extra["assetTransferMethod"] !== transferMethod
     || (
       promotional
         ? signerPresent
@@ -178,6 +204,14 @@ function paymentAccessFromAccepted(
           || typeof signerAddress !== "string"
           || !/^0x[0-9a-fA-F]{40}$/.test(signerAddress)
         )
+    )
+    || (
+      transferMethod === "permit2-exact"
+      && (
+        !spenderPresent
+        || typeof spenderAddress !== "string"
+        || !/^0x[0-9a-fA-F]{40}$/.test(spenderAddress)
+      )
     )
   ) {
     throw new Error("Payment access metadata is invalid");
@@ -219,6 +253,48 @@ export interface PendingCreateOptions extends CreateRequestOptions {
   now?: () => number;
   expectedJobId?: string;
 }
+
+export interface PaidPendingCreateDependencies {
+  createPermit2AllowanceReader(
+    rpcUrl: string,
+    walletAddress: string,
+    token: Permit2TokenSymbol,
+  ): () => Promise<bigint>;
+  buildPaymentProof(
+    wallet: Wallet,
+    challenge: PaidPaymentChallenge,
+  ): Promise<string>;
+}
+
+function createDefaultPermit2AllowanceReader(
+  rpcUrl: string,
+  walletAddress: string,
+  token: Permit2TokenSymbol,
+): () => Promise<bigint> {
+  const provider = new JsonRpcProvider(rpcUrl);
+  const contract = new Contract(
+    PAYMENT_TOKENS[token].asset,
+    ERC20_ALLOWANCE_ABI,
+    provider,
+  );
+  const allowanceContract = {
+    allowance: (owner: string, spender: string) => (
+      contract.getFunction("allowance").staticCall(owner, spender)
+    ),
+  } as Permit2AllowanceContext["contract"];
+  return () => readPermit2Allowance({
+    token,
+    walletAddress,
+    rpcUrl,
+    provider,
+    contract: allowanceContract,
+  });
+}
+
+const DEFAULT_PAID_PENDING_CREATE_DEPENDENCIES: PaidPendingCreateDependencies = {
+  createPermit2AllowanceReader: createDefaultPermit2AllowanceReader,
+  buildPaymentProof,
+};
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -487,9 +563,17 @@ function paymentProofExpiresAt(paymentProof: string): number {
     if (!isRecord(proof)) throw new Error("invalid proof");
     const payload = proof["payload"];
     if (!isRecord(payload)) throw new Error("invalid proof");
-    const authorization = payload["authorization"];
+    const accepted = proof["accepted"];
+    const acceptedExtra = isRecord(accepted) ? accepted["extra"] : undefined;
+    const permit2 = isRecord(acceptedExtra)
+      && acceptedExtra["assetTransferMethod"] === "permit2-exact";
+    const authorization = permit2
+      ? payload["permit2Authorization"]
+      : payload["authorization"];
     if (!isRecord(authorization)) throw new Error("invalid proof");
-    const validBefore = authorization["validBefore"];
+    const validBefore = permit2
+      ? authorization["deadline"]
+      : authorization["validBefore"];
     if (
       typeof validBefore !== "string"
       || !/^[1-9]\d{0,10}$/.test(validBefore)
@@ -531,6 +615,36 @@ export function createPendingRecord(
     proofExpiresAt,
     recoveryExpiresAt: now + PENDING_RECOVERY_MILLISECONDS,
   };
+}
+
+export async function preparePaidPendingCreate(
+  wallet: Wallet,
+  challenge: PaidPaymentChallenge,
+  paymentToken: PaymentTokenSymbol,
+  request: AsyncAnalysisRequest,
+  env: Readonly<Record<string, string | undefined>> = process.env,
+  dependencies: PaidPendingCreateDependencies = (
+    DEFAULT_PAID_PENDING_CREATE_DEPENDENCIES
+  ),
+): Promise<PendingCreateRecord> {
+  const access = paymentAccessFromChallenge(challenge);
+  if (access.token !== paymentToken) {
+    throw new Error("Payment challenge token does not match X402_PAYMENT_TOKEN");
+  }
+  if (challenge.accepted.extra.assetTransferMethod === "permit2-exact") {
+    if (paymentToken !== "USDC" && paymentToken !== "USDT") {
+      throw new Error("Permit2 payment token must be USDC or USDT");
+    }
+    const readAllowance = dependencies.createPermit2AllowanceReader(
+      env["BSC_RPC_URL"] ?? "",
+      wallet.address,
+      paymentToken,
+    );
+    const allowance = await readAllowance();
+    assertPermit2PaymentReady(allowance);
+  }
+  const proof = await dependencies.buildPaymentProof(wallet, challenge);
+  return createPendingRecord(proof, request);
 }
 
 function parsePendingCreate(value: unknown): PendingCreateRecord {
@@ -1083,10 +1197,16 @@ async function main(): Promise<void> {
             readFileSync(keystorePath, "utf8"),
             WALLET_PASSWORD,
           ) as Wallet;
-          console.log("Signing one x402 EIP-3009 payment authorization...");
-          const proof = await buildPaymentProof(wallet, initial.challenge);
-          pending = createPendingRecord(
-            proof,
+          const transferMethod = initial.challenge.accepted.extra.assetTransferMethod;
+          console.log(
+            transferMethod === "permit2-exact"
+              ? "Checking Permit2 allowance and signing one exact payment authorization..."
+              : "Signing one x402 EIP-3009 payment authorization...",
+          );
+          pending = await preparePaidPendingCreate(
+            wallet,
+            initial.challenge,
+            paymentToken,
             request,
           );
           // This durable record must exist before the first payment POST.
