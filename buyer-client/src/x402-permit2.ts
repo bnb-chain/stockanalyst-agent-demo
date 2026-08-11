@@ -374,8 +374,11 @@ const SAFE_CLI_UNKNOWN_ERROR =
 
 function formatPermit2CliError(error: unknown): string {
   try {
-    if (error instanceof Error && SAFE_CLI_ERROR_MESSAGES.has(error.message)) {
-      return error.message;
+    if (error instanceof Error) {
+      const message = error.message;
+      if (SAFE_CLI_ERROR_MESSAGES.has(message)) {
+        return message;
+      }
     }
   } catch {
     // Unknown provider errors may have hostile getters. Never inspect further.

@@ -570,3 +570,72 @@ test("CLI main redacts unknown provider and transaction errors and exits nonzero
     );
   }
 });
+
+test("CLI formatter reads an allowlisted Error message exactly once", async () => {
+  const statefulError = new Error();
+  let messageReads = 0;
+  Object.defineProperty(statefulError, "message", {
+    configurable: true,
+    get: () => {
+      messageReads += 1;
+      if (messageReads === 1) {
+        return "BSC_RPC_URL is required for Permit2 allowance operations";
+      }
+      return [
+        "https://buyer:API_KEY_MARKER@bsc.example/v1",
+        "eth_sendRawTransaction RAW_TX_MARKER",
+        "SIGNATURE_MARKER",
+      ].join("\n");
+    },
+  });
+  const stderr: string[] = [];
+  const exitCodes: number[] = [];
+
+  await runPermit2AllowanceCliMain(
+    ["allowance", "USDC"],
+    {},
+    { createContext: async () => { throw statefulError; } },
+    {
+      writeError: (message) => stderr.push(message),
+      setExitCode: (code) => exitCodes.push(code),
+    },
+  );
+
+  assert.equal(messageReads, 1);
+  assert.deepEqual(stderr, [
+    "BSC_RPC_URL is required for Permit2 allowance operations",
+  ]);
+  assert.deepEqual(exitCodes, [1]);
+  assert.doesNotMatch(
+    stderr.join("\n"),
+    /API_KEY_MARKER|RAW_TX_MARKER|SIGNATURE_MARKER|eth_sendRawTransaction/,
+  );
+});
+
+test("CLI formatter safely handles an Error message getter that throws", async () => {
+  const throwingError = new Error();
+  Object.defineProperty(throwingError, "message", {
+    configurable: true,
+    get: () => {
+      throw new Error("API_KEY_MARKER RAW_TX_MARKER SIGNATURE_MARKER");
+    },
+  });
+  const stderr: string[] = [];
+  const exitCodes: number[] = [];
+
+  await runPermit2AllowanceCliMain(
+    ["allowance", "USDC"],
+    {},
+    { createContext: async () => { throw throwingError; } },
+    {
+      writeError: (message) => stderr.push(message),
+      setExitCode: (code) => exitCodes.push(code),
+    },
+  );
+
+  assert.deepEqual(stderr, [
+    "Permit2 allowance command failed; verify RPC configuration, wallet funds, and transaction status",
+  ]);
+  assert.deepEqual(exitCodes, [1]);
+  assert.doesNotMatch(stderr.join("\n"), /API_KEY_MARKER|RAW_TX_MARKER|SIGNATURE_MARKER/);
+});
