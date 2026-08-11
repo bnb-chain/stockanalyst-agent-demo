@@ -17,8 +17,8 @@ Three ways to pay — pick the one that fits your use case:
 | Tier | Command | Cost | Settlement | Speed |
 |------|---------|------|------------|-------|
 | **Free** quick quote | `npm run x402:free` | 0 U | none (identity proof only) | ~1s |
-| **Paid** full analysis via x402 | `npm run x402:async` | 1.0 U | Binance Pay facilitator | async job |
-| **Paid** full analysis via ERC-8183 | `npm run dev` | 1.0 U | on-chain escrow (trustless) | 5–15 min |
+| **Paid** full analysis via x402 | `npm run x402:async` | 0.21 U or 0.21 USD1 | Binance Pay facilitator | async job |
+| **Paid** full analysis via ERC-8183 | `npm run dev` | 0.21 U | on-chain escrow (trustless) | 5–15 min |
 
 - **Seller** (`stockanalyst/`) — stock analysis agent deployed on BNB Chain platform; serves both x402 (durable private jobs, EIP-712 EIP-3009) and ERC-8183 (on-chain escrow, A2A + Cognito) in parallel. LLM: **kimi-k2.6** with extended thinking.
 - **Buyer** (`buyer-client/`) — TypeScript client that reads the user's portfolio and cost basis from a local UOMP Guard and supports all three payment tiers.
@@ -43,13 +43,13 @@ Three ways to pay — pick the one that fits your use case:
         │◄── JSON: quick quote table ─────────                  (~1s)
         │
         ├─── x402 paid async ─────────────► public x402 API Gateway
-        │    sign 1-U EIP-712 proof         └─ seller agent → Binance Pay facilitator
+        │    sign 0.21-U/USD1 EIP-712 proof └─ seller agent → Binance Pay facilitator
         │    POST /x402/analyze/async          kimi-k2.6 background analysis
         │◄── jobId + private token ────────
         │    poll status → presigned URL ──► private S3 report
         │
         ├─[2]─ A2A negotiate ─────────────► seller agent (BNB Chain Platform :9000)
-        │      OAuth2 token                  └─ sign quote → 1.0 U
+        │      OAuth2 token                  └─ sign quote → 0.21 U
         │◄─────────────────────────────────── signed quote
         │
         ├─[3]─ createJob ─────────────────► BSC Testnet (chain 97)
@@ -76,7 +76,7 @@ Three ways to pay — pick the one that fits your use case:
 
 | | x402 Free | x402 Paid | ERC-8183 |
 |---|---|---|---|
-| Cost | 0 U | 1.0 U | 1.0 U |
+| Cost | 0 U | 0.21 U or 0.21 USD1 | 0.21 U |
 | Signing | EIP-712 (0-U identity proof) | EIP-712 EIP-3009 | EIP-191 quote + on-chain txs |
 | On-chain settlement | none | Binance Pay facilitator | escrow contract (trustless) |
 | Report | quick quote table | full analysis | full analysis |
@@ -97,8 +97,8 @@ node guard-mock.mjs
 # Terminal 3 — buyer (pick one)
 cd buyer-client
 SYMBOL=AAPL npm run x402:free    # free: 0 U, quick quote, ~1s
-npm run x402:async               # paid: 1 U, durable async analysis
-npm run dev                      # paid: 1 U, full analysis, ERC-8183 trustless
+npm run x402:async               # paid: 0.21 U or 0.21 USD1, durable async analysis
+npm run dev                      # paid: 0.21 U, full analysis, ERC-8183 trustless
 ```
 
 ## ERC-8183 E2E test flow
@@ -106,7 +106,7 @@ npm run dev                      # paid: 1 U, full analysis, ERC-8183 trustless
 | Step | Who | Action |
 |------|-----|--------|
 | 1 | Buyer | Read UOMP Guard → AAPL/NVDA holdings + risk profile |
-| 2 | Buyer→Seller | A2A negotiate (OAuth2) → signed quote 1.0 U |
+| 2 | Buyer→Seller | A2A negotiate (OAuth2) → signed quote 0.21 U |
 | 3 | Buyer→Chain | createJob → registerJob → setBudget → approve → fund |
 | 4 | Buyer→Seller | `notify_funded` with EIP-712 authorization from the job-client wallet |
 | 5 | Seller | kimi-k2.6 extended thinking + report (~5–15 min) → submit_result → POST to tunnel |
@@ -146,7 +146,11 @@ Record `agent_id` from `studio.toml [deploy.platform]` and create an OAuth2 clie
 
 The deployed agent exposes two ports:
 - `:9000` — A2A (ERC-8183, requires Cognito Bearer token)
-- `:9001` — x402 (public, `X-Payment` auth only) — enabled by `X402_PORT=9001` env var
+- `:9001` — x402 (public, `Payment-Signature` auth only) — enabled by `X402_PORT=9001` env var
+
+The public x402 V2 exchange is `402 PAYMENT-REQUIRED: base64(PaymentRequired)`,
+followed by a retry carrying `PAYMENT-SIGNATURE: base64(PaymentPayload)`, then
+`202 PAYMENT-RESPONSE: base64(SettlementResponse)`.
 
 ### 2. Configure the buyer
 
@@ -170,15 +174,16 @@ AGENT_CLIENT_ID=<client_id>
 AGENT_CLIENT_SECRET=<client_secret>
 PROVIDER_ADDRESS=<seller wallet address>
 
-# x402 — defaults to localhost:9000; deployed value is the API Gateway
-# CloudFormation `X402GatewayBaseUrl` stack output
-# X402_ENDPOINT=https://<api-id>.execute-api.us-east-1.amazonaws.com/testnet
+# x402 — defaults to localhost:9000; deployed value is the public mainnet gateway
+X402_ENDPOINT=https://stock-agent.bnbchain.org
+# Append /x402/price, /x402/analyze/async, or private job paths to this base.
+# It contains neither /mainnet nor a trailing /x402. The old execute-api endpoint remains enabled during certificate/DNS/custom-domain validation and is disabled only after successful final cutover verification.
 
 UOMP_GUARD_URL=http://127.0.0.1:9374
 UOMP_GUARD_TOKEN=demo-guard-token
 ```
 
-Buyer wallet needs: ≥ 0.01 tBNB (gas) + ≥ 1.0 U (for paid tiers).
+Buyer wallet needs: ≥ 0.01 tBNB (gas) + ≥ 0.21 U (for ERC-8183); x402 accepts 0.21 U or 0.21 USD1.
 
 ### 3. Run
 
@@ -192,8 +197,8 @@ node guard-mock.mjs
 cd buyer-client
 
 SYMBOL=AAPL npm run x402:free   # free: 0 U, quick quote, ~1s, no LLM
-npm run x402:async              # paid: 1 U, durable async analysis
-npm run dev                      # paid: 1 U, full analysis, ERC-8183 trustless (~5–15min)
+npm run x402:async              # paid: 0.21 U or 0.21 USD1, durable async analysis
+npm run dev                      # paid: 0.21 U, full analysis, ERC-8183 trustless (~5–15min)
 ```
 
 After the 24-hour ERC-8183 dispute window:

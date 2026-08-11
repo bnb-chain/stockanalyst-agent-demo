@@ -69,7 +69,8 @@ jobs:
           import json
           from seller_core import _build_stock_analysis_prompt
           task = json.dumps({'task': 'Analyze AAPL', 'terms': {'symbols': ['AAPL'], 'analysis_type': 'technical', 'language': 'en'}})
-          prompt = _build_stock_analysis_prompt(task)
+          prompt, symbols = _build_stock_analysis_prompt(task)
+          assert symbols == ['AAPL'], f'unexpected symbols: {symbols}'
           assert 'AAPL' in prompt
           assert 'get_stock_quote' in prompt
           print('Prompt builder OK')

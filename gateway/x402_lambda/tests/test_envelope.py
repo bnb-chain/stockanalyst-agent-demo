@@ -1,5 +1,7 @@
 import base64
+import traceback
 import unittest
+from unittest.mock import Mock, patch
 
 from envelope import GatewayRequestError, build_envelope
 
@@ -32,7 +34,11 @@ def api_event(
         ),
         "pathParameters": {"proxy": path.lstrip("/")},
         "stageVariables": None,
-        "requestContext": {"stage": stage, "requestId": "gateway-request"},
+        "requestContext": {
+            "stage": stage,
+            "requestId": "gateway-request",
+            "identity": {"sourceIp": "198.51.100.8"},
+        },
         "body": encoded,
         "isBase64Encoded": base64_encoded,
     }
@@ -44,7 +50,7 @@ class EnvelopeTests(unittest.TestCase):
             api_event(
                 method="POST",
                 path="/x402/analyze/async",
-                headers={"X-Payment": "proof", "Content-Type": "application/json"},
+                headers={"PAYMENT-SIGNATURE": "proof", "Content-Type": "application/json"},
                 body=b'{"symbols":["AAPL"]}',
             ),
             public_base_url=PUBLIC_BASE,
@@ -53,7 +59,54 @@ class EnvelopeTests(unittest.TestCase):
         self.assertEqual(envelope["method"], "POST")
         self.assertEqual(envelope["path"], "/x402/analyze/async")
         self.assertEqual(envelope["publicBaseUrl"], PUBLIC_BASE)
-        self.assertEqual(envelope["headers"]["x-payment"], "proof")
+        self.assertEqual(envelope["headers"]["payment-signature"], "proof")
+        self.assertEqual(envelope["sourceIp"], "198.51.100.8")
+
+    def test_normalizes_trusted_ipv6_source_ip(self):
+        event = api_event()
+        event["requestContext"]["identity"]["sourceIp"] = "2001:0db8:0:0:0:0:0:42"
+
+        envelope = build_envelope(event, public_base_url=PUBLIC_BASE)
+
+        self.assertEqual(envelope["sourceIp"], "2001:db8::42")
+
+    def test_rejects_missing_or_malformed_trusted_source_ip(self):
+        missing_identity = api_event()
+        del missing_identity["requestContext"]["identity"]
+        malformed = api_event()
+        malformed["requestContext"]["identity"]["sourceIp"] = "not-an-ip"
+
+        for event in (missing_identity, malformed):
+            with self.subTest(request_context=event["requestContext"]), self.assertRaisesRegex(
+                GatewayRequestError, "source_ip_unavailable"
+            ):
+                build_envelope(event, public_base_url=PUBLIC_BASE)
+
+    def test_malformed_source_ip_is_absent_from_formatted_error(self):
+        marker = "198.51.100.8-attacker-marker"
+        event = api_event()
+        event["requestContext"]["identity"]["sourceIp"] = marker
+
+        try:
+            build_envelope(event, public_base_url=PUBLIC_BASE)
+        except GatewayRequestError as exc:
+            formatted = "".join(traceback.format_exception(exc))
+            self.assertEqual(exc.code, "source_ip_unavailable")
+            self.assertIsNone(exc.__cause__)
+            self.assertNotIn(marker, str(exc))
+            self.assertNotIn(marker, formatted)
+        else:
+            self.fail("malformed source IP was accepted")
+
+    def test_source_ip_is_not_bound_into_request_id(self):
+        ipv4 = api_event()
+        ipv6 = api_event()
+        ipv6["requestContext"]["identity"]["sourceIp"] = "2001:db8::42"
+
+        ipv4_envelope = build_envelope(ipv4, public_base_url=PUBLIC_BASE)
+        ipv6_envelope = build_envelope(ipv6, public_base_url=PUBLIC_BASE)
+
+        self.assertEqual(ipv4_envelope["requestId"], ipv6_envelope["requestId"])
 
     def test_free_get_and_post_routes_build_envelopes(self):
         challenge = build_envelope(
@@ -64,7 +117,7 @@ class EnvelopeTests(unittest.TestCase):
             api_event(
                 method="POST",
                 path="/x402/free",
-                headers={"X-Payment": "proof"},
+                headers={"PAYMENT-SIGNATURE": "proof"},
                 body=b'{"symbol":"AAPL"}',
             ),
             public_base_url=PUBLIC_BASE,
@@ -75,11 +128,30 @@ class EnvelopeTests(unittest.TestCase):
         self.assertEqual(quote["path"], "/x402/free")
 
     def test_request_id_is_stable_for_exact_retry(self):
-        event = api_event(headers={"X-Payment": "proof"})
+        event = api_event(headers={"PAYMENT-SIGNATURE": "proof"})
         first = build_envelope(event, public_base_url=PUBLIC_BASE)
         second = build_envelope(event, public_base_url=PUBLIC_BASE)
         self.assertEqual(first["requestId"], second["requestId"])
         self.assertRegex(first["requestId"], r"\Ax402gw_[0-9a-f]{64}\Z")
+
+    def test_forwards_v2_payment_signature_and_binds_request_id(self):
+        first = build_envelope(
+            api_event(headers={"PAYMENT-SIGNATURE": "proof-a"}),
+            public_base_url=PUBLIC_BASE,
+        )
+        second = build_envelope(
+            api_event(headers={"PAYMENT-SIGNATURE": "proof-b"}),
+            public_base_url=PUBLIC_BASE,
+        )
+        self.assertEqual(first["headers"]["payment-signature"], "proof-a")
+        self.assertNotEqual(first["requestId"], second["requestId"])
+
+    def test_drops_legacy_x_payment(self):
+        envelope = build_envelope(
+            api_event(headers={"X-Payment": "legacy"}),
+            public_base_url=PUBLIC_BASE,
+        )
+        self.assertNotIn("x-payment", envelope["headers"])
 
     def test_removes_stage_prefix_and_rejects_query_string(self):
         event = api_event(path=f"/x402/jobs/{JOB_ID}")
@@ -136,34 +208,60 @@ class EnvelopeTests(unittest.TestCase):
         event = api_event(headers={
             "Host": "api.example.test",
             "Authorization": "Bearer caller-token",
-            "X-Forwarded-For": "198.51.100.8",
+            "X-Forwarded-For": "203.0.113.9",
             "X-Forwarded-Port": "443",
             "X-Forwarded-Proto": "https",
             "Connection": "keep-alive",
             "Accept": "application/json",
-            "X-Payment": "proof",
+            "PAYMENT-SIGNATURE": "proof",
         })
         event["multiValueHeaders"] = {
             "Host": ["api.example.test"],
-            "X-Forwarded-For": ["198.51.100.8"],
+            "X-Forwarded-For": ["203.0.113.9"],
             "Accept": ["application/json"],
-            "X-Payment": ["proof"],
+            "PAYMENT-SIGNATURE": ["proof"],
         }
         envelope = build_envelope(event, public_base_url=PUBLIC_BASE)
-        self.assertEqual(envelope["headers"], {"accept": "application/json", "x-payment": "proof"})
+        self.assertEqual(envelope["headers"], {"accept": "application/json", "payment-signature": "proof"})
+        self.assertEqual(envelope["sourceIp"], "198.51.100.8")
 
     def test_rejects_unsafe_allowlist_multivalue_headers(self):
-        event = api_event(headers={"X-Payment": "proof"})
-        event["multiValueHeaders"] = {"X-Payment": ["proof", "other-proof"]}
+        event = api_event(headers={"PAYMENT-SIGNATURE": "proof"})
+        event["multiValueHeaders"] = {"PAYMENT-SIGNATURE": ["proof", "other-proof"]}
         with self.assertRaisesRegex(GatewayRequestError, "request_header_not_allowed"):
             build_envelope(event, public_base_url=PUBLIC_BASE)
 
     def test_rejects_crlf_in_allowlisted_header(self):
         with self.assertRaisesRegex(GatewayRequestError, "request_header_not_allowed"):
             build_envelope(
-                api_event(headers={"X-Payment": "proof\r\ninjected"}),
+                api_event(headers={"PAYMENT-SIGNATURE": "proof\r\ninjected"}),
                 public_base_url=PUBLIC_BASE,
             )
+
+    def test_payment_signature_limit_is_checked_before_request_digest(self):
+        limit = 32 * 1024
+        accepted = build_envelope(
+            api_event(headers={"PAYMENT-SIGNATURE": "x" * limit}),
+            public_base_url=PUBLIC_BASE,
+        )
+        self.assertEqual(
+            len(accepted["headers"]["payment-signature"]),
+            limit,
+        )
+
+        digest = Mock()
+        with (
+            patch("envelope.hashlib.sha256", return_value=digest),
+            self.assertRaisesRegex(
+                GatewayRequestError,
+                "request_header_not_allowed",
+            ),
+        ):
+            build_envelope(
+                api_event(headers={"PAYMENT-SIGNATURE": "x" * (limit + 1)}),
+                public_base_url=PUBLIC_BASE,
+            )
+        digest.assert_not_called()
 
     def test_all_six_published_route_pairs_and_inverse_rejections(self):
         routes = (
@@ -195,7 +293,7 @@ class EnvelopeTests(unittest.TestCase):
     def test_rejects_header_values_the_bridge_cannot_encode(self):
         with self.assertRaisesRegex(GatewayRequestError, "request_header_not_allowed"):
             build_envelope(
-                api_event(headers={"X-Payment": "proof-\U0001f600"}),
+                api_event(headers={"PAYMENT-SIGNATURE": "proof-\U0001f600"}),
                 public_base_url=PUBLIC_BASE,
             )
 

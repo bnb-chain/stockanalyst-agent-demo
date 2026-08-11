@@ -4,6 +4,7 @@ from __future__ import annotations
 import base64
 import re
 from dataclasses import dataclass
+from ipaddress import ip_address
 from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlsplit
 
@@ -24,18 +25,19 @@ _JOB_ROUTE = re.compile(r"/x402/jobs/x402_[0-9a-f]{32}(?:/resume)?\Z")
 _FREE_SYMBOL = re.compile(r"[A-Za-z0-9.^_-]{1,32}\Z")
 _HEADER_NAME = re.compile(r"[a-z0-9-]+\Z")
 _REQUEST_ID = re.compile(r"x402gw_[0-9a-f]{64}\Z")
-_REQUEST_HEADERS = {"accept", "content-type", "x-payment", "x-job-token"}
+_REQUEST_HEADERS = {"accept", "content-type", "payment-signature", "x-job-token"}
 _RESPONSE_HEADERS = {
     "content-type",
     "location",
     "retry-after",
     "cache-control",
     "vary",
-    "x-payment-required",
+    "payment-required",
+    "payment-response",
 }
 _MAX_REQUEST_BYTES = 256 * 1024
 _MAX_RESPONSE_BYTES = 2 * 1024 * 1024
-_ENVELOPE_FIELDS = {
+_BASE_ENVELOPE_FIELDS = {
     "version",
     "requestId",
     "method",
@@ -45,6 +47,7 @@ _ENVELOPE_FIELDS = {
     "bodyBase64",
     "publicBaseUrl",
 }
+_SOURCE_ENVELOPE_FIELDS = _BASE_ENVELOPE_FIELDS | {"sourceIp"}
 
 
 @dataclass(frozen=True)
@@ -56,6 +59,7 @@ class _Request:
     headers: list[tuple[bytes, bytes]]
     body: bytes
     public_base_url: str
+    source_ip: str | None
 
 
 async def dispatch_x402_envelope(
@@ -90,6 +94,7 @@ async def dispatch_x402_envelope(
             "query_string": request.query_string,
             "headers": request.headers,
             "x402_public_base_url": request.public_base_url,
+            "x402_source_ip": request.source_ip,
         },
         receive,
         send,
@@ -100,7 +105,10 @@ async def dispatch_x402_envelope(
 def _validate_request(
     envelope: dict[str, Any], expected_public_base_url: str
 ) -> _Request:
-    if not isinstance(envelope, dict) or set(envelope) != _ENVELOPE_FIELDS:
+    if not isinstance(envelope, dict) or set(envelope) not in (
+        _BASE_ENVELOPE_FIELDS,
+        _SOURCE_ENVELOPE_FIELDS,
+    ):
         raise EnvelopeError("invalid_envelope")
     if type(envelope["version"]) is not int or envelope["version"] != 1:
         raise EnvelopeError("invalid_envelope_version")
@@ -134,7 +142,17 @@ def _validate_request(
         headers=_validate_request_headers(envelope["headers"]),
         body=body,
         public_base_url=public_base_url,
+        source_ip=_validate_source_ip(envelope.get("sourceIp")) if "sourceIp" in envelope else None,
     )
+
+
+def _validate_source_ip(value: Any) -> str:
+    if not isinstance(value, str):
+        raise EnvelopeError("invalid_source_ip")
+    try:
+        return ip_address(value).compressed
+    except ValueError:
+        raise EnvelopeError("invalid_source_ip") from None
 
 
 def _is_allowed_route(method: str, path: str) -> bool:

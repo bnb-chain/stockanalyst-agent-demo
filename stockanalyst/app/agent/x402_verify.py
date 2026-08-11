@@ -1,85 +1,15 @@
-"""x402 v2 payment proof verification — FIXED CODE, never LLM-callable.
+"""Fixed-code x402 v2 EIP-3009 proof verification.
 
-Signing scheme: EIP-712 TransferWithAuthorization (EIP-3009).
-The buyer uses their Web3 wallet (Binance Web3 Wallet / MetaMask / ethers.js
-signTypedData) to sign a typed-data authorization; the seller verifies the
-EIP-712 signature locally in this module. On-chain settlement is handled
-separately by the Binance Pay x402 facilitator (called from x402_handler.py).
+Paid proofs select U or USD1 from the immutable token registry using the
+accepted asset address. The selected token supplies the 18-decimal units,
+EIP-712 domain name/version, and verifying contract; the seller price is
+fixed separately. Promotional
+proofs use the same token-aware signature verification with an exact zero
+amount and no B402 ``signerAddress`` metadata.
 
-Wire format — X-Payment header = base64(JSON):
-  {
-    "x402Version": 2,
-    "resource": {"url": "https://<agent>/x402/analyze/async", ...},
-    "accepted": {
-      "scheme": "exact", "network": "eip155:97",
-      "amount": "1000000000000000000",
-      "asset": "0xc70B8741B8B07A6d61E54fd4B20f22Fa648E5565",
-      "payTo": "0x<seller>", "maxTimeoutSeconds": 600,
-      "extra": {
-        "name": "U", "version": "1",
-        "assetTransferMethod": "eip3009",
-        "signerAddress": "0x<facilitator>"
-      }
-    },
-    "payload": {
-      "signature":     "0x<65-byte EIP-712 sig>",
-      "authorization": {
-        "from":        "0x<buyer>",
-        "to":          "0x<seller>",       // must equal SELLER_WALLET
-        "value":       "1000000000000000000",  // 1.0 U in wei (≥ MIN_PRICE_WEI)
-        "validAfter":  "0",
-        "validBefore": "<unix_ts>",        // +10 min TTL recommended
-        "nonce":       "0x<32 random bytes>"  // bytes32
-      }
-    }
-  }
-
-EIP-712 domain for U token (BSC Testnet):
-  name:              env U_TOKEN_DOMAIN_NAME    (default "U")
-  version:           env U_TOKEN_DOMAIN_VERSION (default "1")
-  chainId:           97
-  verifyingContract: 0xc70B8741B8B07A6d61E54fd4B20f22Fa648E5565
-
-EIP-712 primary type: TransferWithAuthorization(
-    address from, address to, uint256 value,
-    uint256 validAfter, uint256 validBefore, bytes32 nonce)
-
-To generate a test proof (Python):
-  python - <<'EOF'
-  import json, base64, time, os
-  from eth_account import Account
-  from eth_utils import keccak, to_checksum_address
-  import eth_abi, secrets
-
-  PRIV = "0x<private-key>"
-  SELLER = "0x<seller-wallet>"
-  TOKEN  = "0xc70B8741B8B07A6d61E54fd4B20f22Fa648E5565"
-  acct = Account.from_key(PRIV)
-
-  domain_type = keccak(text="EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)")
-  domain_sep  = keccak(eth_abi.encode(["bytes32","bytes32","bytes32","uint256","address"],
-    [domain_type, keccak(text="U"), keccak(text="1"), 97, to_checksum_address(TOKEN)]))
-  type_hash = keccak(text="TransferWithAuthorization(address from,address to,uint256 value,uint256 validAfter,uint256 validBefore,bytes32 nonce)")
-  nonce = secrets.token_bytes(32)
-  auth = {"from": acct.address.lower(), "to": SELLER,
-          "value": "1000000000000000000", "validAfter": "0",
-          "validBefore": str(int(time.time())+600), "nonce": "0x"+nonce.hex()}
-  struct_hash = keccak(eth_abi.encode(
-    ["bytes32","address","address","uint256","uint256","uint256","bytes32"],
-    [type_hash, to_checksum_address(auth["from"]), to_checksum_address(auth["to"]),
-     int(auth["value"]), int(auth["validAfter"]), int(auth["validBefore"]), nonce]))
-  digest = keccak(b"\\x19\\x01" + domain_sep + struct_hash)
-  sig = Account._sign_hash(digest, PRIV).signature.hex()
-  requirement = {"scheme":"exact","network":"eip155:97",
-    "amount":"1000000000000000000","asset":TOKEN,"payTo":SELLER.lower(),
-    "maxTimeoutSeconds":600,"extra":{"name":"U","version":"1",
-      "assetTransferMethod":"eip3009","signerAddress":"0x<from-/supported>"}}
-  proof = {"x402Version":2,
-           "resource":{"url":"https://<agent>/x402/analyze/async"},
-           "accepted":requirement,
-           "payload":{"signature":"0x"+sig,"authorization":auth}}
-  print(base64.b64encode(json.dumps(proof).encode()).decode())
-  EOF
+This module is never LLM-callable. It verifies signatures locally; on-chain
+settlement remains the responsibility of the B402 facilitator integration in
+``x402_handler.py``. The legacy ``/x402/free`` helpers remain separate.
 """
 from __future__ import annotations
 
@@ -87,14 +17,20 @@ import base64
 import copy
 import json
 import logging
+import math
 import os
 import re
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
 from eth_account import Account
+
+try:
+    from .x402_tokens import U_TOKEN, PaymentToken, token_by_asset
+except ImportError:  # Direct imports from stockanalyst/app/agent.
+    from x402_tokens import U_TOKEN, PaymentToken, token_by_asset
 
 _log = logging.getLogger("seller-agent.x402.verify")
 
@@ -115,16 +51,94 @@ except Exception:
     _log.debug("eth_account smoke recover failed as expected", exc_info=True)
 
 _EVM_ADDRESS = re.compile(r"0x[0-9a-fA-F]{40}\Z")
+MAX_PAYMENT_SIGNATURE_CHARACTERS = 32 * 1024
+MAX_PAYMENT_PROOF_BYTES = 24 * 1024
+MAX_PAYMENT_PROOF_NESTING = 64
+_PAYMENT_SIGNATURE_REJECTION = (
+    "Payment-Signature is not valid base64 JSON"
+)
+_FREE_VALUE_REJECTION = (
+    "free tier requires value=0; "
+    "use /x402/analyze/async for paid analysis"
+)
 
 
-def _resolve_seller_wallet(
+def _finite_json_float(value: str) -> float:
+    parsed = float(value)
+    if not math.isfinite(parsed):
+        raise ValueError("non-finite JSON number")
+    return parsed
+
+
+def _reject_json_constant(_value: str) -> None:
+    raise ValueError("non-finite JSON constant")
+
+
+def _has_bounded_json_nesting(value: object) -> bool:
+    pending: list[tuple[object, int]] = [(value, 1)]
+    while pending:
+        current, depth = pending.pop()
+        if depth > MAX_PAYMENT_PROOF_NESTING:
+            return False
+        if isinstance(current, dict):
+            pending.extend((child, depth + 1) for child in current.values())
+        elif isinstance(current, list):
+            pending.extend((child, depth + 1) for child in current)
+    return True
+
+
+def decode_payment_signature(value: str) -> dict[str, Any] | None:
+    """Strictly decode a bounded canonical Base64 JSON proof object."""
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value) > MAX_PAYMENT_SIGNATURE_CHARACTERS
+    ):
+        return None
+    try:
+        encoded = value.encode("ascii")
+        raw = base64.b64decode(encoded, validate=True)
+        if (
+            len(raw) > MAX_PAYMENT_PROOF_BYTES
+            or base64.b64encode(raw) != encoded
+        ):
+            return None
+        decoded = raw.decode("utf-8", errors="strict")
+        proof = json.loads(
+            decoded,
+            parse_float=_finite_json_float,
+            parse_constant=_reject_json_constant,
+        )
+        if not _has_bounded_json_nesting(proof):
+            return None
+    except (RecursionError, UnicodeError, ValueError, json.JSONDecodeError):
+        return None
+    return proof if isinstance(proof, dict) else None
+
+
+def _payment_payload_objects(
+    proof: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]] | None:
+    payload = proof.get("payload")
+    if not isinstance(payload, dict):
+        return None
+    authorization = payload.get("authorization")
+    if not isinstance(authorization, dict):
+        return None
+    return payload, authorization
+
+
+def _resolve_b402_pay_to_address(
     env: Mapping[str, str] = os.environ,
     studio_loader: Callable[[], Mapping[str, Any] | None] | None = None,
 ) -> str:
-    explicit = env.get("X402_SELLER_WALLET", "").strip()
-    if explicit:
-        raw = explicit
-    else:
+    source = "B402_PAY_TO_ADDRESS"
+    raw = str(env.get(source, "")).strip()
+    if not raw:
+        source = "X402_SELLER_WALLET"
+        raw = str(env.get(source, "")).strip()
+    if not raw:
+        source = "studio wallet address"
         try:
             if studio_loader is None:
                 from bnbagent_studio_core import config
@@ -132,17 +146,44 @@ def _resolve_seller_wallet(
             studio = studio_loader() or {}
             raw = str((studio.get("wallet") or {}).get("address") or "").strip()
         except Exception as exc:
-            raise RuntimeError("x402 seller wallet configuration unavailable") from exc
+            raise RuntimeError("B402 pay-to configuration unavailable") from exc
     if not _EVM_ADDRESS.fullmatch(raw):
-        raise RuntimeError("x402 seller wallet must be a 0x-prefixed EVM address")
+        raise RuntimeError(f"{source} must be a 0x-prefixed EVM address")
     return raw
 
 
-SELLER_WALLET       = _resolve_seller_wallet()
-U_TOKEN_BSC_TESTNET = "0x330949Aed7d00FCe0558C64ED6FeC9792616cC39"
-PRICE_WEI           = 10**6         # 1.0 U (6 decimals)
-MIN_PRICE_WEI       = 5 * 10**5     # 0.5 U (6 decimals)
-CHAIN_ID            = 97            # BSC Testnet
+_DEFAULT_X402_CHAIN_ID = 56
+_DEFAULT_X402_TOKEN_ADDRESS = (
+    "0x330949Aed7d00FCe0558C64ED6FeC9792616cC39"
+)
+
+
+def _resolve_x402_chain_id(env: Mapping[str, str] = os.environ) -> int:
+    if "X402_CHAIN_ID" not in env:
+        return _DEFAULT_X402_CHAIN_ID
+    if str(env.get("X402_CHAIN_ID", "")) != "56":
+        raise RuntimeError("X402_CHAIN_ID must be exactly 56")
+    return 56
+
+
+def _resolve_x402_token_address(
+    env: Mapping[str, str] = os.environ,
+) -> str:
+    if "X402_TOKEN_ADDRESS" not in env:
+        return _DEFAULT_X402_TOKEN_ADDRESS
+    raw = str(env.get("X402_TOKEN_ADDRESS", "")).strip()
+    if _EVM_ADDRESS.fullmatch(raw) is None:
+        raise RuntimeError(
+            "X402_TOKEN_ADDRESS must be a 0x-prefixed EVM address"
+        )
+    return raw
+
+
+B402_PAY_TO_ADDRESS = _resolve_b402_pay_to_address()
+SELLER_WALLET = B402_PAY_TO_ADDRESS  # compatibility alias
+U_TOKEN_ADDRESS = U_TOKEN.address
+PRICE_WEI = 210_000_000_000_000_000
+CHAIN_ID = _resolve_x402_chain_id()
 
 
 @dataclass(frozen=True)
@@ -155,11 +196,13 @@ class VerifiedPayment:
     valid_before: int
     nonce: str
     nonce_bytes: bytes
+    asset: str = U_TOKEN.address.lower()
+    token_symbol: str = U_TOKEN.symbol
+    promotional: bool = False
 
-# U token EIP-712 domain — set env vars if the deployed contract differs.
-# Verify via: cast call <U_TOKEN> "name()" --rpc-url $BSC_TESTNET_RPC
-_TOKEN_DOMAIN_NAME    = os.environ.get("U_TOKEN_DOMAIN_NAME",    "U")
-_TOKEN_DOMAIN_VERSION = os.environ.get("U_TOKEN_DOMAIN_VERSION", "1")
+# Compatibility aliases for the legacy free-tier verifier.
+_TOKEN_DOMAIN_NAME = U_TOKEN.domain_name
+_TOKEN_DOMAIN_VERSION = U_TOKEN.domain_version
 
 # ── Free-tier replay protection ────────────────────────────────────────────────
 # Zero-value free-tier nonces are stored in-memory: they are lost on restart and
@@ -200,20 +243,17 @@ _TRANSFER_TYPE_HASH = _ktext(
 )
 
 
-def _domain_separator(
-    name: str = _TOKEN_DOMAIN_NAME,
-    version: str = _TOKEN_DOMAIN_VERSION,
-) -> bytes:
+def _domain_separator(token: PaymentToken) -> bytes:
     import eth_abi
     from eth_utils import to_checksum_address
     return _keccak(eth_abi.encode(
         ["bytes32", "bytes32", "bytes32", "uint256", "address"],
         [
             _DOMAIN_TYPE_HASH,
-            _ktext(name),
-            _ktext(version),
+            _ktext(token.domain_name),
+            _ktext(token.domain_version),
             CHAIN_ID,
-            to_checksum_address(U_TOKEN_BSC_TESTNET),
+            to_checksum_address(token.address),
         ],
     ))
 
@@ -222,8 +262,7 @@ def _eip712_digest(
     from_: str, to: str, value: int,
     valid_after: int, valid_before: int, nonce: bytes,
     *,
-    domain_name: str = _TOKEN_DOMAIN_NAME,
-    domain_version: str = _TOKEN_DOMAIN_VERSION,
+    token: PaymentToken = U_TOKEN,
 ) -> bytes:
     """keccak256(\\x19\\x01 || domain_separator || struct_hash)."""
     import eth_abi
@@ -242,7 +281,7 @@ def _eip712_digest(
     ))
     return _keccak(
         b"\x19\x01"
-        + _domain_separator(domain_name, domain_version)
+        + _domain_separator(token)
         + struct_hash
     )
 
@@ -252,16 +291,22 @@ def _eip712_digest(
 def build_payment_challenge(
     symbols: list[str],
     resource_url: str,
-    extra: Mapping[str, Any],
-) -> dict:
-    """Return x402 v2 standard payment challenge (HTTP 402 body / X-Payment-Required header)."""
+    requirements: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Return x402 v2 standard payment challenge (HTTP 402 body / Payment-Required header)."""
+    if isinstance(requirements, Mapping):
+        # Compatibility for the paid-U handler until it supplies a list of
+        # already-built requirements.
+        accepts = [build_payment_requirement(U_TOKEN, requirements)]
+    else:
+        accepts = copy.deepcopy(list(requirements))
     description = (
         f"Stock analysis for {', '.join(s.upper() for s in symbols)}"
         if symbols else "Stock analysis report"
     )
     return {
         "x402Version": 2,
-        "accepts": [build_payment_requirement(extra)],
+        "accepts": accepts,
         "error":    "Payment Required",
         "resource": {
             "url": resource_url,
@@ -271,16 +316,25 @@ def build_payment_challenge(
     }
 
 
-def build_payment_requirement(extra: Mapping[str, Any]) -> dict[str, Any]:
-    """Build the paid requirement shared by the challenge and B402 calls."""
+def build_payment_requirement(
+    token: PaymentToken,
+    extra: Mapping[str, Any],
+    *,
+    amount: int | None = None,
+    promotional: bool = False,
+) -> dict[str, Any]:
+    """Build an exact token requirement for a paid or promotional proof."""
+    clean_extra = copy.deepcopy(dict(extra))
+    if promotional:
+        clean_extra.pop("signerAddress", None)
     return {
         "scheme": "exact",
         "network": f"eip155:{CHAIN_ID}",
-        "amount": str(PRICE_WEI),
-        "asset": U_TOKEN_BSC_TESTNET,
-        "payTo": SELLER_WALLET.lower(),
+        "amount": str(PRICE_WEI if amount is None else amount),
+        "asset": token.address,
+        "payTo": B402_PAY_TO_ADDRESS.lower(),
         "maxTimeoutSeconds": 600,
-        "extra": copy.deepcopy(dict(extra)),
+        "extra": clean_extra,
     }
 
 
@@ -290,6 +344,7 @@ def validate_payment_proof(
     expected_requirement: Mapping[str, Any] | None = None,
     now: int | None = None,
     allow_expired: bool = False,
+    promotional: bool = False,
 ) -> tuple[VerifiedPayment | None, str]:
     """Validate a proof without consuming its nonce.
 
@@ -297,10 +352,9 @@ def validate_payment_proof(
     bypasses the wall-clock expiry rejection but preserves every other
     semantic, domain, and cryptographic check.
     """
-    try:
-        proof = json.loads(base64.b64decode(proof_header.strip()))
-    except Exception:
-        return None, "X-Payment is not valid base64 JSON"
+    proof = decode_payment_signature(proof_header)
+    if proof is None:
+        return None, _PAYMENT_SIGNATURE_REJECTION
 
     if proof.get("x402Version") != 2:
         return None, (
@@ -319,25 +373,69 @@ def validate_payment_proof(
     accepted = proof.get("accepted")
     if not isinstance(accepted, dict):
         return None, "payment requirement is missing or invalid"
+    token = token_by_asset(accepted.get("asset"))
+    if token is None:
+        return None, (
+            "payment requirement mismatch"
+            if expected_requirement is not None
+            else "payment requirement is missing or invalid"
+        )
     extra = accepted.get("extra")
     if (
         not isinstance(extra, dict)
-        or extra.get("name") != _TOKEN_DOMAIN_NAME
-        or extra.get("version") != _TOKEN_DOMAIN_VERSION
-        or extra.get("assetTransferMethod") != "eip3009"
-        or not _EVM_ADDRESS.fullmatch(str(extra.get("signerAddress") or ""))
+        or extra.get("name") != token.domain_name
+        or extra.get("version") != token.domain_version
+        or extra.get("assetTransferMethod") != token.transfer_method
     ):
         return None, "payment requirement is missing or invalid"
-    required = (
-        dict(expected_requirement)
+    signer_address = extra.get("signerAddress")
+    # EIP-3009 does not bind B402 facilitator metadata. With no trusted
+    # expected requirement, this layer checks only signerAddress syntax;
+    # B402Client.verify_and_settle refreshes the current supported metadata
+    # and exact-compares it before verification, settlement, or job execution.
+    if promotional:
+        if "signerAddress" in extra:
+            return None, "payment requirement is missing or invalid"
+    elif not _EVM_ADDRESS.fullmatch(str(signer_address or "")):
+        return None, "payment requirement is missing or invalid"
+    canonical_extra = (
+        expected_requirement.get("extra")
         if expected_requirement is not None
-        else build_payment_requirement(extra)
+        else extra
     )
-    if accepted != required:
+    if not isinstance(canonical_extra, Mapping):
+        return None, "payment requirement mismatch"
+    if (
+        canonical_extra.get("name") != token.domain_name
+        or canonical_extra.get("version") != token.domain_version
+        or canonical_extra.get("assetTransferMethod") != token.transfer_method
+    ):
+        return None, "payment requirement mismatch"
+    if promotional:
+        if "signerAddress" in canonical_extra:
+            return None, "payment requirement mismatch"
+    elif not _EVM_ADDRESS.fullmatch(
+        str(canonical_extra.get("signerAddress") or "")
+    ):
+        return None, "payment requirement mismatch"
+    canonical = build_payment_requirement(
+        token,
+        canonical_extra,
+        amount=0 if promotional else PRICE_WEI,
+        promotional=promotional,
+    )
+    if (
+        expected_requirement is not None
+        and dict(expected_requirement) != canonical
+    ):
+        return None, "payment requirement mismatch"
+    if accepted != canonical:
         return None, "payment requirement mismatch"
 
-    payload = proof.get("payload") or {}
-    auth = payload.get("authorization") or {}
+    payload_objects = _payment_payload_objects(proof)
+    if payload_objects is None:
+        return None, _PAYMENT_SIGNATURE_REJECTION
+    payload, auth = payload_objects
     signature = str(payload.get("signature") or "")
     from_address = str(auth.get("from", "")).lower()
     to_address = str(auth.get("to", "")).lower()
@@ -356,15 +454,10 @@ def validate_payment_proof(
     current_time = int(time.time()) if now is None else int(now)
     if not from_address.startswith("0x") or len(from_address) != 42:
         return None, f"invalid from address: {from_address!r}"
-    if to_address != SELLER_WALLET.lower():
+    if to_address != B402_PAY_TO_ADDRESS.lower():
         return None, f"wrong recipient: {to_address!r}"
     if to_address != str(accepted["payTo"]).lower():
         return None, f"wrong recipient: {to_address!r}"
-    if value < MIN_PRICE_WEI:
-        return None, (
-            f"value {value / 1e18:.3f} U < minimum "
-            f"{MIN_PRICE_WEI / 1e18:.3f} U"
-        )
     if value != int(accepted["amount"]):
         return None, "authorization value does not match payment requirement"
     if len(nonce_bytes) != 32:
@@ -386,8 +479,7 @@ def validate_payment_proof(
             valid_after,
             valid_before,
             nonce_bytes,
-            domain_name=str(extra["name"]),
-            domain_version=str(extra["version"]),
+            token=token,
         )
         recovered = Account._recover_hash(digest, signature=signature)
     except Exception as exc:
@@ -406,6 +498,9 @@ def validate_payment_proof(
             valid_before=valid_before,
             nonce=nonce,
             nonce_bytes=nonce_bytes,
+            asset=token.address.lower(),
+            token_symbol=token.symbol,
+            promotional=promotional,
         ),
         "",
     )
@@ -446,8 +541,8 @@ def build_free_payment_challenge(
                 "scheme":            "exact",
                 "network":           f"eip155:{CHAIN_ID}",
                 "maxAmountRequired": "0",
-                "asset":             U_TOKEN_BSC_TESTNET,
-                "payTo":             SELLER_WALLET.lower(),
+                "asset":             U_TOKEN_ADDRESS,
+                "payTo":             B402_PAY_TO_ADDRESS.lower(),
                 "maxTimeoutSeconds": 600,
                 "extra": {
                     "assetTransferMethod": "eip3009",
@@ -471,11 +566,9 @@ def verify_free_payment_proof(proof_header: str) -> tuple[bool, str, str]:
       ok=True  → message = "<N> uses remaining today";  from_addr = signer
       ok=False → message = rejection reason;            from_addr = detected addr or ""
     """
-    try:
-        raw   = base64.b64decode(proof_header.strip())
-        proof = json.loads(raw)
-    except Exception:
-        return False, "X-Payment is not valid base64 JSON", ""
+    proof = decode_payment_signature(proof_header)
+    if proof is None:
+        return False, _PAYMENT_SIGNATURE_REJECTION, ""
 
     if proof.get("x402Version") != 2:
         return False, f"unsupported x402Version: {proof.get('x402Version')!r} (expected 2)", ""
@@ -485,30 +578,32 @@ def verify_free_payment_proof(proof_header: str) -> tuple[bool, str, str]:
     if network != f"eip155:{CHAIN_ID}":
         return False, f"wrong network: {network!r} (expected eip155:{CHAIN_ID})", ""
 
-    payload = proof.get("payload") or {}
-    auth    = payload.get("authorization") or {}
+    payload_objects = _payment_payload_objects(proof)
+    if payload_objects is None:
+        return False, _PAYMENT_SIGNATURE_REJECTION, ""
+    payload, auth = payload_objects
     sig     = str(payload.get("signature") or "")
 
-    from_addr    = str(auth.get("from",        "")).lower()
-    to_addr      = str(auth.get("to",          "")).lower()
-    value_raw    = str(auth.get("value",       "0"))
-    valid_after  = int(auth.get("validAfter",  0))
-    valid_before = int(auth.get("validBefore", 0))
-    nonce_hex    = str(auth.get("nonce", "0x" + "00" * 32))
+    try:
+        from_addr = str(auth.get("from", "")).lower()
+        to_addr = str(auth.get("to", "")).lower()
+        value_raw = auth.get("value")
+        valid_after = int(auth.get("validAfter", 0))
+        valid_before = int(auth.get("validBefore", 0))
+        nonce_hex = str(auth.get("nonce", "0x" + "00" * 32))
+    except (OverflowError, TypeError, ValueError):
+        return False, _PAYMENT_SIGNATURE_REJECTION, ""
 
     if not from_addr.startswith("0x") or len(from_addr) != 42:
         return False, f"invalid from address: {from_addr!r}", ""
-    if to_addr != SELLER_WALLET.lower():
-        return False, f"wrong recipient: {to_addr!r} (expected {SELLER_WALLET.lower()!r})", from_addr
-    try:
-        value = int(value_raw)
-    except (ValueError, TypeError):
-        return False, f"invalid value: {value_raw!r}", from_addr
-    if value != 0:
-        return False, (
-            f"free tier requires value=0 (got {value / 1e18:.3f} U); "
-            "use /x402/analyze/async for paid analysis"
-        ), from_addr
+    if to_addr != B402_PAY_TO_ADDRESS.lower():
+        return False, f"wrong recipient: {to_addr!r} (expected {B402_PAY_TO_ADDRESS.lower()!r})", from_addr
+    if not (
+        (type(value_raw) is str and value_raw == "0")
+        or (type(value_raw) is int and value_raw == 0)
+    ):
+        return False, _FREE_VALUE_REJECTION, from_addr
+    value = 0
 
     now = int(time.time())
     if now < valid_after:
@@ -543,5 +638,5 @@ def verify_free_payment_proof(proof_header: str) -> tuple[bool, str, str]:
         return False, msg, from_addr
 
     _used_nonces.add(nonce_key)
-    _log.info("x402 free tier accepted: from=%s nonce=%s (%s)", from_addr, nonce_hex, msg)
+    _log.info("x402 free tier outcome=accepted")
     return True, msg, from_addr

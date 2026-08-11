@@ -5,15 +5,17 @@ import base64
 import hashlib
 import re
 from collections.abc import Mapping
+from ipaddress import ip_address
 from typing import Any
 from urllib.parse import urlencode, urlsplit
 
 
-_ALLOWED_HEADERS = {"accept", "content-type", "x-payment", "x-job-token"}
+_ALLOWED_HEADERS = {"accept", "content-type", "payment-signature", "x-job-token"}
 _JOB_PATH = re.compile(r"/x402/jobs/x402_[0-9a-f]{32}(?:/resume)?\Z")
 _FREE_SYMBOL = re.compile(r"[A-Za-z0-9.^_-]{1,32}\Z")
 _HEADER_NAME = re.compile(r"[a-z0-9-]+\Z")
 _MAX_BODY_BYTES = 256 * 1024
+_MAX_PAYMENT_SIGNATURE_CHARACTERS = 32 * 1024
 
 
 class GatewayRequestError(ValueError):
@@ -26,6 +28,7 @@ class GatewayRequestError(ValueError):
 def build_envelope(event: Mapping[str, Any], *, public_base_url: str) -> dict[str, Any]:
     """Validate an API Gateway REST proxy event without retaining its contents."""
     method, path = _validated_route(event)
+    source_ip = _trusted_source_ip(event)
     query_string = _validated_query(event, method=method, path=path)
     body = _decode_body(event)
     if method == "GET" and body:
@@ -35,7 +38,7 @@ def build_envelope(event: Mapping[str, Any], *, public_base_url: str) -> dict[st
     for part in (
         b"x402-gateway-v1\0", method.encode("ascii"), b"\0", path.encode("ascii"),
         b"\0", query_string.encode("ascii"),
-        b"\0", headers.get("x-payment", "").encode("utf-8"), b"\0",
+        b"\0", headers.get("payment-signature", "").encode("utf-8"), b"\0",
         headers.get("x-job-token", "").encode("utf-8"), b"\0", body,
     ):
         digest.update(part)
@@ -48,7 +51,20 @@ def build_envelope(event: Mapping[str, Any], *, public_base_url: str) -> dict[st
         "publicBaseUrl": validate_public_base(public_base_url),
         "headers": headers,
         "bodyBase64": base64.b64encode(body).decode("ascii"),
+        "sourceIp": source_ip,
     }
+
+
+def _trusted_source_ip(event: Mapping[str, Any]) -> str:
+    context = event.get("requestContext")
+    identity = context.get("identity") if isinstance(context, Mapping) else None
+    value = identity.get("sourceIp") if isinstance(identity, Mapping) else None
+    if not isinstance(value, str):
+        raise GatewayRequestError("source_ip_unavailable")
+    try:
+        return ip_address(value).compressed
+    except ValueError:
+        raise GatewayRequestError("source_ip_unavailable") from None
 
 
 def _validated_route(event: Mapping[str, Any]) -> tuple[str, str]:
@@ -164,6 +180,11 @@ def _record_header(headers: dict[str, str], raw_name: Any, value: Any) -> None:
     if name not in _ALLOWED_HEADERS:
         return
     if not isinstance(value, str) or "\r" in value or "\n" in value or "\x00" in value:
+        raise GatewayRequestError("request_header_not_allowed")
+    if (
+        name == "payment-signature"
+        and len(value) > _MAX_PAYMENT_SIGNATURE_CHARACTERS
+    ):
         raise GatewayRequestError("request_header_not_allowed")
     try:
         value.encode("latin-1")

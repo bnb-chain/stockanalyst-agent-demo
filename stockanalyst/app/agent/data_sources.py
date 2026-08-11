@@ -7,7 +7,7 @@ whatever data it has. Never raise from these functions.
 Required env vars (add to .studio/.env.local):
     FRED_API_KEY            — https://fred.stlouisfed.org/docs/api/api_key.html (free)
     ALPHA_VANTAGE_API_KEY   — https://www.alphavantage.co/support/#api-key (free, 25 req/day)
-    NEWS_API_KEY            — https://newsapi.org/register (free, 100 req/day)
+    GNEWS_API_KEY           — https://gnews.io/ (free, 100 req/day)
 
 SEC EDGAR is fully public — no key required. A User-Agent header is mandatory.
 """

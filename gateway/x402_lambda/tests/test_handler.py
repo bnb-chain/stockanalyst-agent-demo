@@ -12,6 +12,8 @@ from oauth_client import OAuthUnavailable
 
 
 PUBLIC_BASE = "https://a1b2c3d4e5.execute-api.us-east-1.amazonaws.com/testnet"
+CUSTOM_DOMAIN = "stock-agent.bnbchain.org"
+CUSTOM_PUBLIC_BASE = f"https://{CUSTOM_DOMAIN}"
 
 
 EVENT = {
@@ -28,9 +30,19 @@ EVENT = {
         "domainName": "a1b2c3d4e5.execute-api.us-east-1.amazonaws.com",
         "stage": "testnet",
         "requestId": "gateway-request",
+        "identity": {"sourceIp": "198.51.100.8"},
     },
     "body": None,
     "isBase64Encoded": False,
+}
+CUSTOM_EVENT = {
+    **EVENT,
+    "path": "/x402/price",
+    "requestContext": {
+        **EVENT["requestContext"],
+        "domainName": CUSTOM_DOMAIN,
+        "stage": "mainnet",
+    },
 }
 CONTEXT = object()
 
@@ -80,11 +92,11 @@ class HandlerTests(unittest.TestCase):
             FakeOAuth(),
             FakeAgentCore(response_envelope(headers={
                 "content-type": "application/json",
-                "x-payment-required": '{"x402Version":2}',
+                "payment-required": '{"x402Version":2}',
             })),
         )
         self.assertEqual(result["statusCode"], 402)
-        self.assertEqual(result["headers"]["x-payment-required"], '{"x402Version":2}')
+        self.assertEqual(result["headers"]["payment-required"], '{"x402Version":2}')
         self.assertFalse(result["isBase64Encoded"])
         self.assertEqual(
             json.loads(result["body"]),
@@ -107,6 +119,55 @@ class HandlerTests(unittest.TestCase):
 
         self.assertEqual(result["statusCode"], 200)
         self.assertEqual(agentcore.calls[0]["envelope"]["publicBaseUrl"], PUBLIC_BASE)
+
+    def test_custom_domain_omits_internal_stage_from_public_base(self):
+        agentcore = FakeAgentCore(response_envelope(status=200))
+        app = handler.GatewayApplication(FakeOAuth(), agentcore, CUSTOM_DOMAIN)
+        with patch.object(handler, "_application", app):
+            result = handler.lambda_handler(CUSTOM_EVENT, CONTEXT)
+        self.assertEqual(result["statusCode"], 200)
+        self.assertEqual(
+            agentcore.calls[0]["envelope"]["publicBaseUrl"],
+            CUSTOM_PUBLIC_BASE,
+        )
+
+    def test_custom_domain_requires_exact_name_and_mainnet_stage(self):
+        for domain_name, stage in (
+            (f"evil.{CUSTOM_DOMAIN}", "mainnet"),
+            (CUSTOM_DOMAIN, "testnet"),
+            (CUSTOM_DOMAIN.upper(), "mainnet"),
+        ):
+            with self.subTest(domain_name=domain_name, stage=stage):
+                request_context = {
+                    **CUSTOM_EVENT["requestContext"],
+                    "domainName": domain_name,
+                    "stage": stage,
+                }
+                agentcore = FakeAgentCore(response_envelope(status=200))
+                app = handler.GatewayApplication(FakeOAuth(), agentcore, CUSTOM_DOMAIN)
+                with patch.object(handler, "_application", app):
+                    result = handler.lambda_handler(
+                        {**CUSTOM_EVENT, "requestContext": request_context}, CONTEXT
+                    )
+                self.assertEqual(result["statusCode"], 503)
+                self.assertEqual(agentcore.calls, [])
+
+    def test_custom_domain_ignores_caller_host_headers(self):
+        event = {
+            **CUSTOM_EVENT,
+            "headers": {
+                "Host": "attacker.example",
+                "Forwarded": "host=attacker.example",
+                "X-Forwarded-Host": "attacker.example",
+            },
+        }
+        agentcore = FakeAgentCore(response_envelope(status=200))
+        app = handler.GatewayApplication(FakeOAuth(), agentcore, CUSTOM_DOMAIN)
+        with patch.object(handler, "_application", app):
+            handler.lambda_handler(event, CONTEXT)
+        self.assertEqual(
+            agentcore.calls[0]["envelope"]["publicBaseUrl"], CUSTOM_PUBLIC_BASE
+        )
 
     def test_caller_host_and_forwarded_headers_cannot_influence_public_base(self):
         event = {
@@ -139,6 +200,21 @@ class HandlerTests(unittest.TestCase):
                 self.assertEqual(result["statusCode"], 503)
                 self.assertEqual(json.loads(result["body"])["errorCode"], "service_unavailable")
                 self.assertEqual(agentcore.calls, [])
+
+    def test_missing_trusted_source_ip_fails_closed(self):
+        request_context = {**EVENT["requestContext"]}
+        del request_context["identity"]
+        agentcore = FakeAgentCore(response_envelope(status=200))
+
+        result = self.invoke(
+            FakeOAuth(),
+            agentcore,
+            {**EVENT, "requestContext": request_context},
+        )
+
+        self.assertEqual(result["statusCode"], 400)
+        self.assertEqual(json.loads(result["body"])["errorCode"], "source_ip_unavailable")
+        self.assertEqual(agentcore.calls, [])
 
     def test_oauth_failure_returns_safe_503(self):
         result = self.invoke(FakeOAuth(OAuthUnavailable()), FakeAgentCore(response_envelope()))
@@ -183,6 +259,7 @@ class HandlerTests(unittest.TestCase):
         environment = {
             "AGENTCORE_INVOKE_URL": "https://agentcore.example.test/runtime",
             "OAUTH_SECRET_ARN": "arn:aws:secretsmanager:region:account:secret:gateway",
+            "X402_CUSTOM_DOMAIN_NAME": CUSTOM_DOMAIN,
         }
         with patch("handler.OAuthClient", _ConfiguredOAuth), patch("handler.AgentCoreClient", _ConfiguredAgentCore):
             app = handler._application_from_environment(environment, lambda arn: lambda: "secret")
@@ -195,6 +272,7 @@ class HandlerTests(unittest.TestCase):
             "X402_PUBLIC_BASE_URL": "http://attacker.example.test",
             "AGENTCORE_INVOKE_URL": "https://agentcore.example.test/runtime",
             "OAUTH_SECRET_ARN": "arn:aws:secretsmanager:region:account:secret:gateway",
+            "X402_CUSTOM_DOMAIN_NAME": CUSTOM_DOMAIN,
         }
         with patch("handler.OAuthClient", _ConfiguredOAuth), patch("handler.AgentCoreClient", _ConfiguredAgentCore):
             app = handler._application_from_environment(environment, lambda arn: lambda: "secret")
@@ -202,8 +280,37 @@ class HandlerTests(unittest.TestCase):
             result = handler.lambda_handler(EVENT, CONTEXT)
         self.assertEqual(result["statusCode"], 200)
 
+    def test_environment_requires_exact_custom_domain_name(self):
+        for custom_domain_name in (
+            None,
+            "https://stock-agent.bnbchain.org",
+            "stock-agent.bnbchain.org/path",
+            "STOCK-AGENT.BNBCHAIN.ORG",
+        ):
+            with self.subTest(custom_domain_name=custom_domain_name):
+                environment = {
+                    "AGENTCORE_INVOKE_URL": "https://agentcore.example.test/runtime",
+                    "OAUTH_SECRET_ARN": (
+                        "arn:aws:secretsmanager:region:account:secret:gateway"
+                    ),
+                }
+                if custom_domain_name is not None:
+                    environment["X402_CUSTOM_DOMAIN_NAME"] = custom_domain_name
+                with patch.object(handler, "_application", None), patch.dict(
+                    os.environ, environment, clear=True
+                ), patch("handler.OAuthClient") as oauth_client, patch(
+                    "handler.AgentCoreClient"
+                ) as agentcore_client:
+                    result = handler.lambda_handler(EVENT, CONTEXT)
+                self.assertEqual(result["statusCode"], 503)
+                self.assertEqual(
+                    json.loads(result["body"])["errorCode"], "service_unavailable"
+                )
+                oauth_client.assert_not_called()
+                agentcore_client.assert_not_called()
+
     def test_log_contains_only_safe_summary_fields(self):
-        event = {**EVENT, "httpMethod": "POST", "path": "/testnet/x402/analyze/async", "body": '{"secret":"body-value"}', "headers": {"X-Payment": "payment-value", "X-Job-Token": "job-value"}}
+        event = {**EVENT, "httpMethod": "POST", "path": "/testnet/x402/analyze/async", "body": '{"secret":"body-value"}', "headers": {"PAYMENT-SIGNATURE": "payment-value", "X-Job-Token": "job-value"}}
         app = handler.GatewayApplication(FakeOAuth(), FakeAgentCore(response_envelope(status=200)))
         stdout = io.StringIO()
         with patch.object(handler, "_application", app), redirect_stdout(stdout):

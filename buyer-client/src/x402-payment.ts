@@ -1,17 +1,33 @@
 import { randomBytes } from "node:crypto";
 import { getAddress, type Wallet } from "ethers";
 
-// These values must match stockanalyst/app/agent/x402_verify.py.
-export const U_TOKEN_ADDRESS = "0x330949Aed7d00FCe0558C64ED6FeC9792616cC39";
-export const U_TOKEN_DOMAIN_NAME = process.env["U_TOKEN_DOMAIN_NAME"] ?? "U";
-export const U_TOKEN_DOMAIN_VERSION = process.env["U_TOKEN_DOMAIN_VERSION"] ?? "1";
-export const BSC_TESTNET_CHAIN_ID = 97;
+// These values must match stockanalyst/app/agent/x402_tokens.py.
+export type PaymentTokenSymbol = "U" | "USD1";
+export const PAYMENT_TOKENS = {
+  U: {
+    asset: "0xcE24439F2D9C6a2289F741120FE202248B666666",
+    name: "United Stables",
+    version: "1",
+  },
+  USD1: {
+    asset: "0x8d0D000Ee44948FC98c9B98A4FA4921476f08B0d",
+    name: "World Liberty Financial USD",
+    version: "1",
+  },
+} as const;
+export const BSC_MAINNET_CHAIN_ID = 56;
+export const PAID_AMOUNT = "210000000000000000";
+
+// Compatibility aliases for the promotional client, which remains U-only.
+export const U_TOKEN_ADDRESS = PAYMENT_TOKENS.U.asset;
+export const U_TOKEN_DOMAIN_NAME = PAYMENT_TOKENS.U.name;
+export const U_TOKEN_DOMAIN_VERSION = PAYMENT_TOKENS.U.version;
 
 export interface B402PaymentExtra {
   name: string;
   version: string;
   assetTransferMethod: "eip3009";
-  signerAddress: string;
+  signerAddress?: string;
   [key: string]: unknown;
 }
 
@@ -35,6 +51,7 @@ export interface PaidPaymentChallenge {
   x402Version: 2;
   resource: B402PaymentResource;
   accepted: B402PaymentRequirement;
+  promotional: boolean;
 }
 
 export function resolveX402SellerWallet(
@@ -76,7 +93,7 @@ export async function buildPaymentProof(
   const domain = {
     name: accepted.extra.name,
     version: accepted.extra.version,
-    chainId: BSC_TESTNET_CHAIN_ID,
+    chainId: BSC_MAINNET_CHAIN_ID,
     verifyingContract: accepted.asset,
   };
   const types = {

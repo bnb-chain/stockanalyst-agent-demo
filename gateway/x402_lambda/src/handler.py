@@ -26,24 +26,38 @@ _EXECUTE_API_DOMAIN = re.compile(
     r"[a-z0-9]{10}\.execute-api\.[a-z0-9-]+\.amazonaws\.com(?:\.cn)?\Z"
 )
 _STAGE_NAME = re.compile(r"[a-z0-9-]+\Z")
+_CUSTOM_DOMAIN_NAME = re.compile(
+    r"(?=.{1,253}\Z)[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
+    r"(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+\Z"
+)
 
 
 class GatewayConfigurationError(RuntimeError):
     pass
 
 
+def _validated_custom_domain_name(value: Any) -> str:
+    if not isinstance(value, str) or not _CUSTOM_DOMAIN_NAME.fullmatch(value):
+        raise GatewayConfigurationError("gateway_configuration_invalid")
+    return value
+
+
 class GatewayApplication:
     """Stateless request coordinator; only its OAuth client may warm-cache safely."""
-    def __init__(self, oauth: Any, agentcore: Any) -> None:
+    def __init__(self, oauth: Any, agentcore: Any, custom_domain_name: str = "") -> None:
         self._oauth = oauth
         self._agentcore = agentcore
+        self._custom_domain_name = custom_domain_name
 
     def handle(self, event: dict[str, Any]) -> dict[str, Any]:
         started = time.monotonic()
         request_id: str | None = None
         route: str | None = None
         try:
-            envelope = build_envelope(event, public_base_url=_trusted_public_base(event))
+            envelope = build_envelope(
+                event,
+                public_base_url=_trusted_public_base(event, self._custom_domain_name),
+            )
             request_id = envelope["requestId"]
             route = f"{envelope['method']} {envelope['path']}"
             authorization_header = self._oauth.authorization_header()
@@ -121,17 +135,21 @@ def _application_from_environment(
 ) -> GatewayApplication:
     runtime_url = environment.get("AGENTCORE_INVOKE_URL", "")
     secret_arn = environment.get("OAUTH_SECRET_ARN", "")
-    if not runtime_url or not secret_arn:
+    custom_domain_name = environment.get("X402_CUSTOM_DOMAIN_NAME", "")
+    if not runtime_url or not secret_arn or not custom_domain_name:
         raise GatewayConfigurationError("gateway_configuration_missing")
+    custom_domain_name = _validated_custom_domain_name(custom_domain_name)
     try:
         oauth = OAuthClient(secret_reader_factory(secret_arn), default_token_transport)
         agentcore = AgentCoreClient(runtime_url, oauth.authorization_header, default_agentcore_transport)
     except ValueError as exc:
         raise GatewayConfigurationError("gateway_configuration_invalid") from exc
-    return GatewayApplication(oauth, agentcore)
+    return GatewayApplication(oauth, agentcore, custom_domain_name)
 
 
-def _trusted_public_base(event: Mapping[str, Any]) -> str:
+def _trusted_public_base(
+    event: Mapping[str, Any], custom_domain_name: str = ""
+) -> str:
     """Build the public origin from API Gateway's REST context, never caller headers."""
     request_context = event.get("requestContext")
     if not isinstance(request_context, Mapping):
@@ -141,12 +159,17 @@ def _trusted_public_base(event: Mapping[str, Any]) -> str:
     if (
         not isinstance(domain_name, str)
         or not isinstance(stage, str)
-        or not _EXECUTE_API_DOMAIN.fullmatch(domain_name)
         or not _STAGE_NAME.fullmatch(stage)
     ):
         raise GatewayConfigurationError("gateway_request_context_invalid")
+    if custom_domain_name and domain_name == custom_domain_name and stage == "mainnet":
+        candidate = f"https://{domain_name}"
+    elif _EXECUTE_API_DOMAIN.fullmatch(domain_name):
+        candidate = f"https://{domain_name}/{stage}"
+    else:
+        raise GatewayConfigurationError("gateway_request_context_invalid")
     try:
-        return validate_public_base(f"https://{domain_name}/{stage}")
+        return validate_public_base(candidate)
     except GatewayRequestError as exc:
         raise GatewayConfigurationError("gateway_request_context_invalid") from exc
 

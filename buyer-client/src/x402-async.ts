@@ -34,10 +34,10 @@ import { Wallet } from "ethers";
 import { saveReport } from "./pdf-report.js";
 import { GuardUserMemory, buildTaskFromMemory } from "./uomp.js";
 import {
+  beginAsyncAnalysis,
   createAsyncAnalysis,
   canonicalStatusPath,
   downloadAsyncReport,
-  fetchPaymentChallenge,
   pollAsyncAnalysis,
   AsyncJobClientError,
   type AsyncAnalysisRequest,
@@ -49,9 +49,12 @@ import {
   type SleepImpl,
 } from "./x402-async-client.js";
 import {
-  U_TOKEN_ADDRESS,
+  PAID_AMOUNT,
+  PAYMENT_TOKENS,
   buildPaymentProof,
   resolveX402SellerWallet,
+  type PaidPaymentChallenge,
+  type PaymentTokenSymbol,
 } from "./x402-payment.js";
 
 const MODULE_DIRECTORY = dirname(fileURLToPath(import.meta.url));
@@ -82,6 +85,109 @@ const PENDING_RECOVERY_MILLISECONDS = 7 * 24 * 60 * 60 * 1_000;
 const MAX_CREATE_ATTEMPTS = 3;
 const CREATE_RETRY_MILLISECONDS = 1_000;
 const MAX_CREATE_RETRY_MILLISECONDS = 8_000;
+
+export function resolveX402PaymentToken(
+  env: Readonly<Record<string, string | undefined>> = process.env,
+): PaymentTokenSymbol {
+  const value = env["X402_PAYMENT_TOKEN"] ?? "U";
+  if (value !== "U" && value !== "USD1") {
+    throw new Error("X402_PAYMENT_TOKEN must be U or USD1");
+  }
+  return value;
+}
+
+export function formatX402AccessSummary(
+  access: X402PaymentAccess,
+): string {
+  const canonical = parseX402PaymentAccess(access);
+  if (canonical.promotional) {
+    return `Promotional access: 0 ${canonical.token} (wallet signature only; no settlement)`;
+  }
+  return `Payment: 0.21 ${canonical.token} → ${canonical.payTo}`;
+}
+
+export interface X402PaymentAccess {
+  token: PaymentTokenSymbol;
+  promotional: boolean;
+  payTo: string;
+}
+
+function parseX402PaymentAccess(value: unknown): X402PaymentAccess {
+  if (!isRecord(value)) throw new Error("Pending x402 access metadata is invalid");
+  const token = value["token"];
+  const promotional = value["promotional"];
+  const payTo = value["payTo"];
+  if (
+    (token !== "U" && token !== "USD1")
+    || typeof promotional !== "boolean"
+    || typeof payTo !== "string"
+    || !/^0x[0-9a-f]{40}$/.test(payTo)
+  ) {
+    throw new Error("Pending x402 access metadata is invalid");
+  }
+  return { token, promotional, payTo };
+}
+
+export function paymentAccessFromChallenge(
+  challenge: PaidPaymentChallenge,
+): X402PaymentAccess {
+  return paymentAccessFromAccepted(
+    challenge.accepted,
+    challenge.promotional,
+  );
+}
+
+function paymentAccessFromAccepted(
+  accepted: unknown,
+  expectedPromotional?: boolean,
+): X402PaymentAccess {
+  if (!isRecord(accepted) || !isRecord(accepted["extra"])) {
+    throw new Error("Payment access metadata is invalid");
+  }
+  const extra = accepted["extra"];
+  const asset = accepted["asset"];
+  const amount = accepted["amount"];
+  const payTo = accepted["payTo"];
+  if (typeof asset !== "string") {
+    throw new Error("Payment access metadata is invalid");
+  }
+  const symbol = (Object.entries(PAYMENT_TOKENS).find(
+    ([, token]) => token.asset.toLowerCase() === asset.toLowerCase(),
+  )?.[0]) as PaymentTokenSymbol | undefined;
+  if (symbol === undefined) throw new Error("Payment access metadata is invalid");
+  const token = PAYMENT_TOKENS[symbol];
+  const promotional = amount === "0";
+  const signerAddress = extra["signerAddress"];
+  const signerPresent = Object.prototype.hasOwnProperty.call(
+    extra,
+    "signerAddress",
+  );
+  if (
+    (expectedPromotional !== undefined && expectedPromotional !== promotional)
+    || (!promotional && amount !== PAID_AMOUNT)
+    || typeof payTo !== "string"
+    || !/^0x[0-9a-fA-F]{40}$/.test(payTo)
+    || extra["name"] !== token.name
+    || extra["version"] !== token.version
+    || extra["assetTransferMethod"] !== "eip3009"
+    || (
+      promotional
+        ? signerPresent
+        : (
+          !signerPresent
+          || typeof signerAddress !== "string"
+          || !/^0x[0-9a-fA-F]{40}$/.test(signerAddress)
+        )
+    )
+  ) {
+    throw new Error("Payment access metadata is invalid");
+  }
+  return {
+    token: symbol,
+    promotional,
+    payTo: payTo.toLowerCase(),
+  };
+}
 
 type SaveReportImpl = typeof saveReport;
 
@@ -493,6 +599,23 @@ function parsePendingCreate(value: unknown): PendingCreateRecord {
   };
 }
 
+function paymentAccessFromProof(paymentProof: string): X402PaymentAccess {
+  try {
+    const proof = JSON.parse(
+      Buffer.from(paymentProof, "base64").toString("utf8"),
+    ) as unknown;
+    if (!isRecord(proof)) throw new Error("invalid proof");
+    return paymentAccessFromAccepted(proof["accepted"]);
+  } catch {
+    throw new Error("Pending x402 access metadata is invalid");
+  }
+}
+
+export function pendingAccessSummary(pending: PendingCreateRecord): string {
+  const canonical = parsePendingCreate(pending);
+  return formatX402AccessSummary(paymentAccessFromProof(canonical.paymentProof));
+}
+
 export function persistPendingCreate(
   pendingPath: string,
   pending: PendingCreateRecord,
@@ -893,7 +1016,8 @@ async function main(): Promise<void> {
       basename(PENDING_CREATE_PATH),
     ]);
     const sellerWallet = resolveX402SellerWallet();
-    let receipt: AsyncJobReceipt;
+    const paymentToken = resolveX402PaymentToken();
+    let receipt: AsyncJobReceipt | undefined;
     let symbols: string[];
 
     if (existsSync(RECEIPT_PATH)) {
@@ -918,18 +1042,12 @@ async function main(): Promise<void> {
       }
       console.log(`Continuing asynchronous job ${receipt.jobId}`);
     } else {
-      let pending: PendingCreateRecord;
+      let pending: PendingCreateRecord | undefined;
       if (existsSync(PENDING_CREATE_PATH)) {
         pending = loadPendingCreate(PENDING_CREATE_PATH);
         symbols = [...pending.request.symbols];
         console.log("Continuing the previously signed pending payment request...");
       } else {
-        if (!WALLET_PASSWORD) {
-          throw new Error("WALLET_PASSWORD is required to create a new job");
-        }
-        if (!KEYSTORE_PATH) {
-          throw new Error("KEYSTORE_PATH is required to create a new job");
-        }
         console.log("Loading UOMP portfolio context...");
         const context = await buildTaskFromMemory(new GuardUserMemory());
         symbols = context.symbols;
@@ -940,35 +1058,55 @@ async function main(): Promise<void> {
           portfolio: context.portfolio,
           risk_profile: context.riskProfile,
         };
-        console.log("Fetching the current B402 payment requirement...");
-        const challenge = await fetchPaymentChallenge(
+        console.log("Requesting asynchronous analysis access...");
+        const initial = await beginAsyncAnalysis(
           AGENT_ENDPOINT,
           request,
           sellerWallet,
+          globalThis.fetch,
+          paymentToken,
         );
-        const keystorePath = resolve(MODULE_DIRECTORY, "..", KEYSTORE_PATH);
-        const wallet = await Wallet.fromEncryptedJson(
-          readFileSync(keystorePath, "utf8"),
-          WALLET_PASSWORD,
-        ) as Wallet;
-        console.log("Signing one x402 EIP-3009 payment authorization...");
-        const proof = await buildPaymentProof(wallet, challenge);
-        pending = createPendingRecord(
-          proof,
-          request,
-        );
-        // This durable record must exist before the first payment POST.
-        persistPendingCreate(PENDING_CREATE_PATH, pending);
+        if (initial.kind === "created") {
+          receipt = initial.receipt;
+          persistAsyncJobReceipt(RECEIPT_PATH, receipt);
+          console.log(`Created asynchronous job ${receipt.jobId}`);
+          console.log("Promotional access: free (no wallet or payment)");
+        } else {
+          if (!WALLET_PASSWORD) {
+            throw new Error("WALLET_PASSWORD is required to create a paid job");
+          }
+          if (!KEYSTORE_PATH) {
+            throw new Error("KEYSTORE_PATH is required to create a paid job");
+          }
+          const keystorePath = resolve(MODULE_DIRECTORY, "..", KEYSTORE_PATH);
+          const wallet = await Wallet.fromEncryptedJson(
+            readFileSync(keystorePath, "utf8"),
+            WALLET_PASSWORD,
+          ) as Wallet;
+          console.log("Signing one x402 EIP-3009 payment authorization...");
+          const proof = await buildPaymentProof(wallet, initial.challenge);
+          pending = createPendingRecord(
+            proof,
+            request,
+          );
+          // This durable record must exist before the first payment POST.
+          persistPendingCreate(PENDING_CREATE_PATH, pending);
+        }
       }
-      receipt = await createReceiptFromPending(
-        AGENT_ENDPOINT,
-        pending,
-        PENDING_CREATE_PATH,
-        RECEIPT_PATH,
-      );
-      console.log(`Created asynchronous job ${receipt.jobId}`);
-      console.log(`Payment: 1.0 U → ${sellerWallet}`);
-      console.log(`Token contract: ${U_TOKEN_ADDRESS}`);
+      if (pending !== undefined) {
+        receipt = await createReceiptFromPending(
+          AGENT_ENDPOINT,
+          pending,
+          PENDING_CREATE_PATH,
+          RECEIPT_PATH,
+        );
+        console.log(`Created asynchronous job ${receipt.jobId}`);
+        console.log(pendingAccessSummary(pending));
+      }
+    }
+
+    if (receipt === undefined) {
+      throw new AsyncJobClientError("invalid_response");
     }
 
     console.log("Waiting for the private report; interrupted runs can be restarted safely...");

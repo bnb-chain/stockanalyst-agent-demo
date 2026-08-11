@@ -20,7 +20,7 @@ import { Wallet } from "ethers";
 import { randomBytes } from "crypto";
 import { readFreeQuoteResponse } from "./x402-free-client.js";
 import {
-  BSC_TESTNET_CHAIN_ID,
+  BSC_MAINNET_CHAIN_ID,
   U_TOKEN_ADDRESS,
   U_TOKEN_DOMAIN_NAME,
   U_TOKEN_DOMAIN_VERSION,
@@ -66,7 +66,7 @@ async function buildFreeProof(
   const domain = {
     name:              U_TOKEN_DOMAIN_NAME,
     version:           U_TOKEN_DOMAIN_VERSION,
-    chainId:           BSC_TESTNET_CHAIN_ID,
+    chainId:           BSC_MAINNET_CHAIN_ID,
     verifyingContract: U_TOKEN_ADDRESS,
   };
 
@@ -93,7 +93,7 @@ async function buildFreeProof(
   const proof = {
     x402Version: 2,
     scheme:      "exact",
-    network:     `eip155:${BSC_TESTNET_CHAIN_ID}`,
+    network:     `eip155:${BSC_MAINNET_CHAIN_ID}`,
     payload: { signature: sig, authorization },
   };
 
@@ -106,17 +106,18 @@ async function fetchFreeQuote(endpoint: string, symbol: string, proof: string): 
 
   const resp = await fetch(url, {
     method:  "POST",
-    headers: { "Content-Type": "application/json", "X-Payment": proof },
+    headers: {
+      "Content-Type": "application/json",
+      "PAYMENT-SIGNATURE": proof,
+    },
     body,
   });
 
   if (resp.status === 402) {
-    const j = await resp.json() as { error?: string; detail?: string };
-    throw new Error(`Access denied: ${j.error ?? ""} — ${j.detail ?? "check X-Payment header"}`);
+    throw new Error("free_quote_payment_rejected");
   }
   if (!resp.ok) {
-    const text = await resp.text();
-    throw new Error(`HTTP ${resp.status}: ${text.slice(0, 200)}`);
+    throw new Error(`free_quote_http_${resp.status}`);
   }
   return readFreeQuoteResponse(resp);
 }
@@ -174,7 +175,7 @@ async function main(): Promise<void> {
   console.log("═".repeat(60) + "\n");
 }
 
-main().catch((err: Error) => {
-  console.error("\n✗ FAILED:", err.message);
+main().catch(() => {
+  console.error("\n✗ FAILED: free_quote_failed");
   process.exit(1);
 });

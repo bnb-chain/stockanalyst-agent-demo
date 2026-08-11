@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import base64
 import unittest
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 from x402_envelope import EnvelopeError, dispatch_x402_envelope
 
@@ -64,6 +64,60 @@ async def streaming_app(scope, receive, send) -> None:
 
 
 class X402EnvelopeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_dispatch_propagates_normalized_source_ip_only_in_scope(self) -> None:
+        captured_scope = None
+
+        async def capture_scope(scope, receive, send) -> None:
+            nonlocal captured_scope
+            captured_scope = scope
+            await recording_app(scope, receive, send)
+
+        result = await dispatch_x402_envelope(
+            capture_scope,
+            request_envelope(sourceIp="2001:0db8:0:0:0:0:0:42"),
+            expected_public_base_url=PUBLIC_BASE,
+        )
+
+        self.assertEqual(captured_scope["x402_source_ip"], "2001:db8::42")
+        self.assertNotIn((b"x402-source-ip", b"2001:db8::42"), captured_scope["headers"])
+        self.assertNotIn("sourceIp", result)
+        self.assertNotIn("2001:db8::42", str(result))
+
+    async def test_dispatch_preserves_old_envelope_without_source_ip(self) -> None:
+        captured_scope = None
+
+        async def capture_scope(scope, receive, send) -> None:
+            nonlocal captured_scope
+            captured_scope = scope
+            await recording_app(scope, receive, send)
+
+        await dispatch_x402_envelope(
+            capture_scope,
+            request_envelope(),
+            expected_public_base_url=PUBLIC_BASE,
+        )
+
+        self.assertIsNone(captured_scope["x402_source_ip"])
+
+    async def test_dispatch_rejects_malformed_source_ip(self) -> None:
+        for value in ("not-an-ip", "198.51.100.999", 3325256712, None):
+            with self.subTest(value=value), self.assertRaisesRegex(
+                EnvelopeError, "invalid_source_ip"
+            ):
+                await dispatch_x402_envelope(
+                    recording_app,
+                    request_envelope(sourceIp=value),
+                    expected_public_base_url=PUBLIC_BASE,
+                )
+
+    async def test_dispatch_rejects_unknown_tenth_envelope_field(self) -> None:
+        with self.assertRaisesRegex(EnvelopeError, "invalid_envelope"):
+            await dispatch_x402_envelope(
+                recording_app,
+                request_envelope(sourceIp="198.51.100.8", unexpected="value"),
+                expected_public_base_url=PUBLIC_BASE,
+            )
+
     async def test_dispatch_accepts_integer_envelope_version_only(self) -> None:
         result = await dispatch_x402_envelope(
             recording_app,
@@ -339,6 +393,34 @@ class X402EnvelopeTests(unittest.IsolatedAsyncioTestCase):
 
 
 class X402EnvelopeExecutorTests(unittest.IsolatedAsyncioTestCase):
+    async def test_executor_log_and_error_exclude_malformed_source_ip(self) -> None:
+        from a2a.utils.errors import ServerError
+
+        from executor import SellerAgentExecutor
+
+        marker = "198.51.100.8-attacker-marker"
+        executor = SellerAgentExecutor(
+            run_work=AsyncMock(),
+            generator="stockanalyst",
+            network="bsc-testnet",
+            x402_app=payment_required_app,
+            x402_public_base_url=PUBLIC_BASE,
+        )
+        data = {
+            "skill": "x402_http_envelope",
+            "envelope": request_envelope(sourceIp=marker),
+        }
+
+        with patch.object(executor, "_inbound", return_value=data), self.assertLogs(
+            "seller-agent.a2a", level="ERROR"
+        ) as captured, self.assertRaises(ServerError) as raised:
+            await executor.execute(object(), object())
+
+        formatted_log = "\n".join(captured.output)
+        self.assertNotIn(marker, formatted_log)
+        self.assertNotIn(marker, str(raised.exception))
+        self.assertIn("invalid_source_ip", str(raised.exception))
+
     async def test_executor_rejects_invalid_public_base_at_startup(self) -> None:
         from executor import SellerAgentExecutor
 

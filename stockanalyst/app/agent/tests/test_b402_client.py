@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import copy
 import unittest
 from dataclasses import dataclass
 from typing import Any, Self
@@ -111,13 +112,13 @@ class B402TransportTests(unittest.IsolatedAsyncioTestCase):
 
         response = await client.post(
             "/papi/v2/b402/verify",
-            {"network": "eip155:97", "x402Version": 2},
+            {"network": "eip155:56", "x402Version": 2},
         )
 
         self.assertEqual(response["code"], "000000")
         self.assertEqual(len(http.requests), 1)
         request = http.requests[0]
-        body = b'{"network":"eip155:97","x402Version":2}'
+        body = b'{"network":"eip155:56","x402Version":2}'
         self.assertEqual(request["content"], body)
         self.assertEqual(
             request["url"],
@@ -136,10 +137,16 @@ class B402TransportTests(unittest.IsolatedAsyncioTestCase):
 
 
 SUPPORTED_EXTRA = {
-    "name": "U",
+    "name": "United Stables",
     "version": "1",
     "assetTransferMethod": "eip3009",
     "signerAddress": "0x1111111111111111111111111111111111111111",
+}
+USD1_SUPPORTED_EXTRA = {
+    "name": "World Liberty Financial USD",
+    "version": "1",
+    "assetTransferMethod": "eip3009",
+    "signerAddress": "0x2222222222222222222222222222222222222222",
 }
 
 
@@ -155,7 +162,7 @@ def _supported_response(
                 {
                     "x402Version": 2,
                     "scheme": "exact",
-                    "network": "eip155:97",
+                    "network": "eip155:56",
                     "extra": SUPPORTED_EXTRA,
                 }
             ],
@@ -180,9 +187,17 @@ class B402SupportedKindTests(unittest.IsolatedAsyncioTestCase):
         client = self.client(now)
         client.post = AsyncMock(return_value=_supported_response())
 
-        first = await client.payment_extra("eip155:97", "U", "1")
+        first = await client.payment_extra(
+            "eip155:56",
+            "United Stables",
+            "1",
+        )
         first["signerAddress"] = "changed"
-        second = await client.payment_extra("eip155:97", "U", "1")
+        second = await client.payment_extra(
+            "eip155:56",
+            "United Stables",
+            "1",
+        )
 
         self.assertEqual(second, SUPPORTED_EXTRA)
         client.post.assert_awaited_once_with(
@@ -190,14 +205,104 @@ class B402SupportedKindTests(unittest.IsolatedAsyncioTestCase):
             {},
         )
 
+    async def test_selects_supported_domains_in_requested_order(self) -> None:
+        now = [100.0]
+        client = self.client(now)
+        client.post = AsyncMock(return_value=_supported_response(kinds=[
+            {
+                "x402Version": 2,
+                "scheme": "exact",
+                "network": "eip155:56",
+                "extra": USD1_SUPPORTED_EXTRA,
+            },
+            {
+                "x402Version": 2,
+                "scheme": "exact",
+                "network": "eip155:56",
+                "extra": {
+                    **SUPPORTED_EXTRA,
+                    "assetTransferMethod": "permit2",
+                },
+            },
+            {
+                "x402Version": 2,
+                "scheme": "exact",
+                "network": "eip155:56",
+                "extra": SUPPORTED_EXTRA,
+            },
+            {
+                "x402Version": 1,
+                "scheme": "exact",
+                "network": "eip155:56",
+                "extra": {**SUPPORTED_EXTRA, "name": "Unrelated"},
+            },
+        ]))
+
+        domains = (
+            ("United Stables", "1"),
+            ("World Liberty Financial USD", "1"),
+        )
+        extras = await client.payment_extras("eip155:56", domains)
+
+        self.assertEqual(list(extras), list(domains))
+        self.assertEqual(extras[domains[0]], SUPPORTED_EXTRA)
+        self.assertEqual(extras[domains[1]], USD1_SUPPORTED_EXTRA)
+        self.assertEqual(client.post.await_count, 1)
+
+    async def test_returns_only_supported_domain_or_empty_result(self) -> None:
+        now = [100.0]
+        domains = (
+            ("United Stables", "1"),
+            ("World Liberty Financial USD", "1"),
+        )
+        client = self.client(now)
+        client.post = AsyncMock(return_value=_supported_response(kinds=[{
+            "x402Version": 2,
+            "scheme": "exact",
+            "network": "eip155:56",
+            "extra": USD1_SUPPORTED_EXTRA,
+        }]))
+
+        self.assertEqual(
+            await client.payment_extras("eip155:56", domains),
+            {domains[1]: USD1_SUPPORTED_EXTRA},
+        )
+
+        empty_client = self.client(now)
+        empty_client.post = AsyncMock(
+            return_value=_supported_response(kinds=[])
+        )
+        self.assertEqual(
+            await empty_client.payment_extras("eip155:56", domains),
+            {},
+        )
+
+    async def test_payment_extras_returns_defensive_copies_from_cache(self) -> None:
+        now = [100.0]
+        client = self.client(now)
+        client.post = AsyncMock(return_value=_supported_response(kinds=[{
+            "x402Version": 2,
+            "scheme": "exact",
+            "network": "eip155:56",
+            "extra": SUPPORTED_EXTRA,
+        }]))
+        domain = ("United Stables", "1")
+
+        first = await client.payment_extras("eip155:56", (domain,))
+        first[domain]["signerAddress"] = "changed"
+        second = await client.payment_extras("eip155:56", (domain,))
+
+        self.assertEqual(second[domain], SUPPORTED_EXTRA)
+        self.assertEqual(client.post.await_count, 1)
+
     async def test_refreshes_supported_kinds_after_one_hour(self) -> None:
         now = [100.0]
         client = self.client(now)
         client.post = AsyncMock(return_value=_supported_response())
 
-        await client.payment_extra("eip155:97", "U", "1")
+        await client.payment_extra("eip155:56", "United Stables", "1")
         now[0] += 3_601
-        await client.payment_extra("eip155:97", "U", "1")
+        await client.payment_extra("eip155:56", "United Stables", "1")
 
         self.assertEqual(client.post.await_count, 2)
 
@@ -207,7 +312,7 @@ class B402SupportedKindTests(unittest.IsolatedAsyncioTestCase):
         client.post = AsyncMock(return_value=_supported_response(kinds=[]))
 
         with self.assertRaisesRegex(B402RejectedError, "does not support"):
-            await client.payment_extra("eip155:97", "U", "1")
+            await client.payment_extra("eip155:56", "United Stables", "1")
 
     async def test_requires_a_valid_signer_address(self) -> None:
         now = [100.0]
@@ -219,19 +324,19 @@ class B402SupportedKindTests(unittest.IsolatedAsyncioTestCase):
         client.post = AsyncMock(return_value=_supported_response(kinds=[{
             "x402Version": 2,
             "scheme": "exact",
-            "network": "eip155:97",
+            "network": "eip155:56",
             "extra": extra,
         }]))
 
         with self.assertRaisesRegex(B402RejectedError, "does not support"):
-            await client.payment_extra("eip155:97", "U", "1")
+            await client.payment_extra("eip155:56", "United Stables", "1")
 
 
 PAYMENT_REQUIREMENT = {
     "scheme": "exact",
-    "network": "eip155:97",
-    "amount": "1000000000000000000",
-    "asset": "0xc70B8741B8B07A6d61E54fd4B20f22Fa648E5565",
+    "network": "eip155:56",
+    "amount": "210000000000000000",
+    "asset": "0xcE24439F2D9C6a2289F741120FE202248B666666",
     "payTo": "0xd10bddc20e4dc42a1a19a9653e994991e25b8153",
     "maxTimeoutSeconds": 600,
     "extra": SUPPORTED_EXTRA,
@@ -284,7 +389,7 @@ class B402SettlementTests(unittest.IsolatedAsyncioTestCase):
                     "success": True,
                     "transaction": "0x" + "12" * 32,
                     "payer": "0x2222222222222222222222222222222222222222",
-                    "network": "eip155:97",
+                    "network": "eip155:56",
                     "amount": PAYMENT_REQUIREMENT["amount"],
                 },
             },
@@ -322,6 +427,20 @@ class B402SettlementTests(unittest.IsolatedAsyncioTestCase):
             await client.verify_and_settle(PAYMENT_PAYLOAD)
 
         client.post.assert_awaited_once()
+
+    async def test_substituted_valid_signer_is_rejected_before_verify(self) -> None:
+        client = self.client()
+        client.post = AsyncMock()
+        substituted = copy.deepcopy(PAYMENT_PAYLOAD)
+        substituted["accepted"]["extra"]["signerAddress"] = "0x" + "22" * 20
+
+        with self.assertRaisesRegex(
+            B402RejectedError,
+            "no longer supported",
+        ):
+            await client.verify_and_settle(substituted)
+
+        client.post.assert_not_awaited()
 
     async def test_prebroadcast_settlement_failure_is_explicit(self) -> None:
         client = self.client()
@@ -362,7 +481,7 @@ class B402SettlementTests(unittest.IsolatedAsyncioTestCase):
                     "success": False,
                     "transaction": "0x" + "56" * 32,
                     "payer": "0x" + "22" * 20,
-                    "network": "eip155:97",
+                    "network": "eip155:56",
                     "errorReason": "invalid_transaction_state",
                 },
             },
