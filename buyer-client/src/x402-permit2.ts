@@ -2,6 +2,7 @@ import { randomBytes } from "node:crypto";
 import type { Wallet } from "ethers";
 import {
   BSC_MAINNET_CHAIN_ID,
+  PAYMENT_TIMEOUT_SECONDS,
   PERMIT2_ADDRESS,
   type PaidPaymentChallenge,
 } from "./x402-payment.js";
@@ -27,7 +28,7 @@ const PERMIT2_TYPES = {
 export async function buildPermit2PaymentProof(
   wallet: Wallet,
   challenge: PaidPaymentChallenge,
-  ttlSeconds: number = 600,
+  ttlSeconds: number = PAYMENT_TIMEOUT_SECONDS,
   nowSeconds: () => number = () => Math.floor(Date.now() / 1_000),
 ): Promise<string> {
   const { accepted, resource } = challenge;

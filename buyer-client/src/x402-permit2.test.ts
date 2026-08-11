@@ -202,6 +202,55 @@ test("Permit2 proofs use fresh independent 256-bit nonce values", async () => {
   assert.ok(BigInt(secondNonce) < (1n << 256n));
 });
 
+test("buildPermit2PaymentProof independently recovers the USDT signer", async () => {
+  const wallet = new Wallet(PRIVATE_KEY);
+  const challenge = permit2Challenge("USDT");
+  const proof = decodeProof(await buildPermit2PaymentProof(
+    wallet,
+    challenge,
+    TTL_SECONDS,
+    () => NOW,
+  ));
+  const authorization = proof.payload.permit2Authorization;
+  const domain = {
+    name: "Permit2",
+    chainId: 56,
+    verifyingContract: PERMIT2_ADDRESS,
+  };
+
+  assert.equal(proof.accepted.asset, PAYMENT_TOKENS.USDT.asset);
+  assert.equal(proof.accepted.extra.name, PAYMENT_TOKENS.USDT.name);
+  assert.equal(proof.accepted.extra.version, PAYMENT_TOKENS.USDT.version);
+  assert.equal(proof.accepted.extra.assetTransferMethod, "permit2-exact");
+  assert.equal(authorization.permitted.token, PAYMENT_TOKENS.USDT.asset);
+  assert.deepEqual(domain, {
+    name: "Permit2",
+    chainId: BSC_MAINNET_CHAIN_ID,
+    verifyingContract: "0x000000000022D473030F116dDEE9F6B43aC78BA3",
+  });
+  assert.equal(
+    verifyTypedData(
+      domain,
+      PERMIT2_TYPES,
+      {
+        permitted: {
+          token: authorization.permitted.token,
+          amount: BigInt(authorization.permitted.amount),
+        },
+        spender: authorization.spender,
+        nonce: BigInt(authorization.nonce),
+        deadline: BigInt(authorization.deadline),
+        witness: {
+          to: authorization.witness.to,
+          validAfter: BigInt(authorization.witness.validAfter),
+        },
+      },
+      proof.payload.signature,
+    ),
+    wallet.address,
+  );
+});
+
 test("buildPaymentProof dispatches Permit2 without provider or typed-data metadata on wire", async () => {
   const wallet = new Wallet(PRIVATE_KEY);
   assert.equal(wallet.provider, null);

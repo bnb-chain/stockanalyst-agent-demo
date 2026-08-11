@@ -33,6 +33,7 @@ export const PAYMENT_TOKENS = {
 } as const;
 export const BSC_MAINNET_CHAIN_ID = 56;
 export const PAID_AMOUNT = "210000000000000000";
+export const PAYMENT_TIMEOUT_SECONDS = 600;
 
 // Compatibility aliases for the promotional client, which remains U-only.
 export const U_TOKEN_ADDRESS = PAYMENT_TOKENS.U.asset;
@@ -92,7 +93,7 @@ export function resolveX402SellerWallet(
 export async function buildPaymentProof(
   wallet: Wallet,
   challenge: PaidPaymentChallenge,
-  ttlSeconds: number = 600,
+  ttlSeconds: number = PAYMENT_TIMEOUT_SECONDS,
 ): Promise<string> {
   if (challenge.accepted.extra.assetTransferMethod === "permit2-exact") {
     const { buildPermit2PaymentProof } = await import("./x402-permit2.js");

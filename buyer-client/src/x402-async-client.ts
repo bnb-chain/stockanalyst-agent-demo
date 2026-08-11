@@ -7,6 +7,7 @@ import type {
 import {
   BSC_MAINNET_CHAIN_ID,
   PAID_AMOUNT,
+  PAYMENT_TIMEOUT_SECONDS,
   PAYMENT_TOKENS,
   type PaymentTokenSymbol,
 } from "./x402-payment.js";
@@ -388,9 +389,7 @@ function parsePaymentChallenge(
       || (promotional && transferMethod !== "eip3009")
       || typeof payTo !== "string"
       || payTo.toLowerCase() !== seller
-      || !Number.isSafeInteger(timeout)
-      || (timeout as number) <= 0
-      || (timeout as number) > 3_600
+      || timeout !== PAYMENT_TIMEOUT_SECONDS
       || extraValue["name"] !== token.name
       || extraValue["version"] !== token.version
       || extraValue["assetTransferMethod"] !== transferMethod

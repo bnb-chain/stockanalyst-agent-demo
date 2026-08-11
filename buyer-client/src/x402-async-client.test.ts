@@ -741,6 +741,33 @@ test("fetchPaymentChallenge rejects duplicate Permit2 assets before selection", 
   );
 });
 
+test("fetchPaymentChallenge requires the canonical 600-second payment timeout", async () => {
+  for (const timeout of [1, 599, 601, 3_599, 600.5, "600", null]) {
+    const challenge = paymentChallenge({
+      token: "USDC",
+      accepted: { maxTimeoutSeconds: timeout },
+    });
+    const required = paymentRequired([challenge]);
+
+    await assert.rejects(
+      fetchPaymentChallenge(
+        ENDPOINT,
+        { symbols: ["AAPL"] },
+        SELLER,
+        async () => json(
+          { paymentRequired: required },
+          { status: 402, headers: { "PAYMENT-REQUIRED": base64Json(required) } },
+        ),
+        "USDC",
+      ),
+      (error: unknown) => (
+        (error as AsyncJobClientError).code === "invalid_payment_challenge"
+      ),
+      String(timeout),
+    );
+  }
+});
+
 test("beginAsyncAnalysis accepts a proofless promotional 202 response", async () => {
   const calls: Array<{ url: string; headers: Headers }> = [];
   const result = await beginAsyncAnalysis(
