@@ -16,6 +16,7 @@ import test from "node:test";
 import { Wallet, verifyTypedData } from "ethers";
 import {
   AsyncJobClientError,
+  beginAsyncAnalysis,
   createAsyncAnalysis,
   downloadAsyncReport,
   fetchPaymentChallenge,
@@ -26,13 +27,13 @@ import {
   type FetchImpl,
 } from "./x402-async-client.js";
 import {
-  BSC_TESTNET_CHAIN_ID,
-  U_TOKEN_ADDRESS,
-  U_TOKEN_DOMAIN_NAME,
-  U_TOKEN_DOMAIN_VERSION,
+  BSC_MAINNET_CHAIN_ID,
+  PAID_AMOUNT,
+  PAYMENT_TOKENS,
   buildPaymentProof,
   resolveX402SellerWallet,
   type PaidPaymentChallenge,
+  type PaymentTokenSymbol,
 } from "./x402-payment.js";
 import {
   acquireExclusiveCliLock,
@@ -44,11 +45,15 @@ import {
   installGracefulLockCleanup,
   loadAsyncJobReceipt,
   loadPendingCreate,
+  paymentAccessFromChallenge,
   pendingCreateFailureMessage,
+  pendingAccessSummary,
   pollAsyncAnalysisWithPendingRecovery,
   quarantineRemoveOwnedPending,
+  formatX402AccessSummary,
   persistAsyncJobReceipt,
   persistPendingCreate,
+  resolveX402PaymentToken,
 } from "./x402-async.js";
 
 const JOB_ID = `x402_${"a".repeat(32)}`;
@@ -60,16 +65,16 @@ const OLD_REPORT_URL = "https://reports-bucket.s3.us-east-1.amazonaws.com/old.md
 const NEW_REPORT_URL = "https://reports-bucket.s3.us-east-1.amazonaws.com/new.md?X-Amz-Signature=new";
 const SELLER = "0xd10BdDC20E4DC42A1a19a9653e994991e25b8153";
 const SIGNER = "0x1111111111111111111111111111111111111111";
-const B402_U_TOKEN = "0x330949Aed7d00FCe0558C64ED6FeC9792616cC39";
-const ONE_U_ATOMIC = "1000000";
 
 function paymentChallenge(
   overrides: {
+    token?: PaymentTokenSymbol;
     resource?: Record<string, unknown>;
     accepted?: Record<string, unknown>;
     extra?: Record<string, unknown>;
   } = {},
 ): PaidPaymentChallenge {
+  const token = PAYMENT_TOKENS[overrides.token ?? "U"];
   const resource = {
     url: `${ENDPOINT}/x402/analyze/async`,
     description: "Stock analysis for AAPL",
@@ -77,17 +82,17 @@ function paymentChallenge(
     ...overrides.resource,
   };
   const extra = {
-    name: "U",
-    version: "1",
+    name: token.name,
+    version: token.version,
     assetTransferMethod: "eip3009",
     signerAddress: SIGNER,
     ...overrides.extra,
   };
   const accepted = {
     scheme: "exact",
-    network: "eip155:97",
-    amount: ONE_U_ATOMIC,
-    asset: U_TOKEN_ADDRESS,
+    network: `eip155:${BSC_MAINNET_CHAIN_ID}`,
+    amount: PAID_AMOUNT,
+    asset: token.asset,
     payTo: SELLER.toLowerCase(),
     maxTimeoutSeconds: 600,
     extra,
@@ -97,7 +102,32 @@ function paymentChallenge(
     x402Version: 2,
     resource,
     accepted,
+    promotional: accepted.amount === "0",
   } as PaidPaymentChallenge;
+}
+
+function paymentRequired(
+  challenges: PaidPaymentChallenge[] = [
+    paymentChallenge(),
+    paymentChallenge({ token: "USD1" }),
+  ],
+): Record<string, unknown> {
+  return {
+    x402Version: 2,
+    accepts: challenges.map((challenge) => challenge.accepted),
+    resource: challenges[0]?.resource,
+  };
+}
+
+function promotionalPaymentChallenge(
+  token: PaymentTokenSymbol = "U",
+): PaidPaymentChallenge {
+  const challenge = paymentChallenge({
+    token,
+    accepted: { amount: "0" },
+  });
+  delete (challenge.accepted.extra as { signerAddress?: string }).signerAddress;
+  return challenge;
 }
 
 function receipt(overrides: Partial<AsyncJobReceipt> = {}): AsyncJobReceipt {
@@ -131,6 +161,10 @@ function json(body: unknown, init: ResponseInit = {}): Response {
       ...Object.fromEntries(new Headers(init.headers)),
     },
   });
+}
+
+function base64Json(value: unknown): string {
+  return Buffer.from(JSON.stringify(value)).toString("base64");
 }
 
 function fakeClock(start = 1_000): {
@@ -176,9 +210,153 @@ test("requires an explicit x402 seller wallet", () => {
   );
 });
 
-test("uses the B402-supported six-decimal U token", () => {
-  assert.equal(U_TOKEN_ADDRESS, B402_U_TOKEN);
-  assert.equal(paymentChallenge().accepted.amount, ONE_U_ATOMIC);
+test("parses X402_PAYMENT_TOKEN as the exact U or USD1 enum with U default", () => {
+  assert.equal(resolveX402PaymentToken({}), "U");
+  assert.equal(resolveX402PaymentToken({ X402_PAYMENT_TOKEN: "U" }), "U");
+  assert.equal(resolveX402PaymentToken({ X402_PAYMENT_TOKEN: "USD1" }), "USD1");
+
+  for (const value of ["", "u", "usd1", " USD1 ", "USDC", "USDT"]) {
+    assert.throws(
+      () => resolveX402PaymentToken({ X402_PAYMENT_TOKEN: value }),
+      /X402_PAYMENT_TOKEN must be U or USD1/,
+      value,
+    );
+  }
+});
+
+test("formats promotional and paid CLI output without proof or signature data", () => {
+  assert.equal(
+    formatX402AccessSummary(paymentAccessFromChallenge(promotionalPaymentChallenge("U"))),
+    "Promotional access: 0 U (wallet signature only; no settlement)",
+  );
+  assert.equal(
+    formatX402AccessSummary(paymentAccessFromChallenge(paymentChallenge({ token: "USD1" }))),
+    `Payment: 0.21 USD1 → ${SELLER.toLowerCase()}`,
+  );
+});
+
+test("pending-create recovery retains the correct paid and promotional access summary", async () => {
+  const cases = [
+    {
+      challenge: promotionalPaymentChallenge("U"),
+      summary: "Promotional access: 0 U (wallet signature only; no settlement)",
+    },
+    {
+      challenge: paymentChallenge({ token: "USD1" }),
+      summary: `Payment: 0.21 USD1 → ${SELLER.toLowerCase()}`,
+    },
+  ];
+
+  for (const { challenge, summary } of cases) {
+    const directory = mkdtempSync(join(tmpdir(), "x402-access-recovery-"));
+    const pendingPath = join(directory, "pending.json");
+    const receiptPath = join(directory, "receipt.json");
+    const now = Date.now();
+    const proof = await buildPaymentProof(
+      new Wallet(Wallet.createRandom().privateKey),
+      challenge,
+    );
+    const pending = createPendingRecord(
+      proof,
+      { symbols: ["AAPL"] },
+      now,
+    );
+    try {
+      persistPendingCreate(pendingPath, pending);
+      const restarted = loadPendingCreate(pendingPath);
+      let submittedProof = "";
+      await createReceiptFromPending(
+        ENDPOINT,
+        restarted,
+        pendingPath,
+        receiptPath,
+        async (_input, init) => {
+          submittedProof = new Headers(init?.headers).get("PAYMENT-SIGNATURE") ?? "";
+          return json(receipt(), { status: 202 });
+        },
+        { now: () => now, maxAttempts: 1 },
+      );
+
+      assert.equal(submittedProof, proof);
+      assert.equal(pendingAccessSummary(loadPendingCreate(pendingPath)), summary);
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  }
+});
+
+test("uses the mainnet U and USD1 registry", () => {
+  assert.equal(
+    PAYMENT_TOKENS.U.asset,
+    "0xcE24439F2D9C6a2289F741120FE202248B666666",
+  );
+  assert.equal(
+    PAYMENT_TOKENS.USD1.asset,
+    "0x8d0D000Ee44948FC98c9B98A4FA4921476f08B0d",
+  );
+  assert.equal(PAID_AMOUNT, "210000000000000000");
+  assert.equal(paymentChallenge().accepted.amount, PAID_AMOUNT);
+  assert.equal(BSC_MAINNET_CHAIN_ID, 56);
+});
+
+test("buildPaymentProof uses the exact 0.21-token authorization value", async () => {
+  for (const token of ["U", "USD1"] as const) {
+    const proof = JSON.parse(
+      Buffer.from(
+        await buildPaymentProof(
+          new Wallet(Wallet.createRandom().privateKey),
+          paymentChallenge({ token }),
+        ),
+        "base64",
+      ).toString("utf8"),
+    ) as { payload: { authorization: { value: string } } };
+    assert.equal(proof.payload.authorization.value, "210000000000000000");
+  }
+});
+
+test("x402 production modules expose only explicit mainnet chain naming", () => {
+  const paymentModule = readFileSync(
+    new URL("./x402-payment.js", import.meta.url),
+    "utf8",
+  );
+  const freeModule = readFileSync(
+    new URL("./x402free.js", import.meta.url),
+    "utf8",
+  );
+
+  assert.doesNotMatch(paymentModule, /BSC_TESTNET_CHAIN_ID/);
+  assert.doesNotMatch(freeModule, /BSC_TESTNET_CHAIN_ID/);
+  assert.match(freeModule, /BSC_MAINNET_CHAIN_ID/);
+});
+
+test("x402 free tier uses V2-only headers and never echoes server error data", () => {
+  const freeModule = readFileSync(
+    new URL("./x402free.js", import.meta.url),
+    "utf8",
+  );
+
+  assert.match(freeModule, /"PAYMENT-SIGNATURE": proof/);
+  assert.doesNotMatch(freeModule, /await resp\.(?:json|text)\(/);
+  assert.doesNotMatch(freeModule, /err\.message/);
+  assert.match(freeModule, /free_quote_payment_rejected/);
+  assert.match(freeModule, /free_quote_http_\$\{resp\.status\}/);
+});
+
+test("buyer documentation separates mainnet x402 from testnet ERC-8183", () => {
+  const readme = readFileSync(
+    new URL("../README.md", import.meta.url),
+    "utf8",
+  );
+
+  assert.match(readme, /x402 payments use \*\*BSC Mainnet \(chain ID 56\)\*\*/);
+  assert.match(readme, /United Stables/);
+  assert.match(readme, /World Liberty Financial USD/);
+  assert.doesNotMatch(readme, /x402 \(API Gateway in testnet/);
+  assert.doesNotMatch(readme, /X402_ENDPOINT=.*\/testnet/);
+  assert.doesNotMatch(
+    readme,
+    /domain matches the U token contract on BSC Testnet/,
+  );
 });
 
 test("signs the authorization to the configured seller wallet", async () => {
@@ -192,9 +370,10 @@ test("signs the authorization to the configured seller wallet", async () => {
   assert.equal(proof.payload.authorization.to, SELLER.toLowerCase());
 });
 
-test("buildPaymentProof creates the official B402 V2 proof", async () => {
+test("buildPaymentProof signs with the selected token contract and domain", async () => {
   const wallet = new Wallet(Wallet.createRandom().privateKey);
   const challenge = paymentChallenge({
+    token: "USD1",
     accepted: { amount: "42" },
   });
   const proof = JSON.parse(
@@ -229,10 +408,10 @@ test("buildPaymentProof creates the official B402 V2 proof", async () => {
 
   const recovered = verifyTypedData(
     {
-      name: U_TOKEN_DOMAIN_NAME,
-      version: U_TOKEN_DOMAIN_VERSION,
-      chainId: BSC_TESTNET_CHAIN_ID,
-      verifyingContract: U_TOKEN_ADDRESS,
+      name: PAYMENT_TOKENS.USD1.name,
+      version: PAYMENT_TOKENS.USD1.version,
+      chainId: BSC_MAINNET_CHAIN_ID,
+      verifyingContract: PAYMENT_TOKENS.USD1.asset,
     },
     {
       TransferWithAuthorization: [
@@ -255,22 +434,138 @@ test("buildPaymentProof creates the official B402 V2 proof", async () => {
   assert.equal(recovered, wallet.address);
 });
 
-test("fetchPaymentChallenge validates the B402 payment challenge", async () => {
+test("accepts zero promotional challenges for each registered EIP-3009 token", async () => {
+  for (const token of ["U", "USD1"] as const) {
+    const expected = promotionalPaymentChallenge(token);
+    const required = paymentRequired([expected]);
+    const actual = await fetchPaymentChallenge(
+      ENDPOINT,
+      { symbols: ["AAPL"] },
+      SELLER,
+      async () => json({
+        paymentRequired: required,
+      }, {
+        status: 402,
+        headers: { "PAYMENT-REQUIRED": base64Json(required) },
+      }),
+      token,
+    );
+
+    assert.equal(actual.promotional, true);
+    assert.equal(actual.accepted.amount, "0");
+    assert.equal("signerAddress" in actual.accepted.extra, false);
+    assert.equal(actual.accepted.asset, PAYMENT_TOKENS[token].asset);
+    assert.equal(actual.accepted.extra.name, PAYMENT_TOKENS[token].name);
+    assert.equal(actual.accepted.extra.version, PAYMENT_TOKENS[token].version);
+    assert.equal(actual.accepted.extra.assetTransferMethod, "eip3009");
+  }
+});
+
+test("rejects malformed promotional and paid challenge discriminants", async () => {
+  const paidWithoutSigner = paymentChallenge();
+  delete (paidWithoutSigner.accepted.extra as { signerAddress?: string }).signerAddress;
+  const invalid: Array<[string, PaidPaymentChallenge]> = [
+    ["zero with signer", paymentChallenge({ accepted: { amount: "0" } })],
+    ["paid without signer", paidWithoutSigner],
+    ["negative amount", paymentChallenge({ accepted: { amount: "-1" } })],
+    ["decimal amount", paymentChallenge({ accepted: { amount: "0.0" } })],
+    ["scientific amount", paymentChallenge({ accepted: { amount: "1e18" } })],
+  ];
+
+  for (const [name, challenge] of invalid) {
+    const required = paymentRequired([challenge]);
+    await assert.rejects(
+      fetchPaymentChallenge(
+        ENDPOINT,
+        { symbols: ["AAPL"] },
+        SELLER,
+        async () => json({
+          paymentRequired: required,
+        }, {
+          status: 402,
+          headers: { "PAYMENT-REQUIRED": base64Json(required) },
+        }),
+      ),
+      (error: unknown) => {
+        assert.equal(
+          (error as AsyncJobClientError).code,
+          "invalid_payment_challenge",
+          name,
+        );
+        return true;
+      },
+    );
+  }
+});
+
+test("buildPaymentProof signs an exact zero-value promotional authorization", async () => {
+  const wallet = new Wallet(Wallet.createRandom().privateKey);
+  const challenge = promotionalPaymentChallenge("USD1");
+  const proof = JSON.parse(
+    Buffer.from(await buildPaymentProof(wallet, challenge, 300), "base64").toString("utf8"),
+  ) as {
+    accepted: PaidPaymentChallenge["accepted"];
+    payload: {
+      signature: string;
+      authorization: {
+        from: string;
+        to: string;
+        value: string;
+        validAfter: string;
+        validBefore: string;
+        nonce: string;
+      };
+    };
+  };
+
+  assert.equal(proof.payload.authorization.value, "0");
+  assert.equal(proof.accepted.network, "eip155:56");
+  assert.equal(proof.accepted.asset, PAYMENT_TOKENS.USD1.asset);
+  const recovered = verifyTypedData(
+    {
+      name: PAYMENT_TOKENS.USD1.name,
+      version: PAYMENT_TOKENS.USD1.version,
+      chainId: 56,
+      verifyingContract: PAYMENT_TOKENS.USD1.asset,
+    },
+    {
+      TransferWithAuthorization: [
+        { name: "from", type: "address" },
+        { name: "to", type: "address" },
+        { name: "value", type: "uint256" },
+        { name: "validAfter", type: "uint256" },
+        { name: "validBefore", type: "uint256" },
+        { name: "nonce", type: "bytes32" },
+      ],
+    },
+    {
+      ...proof.payload.authorization,
+      value: 0n,
+      validAfter: BigInt(proof.payload.authorization.validAfter),
+      validBefore: BigInt(proof.payload.authorization.validBefore),
+    },
+    proof.payload.signature,
+  );
+  assert.equal(recovered, wallet.address);
+});
+
+test("fetchPaymentChallenge selects U by default and USD1 explicitly", async () => {
   const expected = paymentChallenge();
+  const expectedUsd1 = paymentChallenge({ token: "USD1" });
   const calls: Array<{ url: string; headers: Headers }> = [];
   const fetchImpl: FetchImpl = async (input, init) => {
     calls.push({
       url: String(input),
       headers: new Headers(init?.headers),
     });
+    const required = paymentRequired([expected, expectedUsd1]);
     return json({
       error: "Payment Required",
-      paymentRequired: {
-        x402Version: 2,
-        accepts: [expected.accepted],
-        resource: expected.resource,
-      },
-    }, { status: 402 });
+      paymentRequired: required,
+    }, {
+      status: 402,
+      headers: { "PAYMENT-REQUIRED": base64Json(required) },
+    });
   };
 
   const actual = await fetchPaymentChallenge(
@@ -283,7 +578,88 @@ test("fetchPaymentChallenge validates the B402 payment challenge", async () => {
   assert.deepEqual(actual, expected);
   assert.equal(calls.length, 1);
   assert.equal(calls[0]?.url, `${ENDPOINT}/x402/analyze/async`);
-  assert.equal(calls[0]?.headers.has("X-Payment"), false);
+  assert.equal(calls[0]?.headers.has("PAYMENT-SIGNATURE"), false);
+
+  const usd1 = await fetchPaymentChallenge(
+    ENDPOINT,
+    { symbols: ["AAPL"] },
+    SELLER,
+    fetchImpl,
+    "USD1",
+  );
+  assert.equal(
+    usd1.accepted.asset.toLowerCase(),
+    PAYMENT_TOKENS.USD1.asset.toLowerCase(),
+  );
+  assert.equal(usd1.accepted.amount, PAID_AMOUNT);
+
+  await assert.rejects(
+    fetchPaymentChallenge(
+      ENDPOINT,
+      { symbols: ["AAPL"] },
+      SELLER,
+      fetchImpl,
+      "USDT" as never,
+    ),
+    (error: unknown) => (
+      (error as AsyncJobClientError).code === "invalid_payment_challenge"
+    ),
+  );
+});
+
+test("beginAsyncAnalysis accepts a proofless promotional 202 response", async () => {
+  const calls: Array<{ url: string; headers: Headers }> = [];
+  const result = await beginAsyncAnalysis(
+    ENDPOINT,
+    { symbols: ["AAPL"] },
+    SELLER,
+    async (input, init) => {
+      calls.push({
+        url: String(input),
+        headers: new Headers(init?.headers),
+      });
+      return json(receipt(), { status: 202 });
+    },
+  );
+
+  assert.deepEqual(result, { kind: "created", receipt: receipt() });
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0]?.url, `${ENDPOINT}/x402/analyze/async`);
+  assert.equal(calls[0]?.headers.has("PAYMENT-SIGNATURE"), false);
+});
+
+test("beginAsyncAnalysis preserves the paid 402 challenge", async () => {
+  const expected = paymentChallenge({ token: "USD1" });
+  const required = paymentRequired([expected]);
+  const result = await beginAsyncAnalysis(
+    ENDPOINT,
+    { symbols: ["AAPL"] },
+    SELLER,
+    async () => json(
+      { paymentRequired: required },
+      { status: 402, headers: { "PAYMENT-REQUIRED": base64Json(required) } },
+    ),
+    "USD1",
+  );
+
+  assert.deepEqual(result, {
+    kind: "payment_required",
+    challenge: expected,
+  });
+});
+
+test("beginAsyncAnalysis rejects malformed promotional receipts", async () => {
+  await assert.rejects(
+    beginAsyncAnalysis(
+      ENDPOINT,
+      { symbols: ["AAPL"] },
+      SELLER,
+      async () => json({ status: "queued" }, { status: 202 }),
+    ),
+    (error: unknown) => (
+      (error as AsyncJobClientError).code === "invalid_response"
+    ),
+  );
 });
 
 test("fetchPaymentChallenge preserves an API Gateway stage prefix", async () => {
@@ -294,6 +670,7 @@ test("fetchPaymentChallenge preserves an API Gateway stage prefix", async () => 
     },
   });
   let requestedUrl = "";
+  const required = paymentRequired([expected]);
   const actual = await fetchPaymentChallenge(
     endpoint,
     { symbols: ["AAPL"] },
@@ -301,12 +678,11 @@ test("fetchPaymentChallenge preserves an API Gateway stage prefix", async () => 
     async (input) => {
       requestedUrl = String(input);
       return json({
-        paymentRequired: {
-          x402Version: 2,
-          accepts: [expected.accepted],
-          resource: expected.resource,
-        },
-      }, { status: 402 });
+        paymentRequired: required,
+      }, {
+        status: 402,
+        headers: { "PAYMENT-REQUIRED": base64Json(required) },
+      });
     },
   );
 
@@ -316,28 +692,29 @@ test("fetchPaymentChallenge preserves an API Gateway stage prefix", async () => 
 
 test("fetchPaymentChallenge rejects unsafe B402 payment challenges", async () => {
   const invalid: Array<[string, PaidPaymentChallenge]> = [
-    ["network", paymentChallenge({ accepted: { network: "eip155:56" } })],
+    ["network", paymentChallenge({ accepted: { network: "eip155:97" } })],
     ["asset", paymentChallenge({ accepted: { asset: "0x" + "22".repeat(20) } })],
     ["seller", paymentChallenge({ accepted: { payTo: "0x" + "33".repeat(20) } })],
     ["amount", paymentChallenge({ accepted: { amount: "999" } })],
+    ["domain", paymentChallenge({ extra: { name: PAYMENT_TOKENS.USD1.name } })],
     ["method", paymentChallenge({ extra: { assetTransferMethod: "permit2-exact" } })],
     ["signer", paymentChallenge({ extra: { signerAddress: "invalid" } })],
     ["resource", paymentChallenge({ resource: { url: "https://evil.example/x402" } })],
   ];
 
   for (const [field, challenge] of invalid) {
+    const required = paymentRequired([challenge]);
     await assert.rejects(
       fetchPaymentChallenge(
         ENDPOINT,
         { symbols: ["AAPL"] },
         SELLER,
         async () => json({
-          paymentRequired: {
-            x402Version: 2,
-            accepts: [challenge.accepted],
-            resource: challenge.resource,
-          },
-        }, { status: 402 }),
+          paymentRequired: required,
+        }, {
+          status: 402,
+          headers: { "PAYMENT-REQUIRED": base64Json(required) },
+        }),
       ),
       (error: unknown) => {
         assert.equal((error as AsyncJobClientError).code, "invalid_payment_challenge", field);
@@ -345,6 +722,413 @@ test("fetchPaymentChallenge rejects unsafe B402 payment challenges", async () =>
       },
     );
   }
+});
+
+test("fetchPaymentChallenge validates every entry and rejects ambiguity", async () => {
+  const validU = paymentChallenge();
+  const cases: Array<[string, PaidPaymentChallenge[], PaymentTokenSymbol]> = [
+    ["duplicate", [validU, validU], "U"],
+    [
+      "unknown asset",
+      [
+        validU,
+        paymentChallenge({
+          token: "USD1",
+          accepted: { asset: "0x" + "44".repeat(20) },
+        }),
+      ],
+      "U",
+    ],
+    [
+      "wrong contract/domain pair",
+      [
+        validU,
+        paymentChallenge({
+          token: "USD1",
+          extra: { name: PAYMENT_TOKENS.U.name },
+        }),
+      ],
+      "U",
+    ],
+    [
+      "wrong decimals",
+      [validU, paymentChallenge({ token: "USD1", accepted: { amount: "1000000" } })],
+      "U",
+    ],
+    ["preferred token absent", [validU], "USD1"],
+  ];
+
+  for (const [name, challenges, preferred] of cases) {
+    const required = paymentRequired(challenges);
+    await assert.rejects(
+      fetchPaymentChallenge(
+        ENDPOINT,
+        { symbols: ["AAPL"] },
+        SELLER,
+        async () => json(
+          { paymentRequired: required },
+          { status: 402, headers: { "PAYMENT-REQUIRED": base64Json(required) } },
+        ),
+        preferred,
+      ),
+      (error: unknown) => {
+        assert.equal(
+          (error as AsyncJobClientError).code,
+          "invalid_payment_challenge",
+          name,
+        );
+        return true;
+      },
+    );
+  }
+
+});
+
+test("paid create sends only PAYMENT-SIGNATURE and accepts a safe settlement response", async () => {
+  const headers: Headers[] = [];
+  const proof = "proof";
+  const fetchImpl: FetchImpl = async (_url, init) => {
+    headers.push(new Headers(init?.headers));
+    return json(receipt(), {
+      status: 202,
+      headers: {
+        "PAYMENT-RESPONSE": base64Json({
+          success: true,
+          transaction: "0xtx",
+          network: "eip155:56",
+          payer: SELLER,
+        }),
+      },
+    });
+  };
+
+  await createAsyncAnalysis(ENDPOINT, proof, { symbols: ["AAPL"] }, fetchImpl);
+
+  assert.equal(headers[0]?.get("PAYMENT-SIGNATURE"), proof);
+});
+
+test("paid create accepts a settled response when the transaction reference is unavailable", async () => {
+  await createAsyncAnalysis(
+    ENDPOINT,
+    "proof",
+    { symbols: ["AAPL"] },
+    async () => json(receipt(), {
+      status: 202,
+      headers: {
+        "PAYMENT-RESPONSE": base64Json({
+          success: true,
+          transaction: "",
+          network: "eip155:56",
+          payer: SELLER,
+        }),
+      },
+    }),
+  );
+});
+
+test("paid create rejects malformed PAYMENT-RESPONSE without exposing its value", async () => {
+  const secret = "untrusted-settlement-value";
+  await assert.rejects(
+    createAsyncAnalysis(
+      ENDPOINT,
+      "proof",
+      { symbols: ["AAPL"] },
+      async () => json(receipt(), {
+        status: 202,
+        headers: {
+          "PAYMENT-RESPONSE": base64Json({
+            success: true,
+            transaction: secret,
+            network: "eip155:97",
+            payer: SELLER,
+          }),
+        },
+      }),
+    ),
+    (error: unknown) => error instanceof AsyncJobClientError
+      && error.code === "invalid_payment_response"
+      && !error.message.includes(secret),
+  );
+});
+
+test("paid create binds settlement success to the HTTP status", async () => {
+  const failedReceipt = {
+    success: false,
+    transaction: "",
+    network: "eip155:56",
+    payer: SELLER,
+    errorReason: "payment_rejected",
+  };
+  await assert.rejects(
+    createAsyncAnalysis(
+      ENDPOINT,
+      "proof",
+      { symbols: ["AAPL"] },
+      async () => json({ errorCode: "payment_rejected", retryable: false }, {
+        status: 402,
+        headers: { "PAYMENT-RESPONSE": base64Json(failedReceipt) },
+      }),
+    ),
+    (error: unknown) => error instanceof AsyncJobClientError
+      && error.code === "payment_rejected"
+      && error.httpStatus === 402,
+  );
+
+  for (const [name, statusCode, settlement] of [
+    ["202 failure", 202, { ...failedReceipt, transaction: "0xtx" }],
+    ["402 success", 402, {
+      ...failedReceipt,
+      success: true,
+      transaction: "0xtx",
+    }],
+  ] as const) {
+    await assert.rejects(
+      createAsyncAnalysis(
+        ENDPOINT,
+        "proof",
+        { symbols: ["AAPL"] },
+        async () => json(
+          statusCode === 202 ? receipt() : { errorCode: "payment_rejected" },
+          {
+            status: statusCode,
+            headers: { "PAYMENT-RESPONSE": base64Json(settlement) },
+          },
+        ),
+      ),
+      (error: unknown) => error instanceof AsyncJobClientError
+        && error.code === "invalid_payment_response",
+      name,
+    );
+  }
+  await assert.rejects(
+    createAsyncAnalysis(
+      ENDPOINT,
+      "proof",
+      { symbols: ["AAPL"] },
+      async () => json({ errorCode: "payment_rejected" }, {
+        status: 402,
+        headers: {
+          "PAYMENT-RESPONSE": base64Json({
+            ...failedReceipt,
+            errorReason: "untrusted_reason",
+          }),
+        },
+      }),
+    ),
+    (error: unknown) => error instanceof AsyncJobClientError
+      && error.code === "invalid_payment_response",
+  );
+});
+
+test("paid create strictly bounds settlement receipt fields", async () => {
+  const valid = {
+    success: true,
+    transaction: "x".repeat(4_096),
+    network: "eip155:56",
+    payer: SELLER,
+  };
+  await createAsyncAnalysis(
+    ENDPOINT,
+    "proof",
+    { symbols: ["AAPL"] },
+    async () => json(receipt(), {
+      status: 202,
+      headers: { "PAYMENT-RESPONSE": base64Json(valid) },
+    }),
+  );
+
+  const invalidReceipts: Array<[string, Record<string, unknown>]> = [
+    ["boolean", { ...valid, success: "true" }],
+    ["transaction type", { ...valid, transaction: 1 }],
+    ["transaction length", { ...valid, transaction: "x".repeat(4_097) }],
+    ["astral transaction", {
+      ...valid,
+      transaction: `${"x".repeat(4_094)}😀`,
+    }],
+    ["space transaction", { ...valid, transaction: "contains space" }],
+    ["newline transaction", { ...valid, transaction: "line\nbreak" }],
+    ["delete transaction", { ...valid, transaction: "delete\u007f" }],
+    ["success failure reason", { ...valid, errorReason: "payment_rejected" }],
+    ["network", { ...valid, network: "eip155:97" }],
+    ["payer", { ...valid, payer: "not-an-address" }],
+  ];
+  for (const [name, settlement] of invalidReceipts) {
+    await assert.rejects(
+      createAsyncAnalysis(
+        ENDPOINT,
+        "proof",
+        { symbols: ["AAPL"] },
+        async () => json(receipt(), {
+          status: 202,
+          headers: { "PAYMENT-RESPONSE": base64Json(settlement) },
+        }),
+      ),
+      (error: unknown) => error instanceof AsyncJobClientError
+        && error.code === "invalid_payment_response",
+      name,
+    );
+  }
+});
+
+test("challenge requires PAYMENT-REQUIRED consistent with its body", async () => {
+  const required = paymentRequired([paymentChallenge()]);
+  const valid: FetchImpl = async () => json({ paymentRequired: required }, {
+    status: 402,
+    headers: { "PAYMENT-REQUIRED": base64Json(required) },
+  });
+  const result = await fetchPaymentChallenge(
+    ENDPOINT,
+    { symbols: ["AAPL"] },
+    SELLER,
+    valid,
+  );
+  assert.equal(result.x402Version, 2);
+
+  const mismatch: FetchImpl = async () => json({ paymentRequired: required }, {
+    status: 402,
+    headers: {
+      "PAYMENT-REQUIRED": base64Json({ ...required, accepts: [] }),
+    },
+  });
+  await assert.rejects(
+    fetchPaymentChallenge(ENDPOINT, { symbols: ["AAPL"] }, SELLER, mismatch),
+    (error: unknown) => error instanceof AsyncJobClientError
+      && error.code === "invalid_payment_challenge",
+  );
+});
+
+test("challenge header decoding is bounded, canonical, and semantic", async () => {
+  const required = paymentRequired([paymentChallenge()]);
+  const reordered = {
+    resource: required["resource"],
+    accepts: required["accepts"],
+    x402Version: required["x402Version"],
+  };
+  const reorderedResult = await fetchPaymentChallenge(
+    ENDPOINT,
+    { symbols: ["AAPL"] },
+    SELLER,
+    async () => json({ paymentRequired: required }, {
+      status: 402,
+      headers: { "PAYMENT-REQUIRED": base64Json(reordered) },
+    }),
+  );
+  assert.equal(reorderedResult.x402Version, 2);
+
+  const prototypeExtra: Record<string, unknown> = { ...required };
+  Object.defineProperty(prototypeExtra, "__proto__", {
+    enumerable: true,
+    value: "unexpected",
+  });
+  const invalidHeaders = [
+    ["missing", null],
+    ["noncanonical", `${base64Json(required)}=`],
+    ["invalid utf8", Buffer.from([0xff]).toString("base64")],
+    ["oversize", Buffer.alloc(64 * 1024 + 1, 0x20).toString("base64")],
+    ["type difference", base64Json({ ...required, x402Version: "2" })],
+    ["prototype key", base64Json(prototypeExtra)],
+  ] as const;
+  for (const [name, header] of invalidHeaders) {
+    await assert.rejects(
+      fetchPaymentChallenge(
+        ENDPOINT,
+        { symbols: ["AAPL"] },
+        SELLER,
+        async () => json({ paymentRequired: required }, {
+          status: 402,
+          headers: header === null ? {} : { "PAYMENT-REQUIRED": header },
+        }),
+      ),
+      (error: unknown) => error instanceof AsyncJobClientError
+        && error.code === "invalid_payment_challenge",
+      name,
+    );
+  }
+});
+
+test("analysis_empty_response resumes without a payment signature", async () => {
+  const calls: Array<{ url: string; headers: Headers }> = [];
+  const fetchImpl: FetchImpl = async (input, init) => {
+    calls.push({ url: String(input), headers: new Headers(init?.headers) });
+    if (calls.length === 1) {
+      return json(status("failed", {
+        errorCode: "analysis_empty_response",
+        retryable: true,
+      }));
+    }
+    if (calls.length === 2) return json(status("queued"), { status: 202 });
+    return json(status("succeeded", {
+      downloadUrl: REPORT_URL,
+      downloadUrlExpiresAt: EXPIRES_AT - 1,
+    }));
+  };
+
+  await pollAsyncAnalysis(ENDPOINT, receipt(), fetchImpl, {
+    ...fakeClock(),
+    timeoutMs: 20_000,
+    sleep: async () => {},
+  });
+
+  assert.equal(
+    calls.some((call) => call.headers.has("PAYMENT-SIGNATURE")),
+    false,
+  );
+  assert.equal(calls.filter((call) => call.url.endsWith("/resume")).length, 1);
+});
+
+test("resume status preserves analysis_empty_response without a payment signature", async () => {
+  let submittedHeaders = new Headers();
+  const resumed = await resumeAsyncAnalysis(
+    ENDPOINT,
+    receipt(),
+    async (_input, init) => {
+      submittedHeaders = new Headers(init?.headers);
+      return json(status("failed", {
+        errorCode: "analysis_empty_response",
+        retryable: true,
+      }), { status: 202 });
+    },
+  );
+
+  assert.equal(resumed.errorCode, "analysis_empty_response");
+  assert.equal(submittedHeaders.has("PAYMENT-SIGNATURE"), false);
+});
+
+test("analysis_empty_response remains the final error after one empty resume", async () => {
+  const calls: Array<{ url: string; headers: Headers }> = [];
+  let reads = 0;
+  const fetchImpl: FetchImpl = async (input, init) => {
+    const url = String(input);
+    calls.push({ url, headers: new Headers(init?.headers) });
+    if (url.endsWith("/resume")) {
+      return json(status("queued"), {
+        status: 202,
+        headers: { "Retry-After": "0" },
+      });
+    }
+    reads += 1;
+    return json(status("failed", {
+      errorCode: "analysis_empty_response",
+      retryable: true,
+    }));
+  };
+
+  await assert.rejects(
+    pollAsyncAnalysis(ENDPOINT, receipt(), fetchImpl, {
+      ...fakeClock(),
+      timeoutMs: 5_000,
+    }),
+    (error: unknown) => error instanceof AsyncJobClientError
+      && error.code === "analysis_empty_response"
+      && error.retryable,
+  );
+
+  assert.equal(reads, 2);
+  assert.equal(calls.filter((call) => call.url.endsWith("/resume")).length, 1);
+  assert.equal(
+    calls.some((call) => call.headers.has("PAYMENT-SIGNATURE")),
+    false,
+  );
 });
 
 test("creates, polls, and downloads an asynchronous report", async () => {
@@ -1410,7 +2194,7 @@ test("ambiguous create retries and restarts reuse one persisted proof and reques
     assert.equal(existsSync(pendingPath), true);
     assert.equal(existsSync(receiptPath), false);
     calls.push({
-      proof: new Headers(init?.headers).get("X-Payment"),
+      proof: new Headers(init?.headers).get("PAYMENT-SIGNATURE"),
       body: String(init?.body),
     });
     throw new TypeError("response lost after server accepted payment");
@@ -1443,7 +2227,7 @@ test("ambiguous create retries and restarts reuse one persisted proof and reques
       receiptPath,
       async (_input, init) => {
         calls.push({
-          proof: new Headers(init?.headers).get("X-Payment"),
+          proof: new Headers(init?.headers).get("PAYMENT-SIGNATURE"),
           body: String(init?.body),
         });
         return json(receipt(), { status: 202 });
@@ -1490,7 +2274,7 @@ test("settling recovery retains both files across interruption and resubmits the
         pendingPath,
         receiptPath,
         async (_input, init) => {
-          submittedProofs.push(new Headers(init?.headers).get("X-Payment"));
+          submittedProofs.push(new Headers(init?.headers).get("PAYMENT-SIGNATURE"));
           return await new Promise<Response>((_resolve, reject) => {
             init?.signal?.addEventListener("abort", () => {
               reject(new DOMException("ambiguous timeout", "AbortError"));
@@ -1520,7 +2304,7 @@ test("settling recovery retains both files across interruption and resubmits the
       pendingPath,
       receiptPath,
       async (_input, init) => {
-        submittedProofs.push(new Headers(init?.headers).get("X-Payment"));
+        submittedProofs.push(new Headers(init?.headers).get("PAYMENT-SIGNATURE"));
         return json(receipt({ status: "settling" }), { status: 202 });
       },
       {
@@ -1569,7 +2353,7 @@ test("settling recovery retains both files across interruption and resubmits the
       async (input, init) => {
         const url = String(input);
         if (url.endsWith("/x402/analyze/async")) {
-          submittedProofs.push(new Headers(init?.headers).get("X-Payment"));
+          submittedProofs.push(new Headers(init?.headers).get("PAYMENT-SIGNATURE"));
           return json(receipt({ status: "queued" }), { status: 202 });
         }
         jobReads += 1;
@@ -2051,7 +2835,7 @@ test("retryable create failures back off and reuse the identical pending identit
       receiptPath,
       async (_input, init) => {
         attempts += 1;
-        proofs.push(new Headers(init?.headers).get("X-Payment"));
+        proofs.push(new Headers(init?.headers).get("PAYMENT-SIGNATURE"));
         bodies.push(String(init?.body));
         if (attempts === 1) {
           return json({
@@ -2103,7 +2887,7 @@ test("a timed-out create retries with the same durable proof and clears every ti
       receiptPath,
       async (_input, init) => {
         attempt += 1;
-        proofs.push(new Headers(init?.headers).get("X-Payment"));
+        proofs.push(new Headers(init?.headers).get("PAYMENT-SIGNATURE"));
         bodies.push(String(init?.body));
         if (attempt === 1) {
           return await new Promise<Response>((_resolve, reject) => {

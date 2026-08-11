@@ -6,7 +6,7 @@
  *   ERC-20 approve → fund → [agent works] → settle
  */
 
-import { Contract, JsonRpcProvider, Wallet, type BaseWallet, parseUnits, formatUnits } from "ethers";
+import { Contract, JsonRpcProvider, Wallet, type BaseWallet, formatUnits, parseUnits } from "ethers";
 import { COMMERCE_ABI } from "./abi/commerce.js";
 import { ROUTER_ABI } from "./abi/router.js";
 import { POLICY_ABI } from "./abi/policy.js";
@@ -56,6 +56,22 @@ export const JobStatus: Record<number, string> = {
   4: "REJECTED",
   5: "EXPIRED",
 };
+
+export function formatUAmount(amountAtomic: bigint): string {
+  return formatUnits(amountAtomic, 18);
+}
+
+export function assertSufficientUBalance(
+  balanceAtomic: bigint,
+  requiredAtomic: bigint,
+): void {
+  if (balanceAtomic < requiredAtomic) {
+    throw new Error(
+      `Insufficient U balance (need ≥ ${formatUAmount(requiredAtomic)} U). `
+      + "Faucet: https://united-coin-u.github.io/u-faucet/",
+    );
+  }
+}
 
 export interface BuyResult {
   jobId: bigint;
@@ -109,8 +125,11 @@ export class ERC8183Buyer {
   }
 
   async uBalance(): Promise<string> {
-    const raw = await this.uToken.balanceOf(this.wallet.address) as bigint;
-    return formatUnits(raw, 18);
+    return formatUAmount(await this.uBalanceAtomic());
+  }
+
+  async uBalanceAtomic(): Promise<bigint> {
+    return await this.uToken.balanceOf(this.wallet.address) as bigint;
   }
 
   async tBnbBalance(): Promise<string> {

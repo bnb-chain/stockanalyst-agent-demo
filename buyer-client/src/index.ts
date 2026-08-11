@@ -32,7 +32,12 @@ import {
   resolveMaxBudgetWei,
   assertQuoteWithinBudget,
 } from "./negotiate.js";
-import { CONTRACTS, ERC8183Buyer } from "./erc8183.js";
+import {
+  assertSufficientUBalance,
+  CONTRACTS,
+  ERC8183Buyer,
+  formatUAmount,
+} from "./erc8183.js";
 import {
   fetchDeliverable,
   shouldUseBuyerRelay,
@@ -101,14 +106,14 @@ async function main(): Promise<void> {
 
   // ── Step 0: Pre-flight balance check ────────────────────────────────────
   const tBnb = await buyer.tBnbBalance();
-  const uBal = await buyer.uBalance();
+  const uBalanceAtomic = await buyer.uBalanceAtomic();
 
   banner([
     "Stock Analysis Agent — UOMP Buyer Client",
     `Agent:    ${AGENT_ENDPOINT}`,
     `Provider: ${PROVIDER_ADDRESS}`,
     `Buyer:    ${buyer.address}`,
-    `Balance:  ${Number(tBnb).toFixed(4)} tBNB  |  ${Number(uBal).toFixed(4)} U`,
+    `Balance:  ${Number(tBnb).toFixed(4)} tBNB  |  ${formatUAmount(uBalanceAtomic)} U`,
     "Network:  BSC Testnet (chain 97)",
   ]);
 
@@ -116,11 +121,6 @@ async function main(): Promise<void> {
     console.error("ERROR: Insufficient tBNB for gas. Faucet: https://testnet.bnbchain.org/faucet-smart");
     process.exit(1);
   }
-  if (Number(uBal) < 1) {
-    console.error("ERROR: Insufficient U balance (need ≥ 1 U). Faucet: https://united-coin-u.github.io/u-faucet/");
-    process.exit(1);
-  }
-
   // ── Step 1: Load UOMP portfolio context ─────────────────────────────────
   hr("Step 1: Load UOMP user context (portfolio + risk profile)");
   const guardUrl = process.env["UOMP_GUARD_URL"] ?? "http://127.0.0.1:9374";
@@ -139,7 +139,8 @@ async function main(): Promise<void> {
   // Refuse to fund a quote above the client-side spend ceiling BEFORE any
   // on-chain spend — the seller signs its own price and could quote anything.
   assertQuoteWithinBudget(priceRaw, resolveMaxBudgetWei());
-  const priceU   = Number(priceRaw) / 1e18;
+  assertSufficientUBalance(uBalanceAtomic, priceRaw);
+  const priceU = formatUAmount(priceRaw);
   console.log(`  ✓ Accepted     price=${priceU} U`);
   console.log(`  ✓ Estimated    completion=${envelope.response.estimated_completion_seconds}s`);
   const hash = (envelope.negotiation_hash ?? envelope.response.negotiation_hash ?? "").slice(0, 22);
@@ -152,7 +153,7 @@ async function main(): Promise<void> {
   const buy = await buyer.buy({
     provider: PROVIDER_ADDRESS,
     description,
-    budgetU: String(priceU),
+    budgetU: priceU,
   });
 
   console.log(`\n  ✓ Job ID       ${buy.jobId}`);

@@ -4,11 +4,15 @@ TypeScript buyer client for the [Stock Analysis Agent](../stockanalyst/README.md
 
 | Tier | Command | Cost | Settlement | Report | Speed |
 |------|---------|------|------------|--------|-------|
-| **x402 Free** | `npm run x402:free` | 0 U | none | quick quote table | ~1s |
-| **x402 Paid Async** | `npm run x402:async` | 1.0 U | Binance Pay facilitator | private polling + download | create returns quickly |
-| **ERC-8183** (on-chain escrow) | `npm run dev` | 1.0 U | trustless escrow | full analysis | 5–15 min |
+| **x402 Free (legacy)** | `npm run x402:free` | 0 U | none | retired public endpoint | — |
+| **x402 Paid Async** | `npm run x402:async` | 0.21 U or 0.21 USD1 | Binance Pay facilitator | private polling + download | create returns quickly |
+| **ERC-8183** (on-chain escrow) | `npm run dev` | 0.21 U | trustless escrow | full analysis | 5–15 min |
 
-The free tier proves wallet identity via a 0-U EIP-712 signature and is rate-limited to 10 requests per wallet per 24 hours. Both full-analysis flows read the buyer's portfolio from a local **UOMP Memory Guard** and produce the same HTML + PDF report.
+x402 payments use **BSC Mainnet (chain ID 56)** and accept **U (United
+Stables)** or **USD1 (World Liberty Financial USD)**. The legacy free client proves wallet
+identity with the mainnet U EIP-712 domain, but its public endpoint is retired.
+Both full-analysis flows read the buyer's portfolio from a local **UOMP Memory
+Guard** and produce the same HTML + PDF report.
 
 ---
 
@@ -50,8 +54,10 @@ The free tier proves wallet identity via a 0-U EIP-712 signature and is rate-lim
 ## Prerequisites
 
 - **Node.js 18+** (for native `fetch` + `ReadableStream`)
-- **tBNB** in your wallet (gas) — [BSC Testnet Faucet](https://testnet.bnbchain.org/faucet-smart)
-- **U token** in your wallet (payment) — [U Faucet](https://united-coin-u.github.io/u-faucet/)
+- For x402 paid async: **U or USD1 on BSC Mainnet**. The buyer signs the
+  facilitator requirement and does not submit its own on-chain transaction.
+- For ERC-8183 only: **tBNB** for gas and the testnet U token —
+  [BSC Testnet Faucet](https://testnet.bnbchain.org/faucet-smart)
 - **UOMP Guard** running locally on port 9374
 - **Agent** running locally on port 9000 (for x402) or deployed on platform (for ERC-8183)
 
@@ -135,9 +141,11 @@ AGENT_CLIENT_SECRET=<cognito-secret>
 DELIVERY_MODE=ipfs
 PROVIDER_ADDRESS=0x1FF095E1C5Cf4bC72a3DC54be17B6cf85043Fb67
 
-# ── x402 (API Gateway in testnet; local agent may use localhost) ─
-X402_ENDPOINT=https://<api-id>.execute-api.us-east-1.amazonaws.com/testnet
+# ── x402 (BSC Mainnet; local agent may use localhost) ─────────────
+X402_ENDPOINT=https://stock-agent.bnbchain.org
 X402_SELLER_WALLET=0xd10BdDC20E4DC42A1a19a9653e994991e25b8153
+# Optional strict token selector: U (default) or USD1.
+X402_PAYMENT_TOKEN=U
 # Optional async-client polling deadline; default is 30 minutes.
 X402_POLL_TIMEOUT_MS=1800000
 
@@ -148,10 +156,13 @@ UOMP_GUARD_TOKEN=your_guard_jwt_token
 
 > **Note:** `X402_ENDPOINT` and `AGENT_ENDPOINT` are separate.
 > `AGENT_ENDPOINT` is the deployed A2A path (requires Cognito auth) used by `npm run dev`.
-> `X402_ENDPOINT` is the API Gateway base URL for the deployed x402 gateway,
-> never the raw AgentCore invocation URL. Local development may instead use
-> `http://localhost:9000`. The public gateway exposes price, free challenge,
-> free quote, paid create, private job status, and private resume routes.
+> `X402_ENDPOINT` is the public base URL for the deployed mainnet x402 gateway,
+> never the raw AgentCore invocation URL. Append `/x402/price`,
+> `/x402/analyze/async`, or private job paths; the base contains neither
+> `/mainnet` nor a trailing `/x402`. The old execute-api endpoint remains enabled during certificate/DNS/custom-domain validation and is disabled only after successful final cutover verification. Local development may instead use `http://localhost:9000`.
+> The current public gateway exposes price, paid create, private job status, and
+> private resume routes. `/x402/free` remains retired and is not present in the
+> public OpenAPI routes.
 
 ### AWS AgentCore runtime
 
@@ -185,9 +196,12 @@ uses the AWS S3/CloudFront delivery path.
 
 ---
 
-## Quick start — x402 free tier (0 U, ~1s)
+## Legacy x402 free client (retired public endpoint)
 
-No LLM involved — the free tier calls `yfinance` directly and returns a markdown price table. Rate-limited to 10 requests per wallet per 24 hours.
+The source remains for compatibility testing against a matching local server.
+It uses the mainnet U domain on chain 56, calls `yfinance` directly, and returns
+a markdown price table. Do not use it against the current public x402 gateway;
+that gateway no longer exposes `/x402/free`.
 
 ```bash
 # Terminal 1 — start agent
@@ -229,7 +243,7 @@ Expected output:
 │ | Beta           | 1.10                        |
 │ | 52W Range      | USD 201.50 – USD 334.99     |
 │
-│ > Full analysis → Paid tier (1.0 U) via POST /x402/analyze/async
+│ > Full analysis → Paid tier (0.21 U) via POST /x402/analyze/async
 
   ✓ FREE TIER COMPLETE — 0 U · 1 signature · ~1s
 ```
@@ -237,7 +251,10 @@ Expected output:
 ## Quick start — x402 paid async
 
 This flow completes payment quickly, stores a private job receipt, and polls
-while the report runs in the background:
+while the report runs in the background. The challenge advertises its supported
+subset of mainnet U and USD1 in stable order. The CLI selects U by default;
+integrators can pass `"U"` or `"USD1"` as the preferred-token argument to
+`fetchPaymentChallenge`.
 
 ```bash
 cd buyer-client
@@ -330,11 +347,11 @@ bag erc8183 settle <job_id>
 
 ```
 src/
-├── x402free.ts     — free tier buyer    (npm run x402:free)  — 0 U, ~1s, no LLM
-├── x402-async.ts   — durable paid buyer (npm run x402:async) — private job polling
+├── x402free.ts     — legacy mainnet-U free client for a matching local server
+├── x402-async.ts   — proofless-promo or durable paid buyer (npm run x402:async) — private job polling
 ├── x402-async-client.ts — typed async create/poll/resume/download client
 ├── x402-payment.ts — shared side-effect-free EIP-3009 proof builder
-├── index.ts        — ERC-8183 buyer    (npm run dev)        — 1 U, on-chain escrow
+├── index.ts        — ERC-8183 buyer    (npm run dev)        — 0.21 U, on-chain escrow
 ├── erc8183.ts      — on-chain job lifecycle: createJob → fund → settle
 ├── negotiate.ts    — A2A JSON-RPC negotiate with OAuth2 support
 ├── uomp.ts         — UOMP Guard HTTP client + buildTaskFromMemory()
@@ -347,51 +364,104 @@ src/
 
 ## Payment channels explained
 
-### x402 free tier — wallet identity proof (0 U)
+### Legacy x402 free tier — wallet identity proof (0 U)
+
+This flow uses the BSC Mainnet U domain, but the current public endpoint is
+retired. The diagram documents the retained local compatibility client.
 
 ```
-Buyer                              Public x402 gateway
+Buyer                              Matching local legacy gateway
   │                                        │
   │  POST /x402/free                       │
   │  {"symbol": "AAPL"}                    │
-  │  X-Payment: base64(0-U proof)  ───────▶│
+  │  PAYMENT-SIGNATURE: base64(0-U proof) ▶│
   │                                        │  verify_free_payment_proof()
   │                                        │  value must = 0, rate limit 10/24h
   │                                        │  fetch_quote("AAPL")  — no LLM
   │◀── 200 JSON {content, format} ─────────│  markdown price table
 ```
 
-### x402 paid async — Binance Pay facilitator (1.0 U)
+### x402 async — paid or promotional analysis
 
 ```
 Buyer                              Agent (localhost:9000)
   │                                        │
   │  POST /x402/analyze/async              │
   │  {"symbols": ["AAPL","NVDA"], ...}     │
-  │  (without X-Payment) ─────────────────▶│  B402 /supported
-  │◀── 402 accepted + resource + extra ─────│
+  │  (without PAYMENT-SIGNATURE) ─────────▶│
+  │                                        ├─ promo=1: IP limit, create job
+  │◀── 202 jobId + private jobToken ───────│
   │                                        │
+  │  paid mode only:                       ├─ promo=0: B402 /supported
+  │◀── 402 accepts[U, USD1] + resource ─────│  amount 210000000000000000
   │  sign exact returned requirement       │
-  │  X-Payment: base64(1-U proof)  ───────▶│
-  │                                        │  validate_payment_proof() ← fixed code
-  │                                        │  B402 /verify → /settle → on-chain tx
+  │  PAYMENT-SIGNATURE: base64(selected proof) ▶│  validate → B402 verify/settle
   │◀── 202 jobId + private jobToken ───────│
   │  GET /x402/jobs/{jobId} ──────────────▶│  background analysis
   │◀── queued / running / succeeded ───────│
   │  GET private presigned S3 URL ────────▶│  full markdown report
 ```
 
-Both tiers use **x402 v2 / EIP-712 EIP-3009 (TransferWithAuthorization)**. The client signs structured typed data; no `eth_sign` / `personal_sign` involved:
+The current paid flow and retained legacy free client use **x402 v2 / EIP-712
+EIP-3009 (TransferWithAuthorization)** on **BSC Mainnet (chain ID 56)**. Paid
+requirements may select either of these exact token domains:
+
+| Symbol | EIP-712 name | Version | Decimals | Exact paid amount | Mainnet contract |
+|--------|--------------|---------|----------|-------------------|------------------|
+| U | United Stables | 1 | 18 | `210000000000000000` (`0.21 × 10^18`) | `0xcE24439F2D9C6a2289F741120FE202248B666666` |
+| USD1 | World Liberty Financial USD | 1 | 18 | `210000000000000000` (`0.21 × 10^18`) | `0x8d0D000Ee44948FC98c9B98A4FA4921476f08B0d` |
+
+Set `X402_PAYMENT_TOKEN=U` or `X402_PAYMENT_TOKEN=USD1`; the default is U and
+any other spelling is rejected. The seller's fixed registry controls these
+assets. Legacy `X402_TOKEN_ADDRESS` and U-domain environment settings are
+compatibility inputs only and cannot replace or override the registry. USDC
+and USDT are deferred because their supported transfer path requires Permit2.
+
+When `X402_PROMO_FREE_MODE=1`, callers POST directly without a wallet or
+`Payment-Signature`. Promotional access is free. The same full async analysis runs, but the request does not enter
+x402 proof validation, B402 verify/settle, authorization-used RPC, or any
+blockchain RPC. From `buyer-client/`, update the existing Runtime manually with:
+
+```bash
+cd ../stockanalyst/app/agent
+bag env set X402_PROMO_FREE_MODE 1
+# Later, disable it explicitly with:
+bag env set X402_PROMO_FREE_MODE 0
+```
+
+The existing Runtime must be restarted or deployed again for the change to take effect.
+These commands only update configuration; run the repository's reviewed deploy
+procedure separately when an operator intends to roll out the change.
+The CLI reports only a safe mode summary; it never prints a proof, signature,
+job token, or private report URL:
+
+```text
+Promotional access: free (no wallet or payment)
+Payment: 0.21 USD1 → <public pay-to address>
+```
+
+Every accepted POST creates a new job and consumes one of the 30 requests per
+trusted IP in the rolling 24-hour window, including an identical retry. The
+limiter is process-local: a restart clears it and replicas do not share
+counters. In the public deployment, the trusted source IP comes from API
+Gateway request context, never a caller-supplied forwarding header. Setting
+`X402_PROMO_FREE_MODE=0` restores the paid U/USD1 HTTP 402 flow. That paid flow costs
+0.21 U or 0.21 USD1. The old
+`/x402/free` route remains retired.
+
+The client signs structured typed data; no `eth_sign` / `personal_sign` is
+involved:
 
 ```typescript
-// ethers v6 signTypedData — domain matches the U token contract on BSC Testnet
+// ethers v6 signTypedData — use the explicitly selected mainnet requirement
+const token = PAYMENT_TOKENS[selectedToken]; // "U" or "USD1"
 const sig = await wallet.signTypedData(
-  { name: "U", version: "1", chainId: 97,
-    verifyingContract: "0xc70B8741B8B07A6d61E54fd4B20f22Fa648E5565" },
+  { name: token.name, version: token.version, chainId: 56,
+    verifyingContract: token.asset },
   { TransferWithAuthorization: [
       { name: "from",        type: "address" },
       { name: "to",          type: "address" },
-      { name: "value",       type: "uint256" },  // 0 (free) or 1e18 (paid)
+      { name: "value",       type: "uint256" },  // exactly 210000000000000000 in paid mode
       { name: "validAfter",  type: "uint256" },
       { name: "validBefore", type: "uint256" },
       { name: "nonce",       type: "bytes32" },
@@ -405,27 +475,48 @@ const proof = {
   x402Version: 2, resource, accepted,
   payload: { signature: sig, authorization: { from, to, value, validAfter, validBefore, nonce } },
 };
-// X-Payment header: Buffer.from(JSON.stringify(proof)).toString("base64")
+// Payment-Signature header: Buffer.from(JSON.stringify(proof)).toString("base64")
 ```
 
-The agent verifies: EIP-712 signature recovers to `from`, `to` == seller wallet, `value` ≥ 0.5 U (paid) or == 0 (free), not expired, nonce not reused.
+In paid mode, the agent verifies that the EIP-712 signature recovers to `from`, the selected
+asset/domain pair is registered, `to` is the seller wallet, the paid value is
+exactly 0.21 token (`210000000000000000` atomic units), the proof is unexpired, and the nonce
+has not been reused. Promotional mode publishes no payment challenge and does
+not inspect a supplied `Payment-Signature` header.
+
+The V2 wire exchange is:
+
+```text
+402: PAYMENT-REQUIRED: base64(PaymentRequired)
+retry: PAYMENT-SIGNATURE: base64(PaymentPayload)
+202: PAYMENT-RESPONSE: base64(SettlementResponse)
+```
+
+Provider output is retried automatically twice after an empty result. If all
+three attempts are empty, the settled job reports `analysis_empty_response`
+with `retryable: true`. Resume that same job with its private job token; resume
+does not send a payment signature and never verifies or settles payment again.
 
 **curl example:**
 ```bash
 # Get price / challenge
 curl "$X402_ENDPOINT/x402/price"
-curl "$X402_ENDPOINT/x402/free?symbol=AAPL"
 
-# Create paid async analysis (generate a proof with x402-payment.ts)
+# Promotional mode: create directly without a wallet or Payment-Signature
 curl -X POST "$X402_ENDPOINT/x402/analyze/async" \
   -H "Content-Type: application/json" \
-  -H "X-Payment: <base64-proof>" \
   -d '{"symbols": ["AAPL", "NVDA"]}'
 
-# Free quick quote
-curl -X POST "$X402_ENDPOINT/x402/free" \
+# Paid mode: repeat the request with the exact proof returned by the HTTP 402
+curl -X POST "$X402_ENDPOINT/x402/analyze/async" \
   -H "Content-Type: application/json" \
-  -H "X-Payment: <base64-0u-proof>" \
+  -H "Payment-Signature: <base64-proof>" \
+  -d '{"symbols": ["AAPL", "NVDA"]}'
+
+# Legacy free quick quote against a matching local server only
+curl -X POST "http://localhost:9000/x402/free" \
+  -H "Content-Type: application/json" \
+  -H "Payment-Signature: <base64-0u-proof>" \
   -d '{"symbol": "AAPL"}'
 ```
 
@@ -438,7 +529,7 @@ Buyer                      BSC Testnet contracts         Agent (cloud)
   ├── registerJob ───────────────▶│                           │
   ├── setBudget  ────────────────▶│                           │
   ├── approve (U token) ─────────▶│                           │
-  ├── fund (lock 1 U in escrow) ─▶│                           │
+  ├── fund (lock 0.21 U in escrow) ─▶│                           │
   │                               │                           │
   ├── notify_funded ──────────────┼──────────────────────────▶│
   │                               │      LLM analysis (40–120s)│
@@ -456,11 +547,19 @@ To call the agent from your own code, here are the minimal integration points:
 
 ### x402 async (simplest — any language/framework)
 
-1. **POST** `/x402/analyze/async` without `X-Payment` and read the returned HTTP 402 `paymentRequired`.
-2. Validate and copy its complete `resource`, selected `accepts[]` requirement, and `extra` values.
-3. Sign the EIP-712 EIP-3009 authorization using that requirement.
-4. Repeat the same **POST** with the official V2 proof in `X-Payment`.
-5. Persist the returned `jobId`, `jobToken`, status path, and expiry.
+1. **POST** `/x402/analyze/async` without `Payment-Signature`.
+2. If the response is HTTP 202, promotional mode created the job directly;
+   persist its `jobId`, `jobToken`, status path, and expiry. Do not sign or send
+   a payment proof.
+3. If the response is HTTP 402, validate every advertised `accepts[]` entry
+   against the mainnet U/USD1 registry, reject duplicates or unknown assets,
+   and explicitly select U or USD1. The paid amount must be exactly
+   `210000000000000000` and
+   include a valid B402 signer.
+4. Copy the complete `resource`, selected requirement, and `extra`, sign the
+   EIP-712 EIP-3009 authorization with chain ID 56 and the selected token
+   contract, then repeat the POST with the official V2 proof in `Payment-Signature`.
+5. Persist the returned private job receipt.
 6. Poll the status path with `X-Job-Token`; resume when instructed.
 7. Download the report from the returned private presigned URL.
 
@@ -495,7 +594,7 @@ const url = await buyer.getDeliverableUrl(buy.jobId, buy.fundTxBlock);
 
 ---
 
-## BSC Testnet contract addresses
+## ERC-8183-only BSC Testnet contract addresses
 
 | Contract | Address |
 |---------|---------|
@@ -504,7 +603,8 @@ const url = await buyer.getDeliverableUrl(buy.jobId, buy.fundTxBlock);
 | OptimisticPolicy | `0x4f4678d4439fec812ac7674bb3efb4c8f5fb78a6` |
 | U Token (ERC-20) | `0xc70B8741B8B07A6d61E54fd4B20f22Fa648E5565` |
 
-Chain ID: **97** (BSC Testnet)
+Chain ID: **97** (BSC Testnet). These addresses belong to the ERC-8183 demo and
+must not be used for x402, which uses the mainnet registry above.
 
 ---
 
@@ -537,9 +637,10 @@ The agent uses this to personalize the report: real P&L vs cost basis, risk-adju
 
 | Resource | Link |
 |---------|------|
-| tBNB faucet (gas) | https://testnet.bnbchain.org/faucet-smart |
-| U token faucet | https://united-coin-u.github.io/u-faucet/ |
-| BSC Testnet Explorer | https://testnet.bscscan.com |
+| ERC-8183 tBNB faucet (gas) | https://testnet.bnbchain.org/faucet-smart |
+| ERC-8183 testnet U token faucet | https://united-coin-u.github.io/u-faucet/ |
+| ERC-8183 BSC Testnet Explorer | https://testnet.bscscan.com |
+| x402 BSC Mainnet Explorer | https://bscscan.com |
 | Agent source | [../stockanalyst/app/agent/](../stockanalyst/app/agent/) |
 | ERC-8183 spec | https://github.com/bnb-chain/BEPs |
 | UOMP protocol | https://github.com/0xaicrypto/uomp-core |

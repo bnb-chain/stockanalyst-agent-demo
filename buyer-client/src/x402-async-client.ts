@@ -4,6 +4,12 @@ import type {
   B402PaymentResource,
   PaidPaymentChallenge,
 } from "./x402-payment.js";
+import {
+  BSC_MAINNET_CHAIN_ID,
+  PAID_AMOUNT,
+  PAYMENT_TOKENS,
+  type PaymentTokenSymbol,
+} from "./x402-payment.js";
 
 export type FetchImpl = (
   input: RequestInfo | URL,
@@ -26,6 +32,10 @@ export interface AsyncJobReceipt {
   statusUrl: string;
   expiresAt: number;
 }
+
+export type BeginAsyncAnalysisResult =
+  | { kind: "created"; receipt: AsyncJobReceipt }
+  | { kind: "payment_required"; challenge: PaidPaymentChallenge };
 
 export interface AsyncJobStatus {
   jobId: string;
@@ -102,11 +112,14 @@ const MAX_CREATE_TIMEOUT_MILLISECONDS = 5 * 60 * 1_000;
 const MIN_POLL_MILLISECONDS = 1_000;
 const MAX_REPORT_BYTES = 2 * 1024 * 1024;
 const MAX_JSON_BYTES = 64 * 1024;
-const BSC_TESTNET_NETWORK = "eip155:97";
-const U_TOKEN_ADDRESS = "0x330949Aed7d00FCe0558C64ED6FeC9792616cC39";
-const PAID_AMOUNT = "1000000";
+const MAX_BASE64_JSON_CHARACTERS = Math.ceil(MAX_JSON_BYTES / 3) * 4;
+const MAX_SETTLEMENT_TRANSACTION_CHARACTERS = 4_096;
+const BSC_MAINNET_NETWORK = `eip155:${BSC_MAINNET_CHAIN_ID}`;
 const EVM_ADDRESS_PATTERN = /^0x[0-9a-fA-F]{40}$/;
+const SETTLEMENT_TRANSACTION_PATTERN = /^[\x21-\x7e]*$/;
+const BASE64_PATTERN = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
 const SAFE_SERVER_ERROR_CODES = new Set([
+  "analysis_empty_response",
   "analysis_failed",
   "analysis_timeout",
   "async_jobs_paused",
@@ -121,6 +134,7 @@ const SAFE_SERVER_ERROR_CODES = new Set([
   "payment_backend_unavailable",
   "payment_rejected",
   "payment_unavailable",
+  "promo_rate_limited",
   "request_too_large",
   "settlement_pending",
 ]);
@@ -129,6 +143,50 @@ const DNS_LABEL_PATTERN = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function deepEqualJson(left: unknown, right: unknown): boolean {
+  if (Object.is(left, right)) return true;
+  if (Array.isArray(left) && Array.isArray(right)) {
+    return left.length === right.length
+      && left.every((value, index) => deepEqualJson(value, right[index]));
+  }
+  if (!isRecord(left) || !isRecord(right)) return false;
+  const leftKeys = Object.keys(left);
+  const rightKeys = Object.keys(right);
+  return leftKeys.length === rightKeys.length
+    && leftKeys.every(
+      (key) => Object.prototype.hasOwnProperty.call(right, key)
+        && deepEqualJson(left[key], right[key]),
+    );
+}
+
+function decodeBoundedBase64Json(
+  encoded: string | null,
+  errorCode: "invalid_payment_challenge" | "invalid_payment_response",
+): unknown {
+  if (
+    encoded === null
+    || encoded.length === 0
+    || encoded.length > MAX_BASE64_JSON_CHARACTERS
+    || !BASE64_PATTERN.test(encoded)
+  ) {
+    throw new AsyncJobClientError(errorCode);
+  }
+  const bytes = Buffer.from(encoded, "base64");
+  if (
+    bytes.byteLength > MAX_JSON_BYTES
+    || bytes.toString("base64") !== encoded
+  ) {
+    throw new AsyncJobClientError(errorCode);
+  }
+  let text: string;
+  try {
+    text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+    return JSON.parse(text) as unknown;
+  } catch {
+    throw new AsyncJobClientError(errorCode);
+  }
 }
 
 function requiredString(
@@ -187,10 +245,77 @@ function invalidPaymentChallenge(): never {
   throw new AsyncJobClientError("invalid_payment_challenge");
 }
 
+function parseV2PaymentChallenge(
+  endpoint: string,
+  expectedSeller: string,
+  value: unknown,
+  paymentRequiredHeader: string | null,
+  preferredToken: PaymentTokenSymbol,
+): PaidPaymentChallenge {
+  if (!isRecord(value)) invalidPaymentChallenge();
+  const paymentRequired = value["paymentRequired"];
+  const headerPaymentRequired = decodeBoundedBase64Json(
+    paymentRequiredHeader,
+    "invalid_payment_challenge",
+  );
+  if (!deepEqualJson(headerPaymentRequired, paymentRequired)) {
+    invalidPaymentChallenge();
+  }
+  return parsePaymentChallenge(
+    endpoint,
+    expectedSeller,
+    value,
+    preferredToken,
+  );
+}
+
+function validateSettlementResponse(
+  status: number,
+  paymentResponseHeader: string | null,
+): void {
+  if (paymentResponseHeader === null) return;
+  const value = decodeBoundedBase64Json(
+    paymentResponseHeader,
+    "invalid_payment_response",
+  );
+  if (
+    !isRecord(value)
+    || typeof value["success"] !== "boolean"
+    || typeof value["transaction"] !== "string"
+    || value["transaction"].length > MAX_SETTLEMENT_TRANSACTION_CHARACTERS
+    || !SETTLEMENT_TRANSACTION_PATTERN.test(value["transaction"])
+    || value["network"] !== BSC_MAINNET_NETWORK
+    || typeof value["payer"] !== "string"
+    || !EVM_ADDRESS_PATTERN.test(value["payer"])
+  ) {
+    throw new AsyncJobClientError("invalid_payment_response");
+  }
+  if (status >= 200 && status < 300) {
+    if (
+      value["success"] === true
+      && value["errorReason"] === undefined
+    ) {
+      return;
+    }
+    throw new AsyncJobClientError("invalid_payment_response");
+  }
+  if (status === 402) {
+    if (
+      value["success"] === false
+      && value["transaction"] === ""
+      && value["errorReason"] === "payment_rejected"
+    ) {
+      return;
+    }
+  }
+  throw new AsyncJobClientError("invalid_payment_response");
+}
+
 function parsePaymentChallenge(
   endpoint: string,
   expectedSeller: string,
   value: unknown,
+  preferredToken: PaymentTokenSymbol,
 ): PaidPaymentChallenge {
   if (!isRecord(value)) invalidPaymentChallenge();
   const paymentRequired = value["paymentRequired"];
@@ -198,17 +323,12 @@ function parsePaymentChallenge(
     !isRecord(paymentRequired)
     || paymentRequired["x402Version"] !== 2
     || !Array.isArray(paymentRequired["accepts"])
-    || paymentRequired["accepts"].length !== 1
+    || paymentRequired["accepts"].length === 0
   ) {
     invalidPaymentChallenge();
   }
-  const acceptedValue = paymentRequired["accepts"][0];
   const resourceValue = paymentRequired["resource"];
-  if (!isRecord(acceptedValue) || !isRecord(resourceValue)) {
-    invalidPaymentChallenge();
-  }
-  const extraValue = acceptedValue["extra"];
-  if (!isRecord(extraValue)) invalidPaymentChallenge();
+  if (!isRecord(resourceValue)) invalidPaymentChallenge();
 
   const resourceUrl = resourceValue["url"];
   const description = resourceValue["description"];
@@ -224,47 +344,83 @@ function parsePaymentChallenge(
   }
 
   const seller = expectedSeller.toLowerCase();
-  const asset = acceptedValue["asset"];
-  const payTo = acceptedValue["payTo"];
-  const timeout = acceptedValue["maxTimeoutSeconds"];
-  const signerAddress = extraValue["signerAddress"];
   if (
     !EVM_ADDRESS_PATTERN.test(expectedSeller)
-    || acceptedValue["scheme"] !== "exact"
-    || acceptedValue["network"] !== BSC_TESTNET_NETWORK
-    || acceptedValue["amount"] !== PAID_AMOUNT
-    || typeof asset !== "string"
-    || asset.toLowerCase() !== U_TOKEN_ADDRESS.toLowerCase()
-    || typeof payTo !== "string"
-    || payTo.toLowerCase() !== seller
-    || !Number.isSafeInteger(timeout)
-    || (timeout as number) <= 0
-    || (timeout as number) > 3_600
-    || extraValue["name"] !== "U"
-    || extraValue["version"] !== "1"
-    || extraValue["assetTransferMethod"] !== "eip3009"
-    || typeof signerAddress !== "string"
-    || !EVM_ADDRESS_PATTERN.test(signerAddress)
-  ) {
-    invalidPaymentChallenge();
-  }
+    || !Object.prototype.hasOwnProperty.call(PAYMENT_TOKENS, preferredToken)
+  ) invalidPaymentChallenge();
 
-  const extra: B402PaymentExtra = {
-    ...extraValue,
-    name: "U",
-    version: "1",
-    assetTransferMethod: "eip3009",
-    signerAddress,
-  };
-  const accepted: B402PaymentRequirement = {
-    scheme: "exact",
-    network: BSC_TESTNET_NETWORK,
-    amount: PAID_AMOUNT,
-    asset,
-    payTo: payTo.toLowerCase(),
-    maxTimeoutSeconds: timeout as number,
-    extra,
-  };
+  const acceptedBySymbol = new Map<PaymentTokenSymbol, {
+    accepted: B402PaymentRequirement;
+    promotional: boolean;
+  }>();
+  for (const acceptedValue of paymentRequired["accepts"]) {
+    if (!isRecord(acceptedValue)) invalidPaymentChallenge();
+    const extraValue = acceptedValue["extra"];
+    if (!isRecord(extraValue)) invalidPaymentChallenge();
+    const asset = acceptedValue["asset"];
+    if (typeof asset !== "string") invalidPaymentChallenge();
+    const symbol = (Object.entries(PAYMENT_TOKENS).find(
+      ([, token]) => token.asset.toLowerCase() === asset.toLowerCase(),
+    )?.[0]) as PaymentTokenSymbol | undefined;
+    if (symbol === undefined || acceptedBySymbol.has(symbol)) {
+      invalidPaymentChallenge();
+    }
+    const token = PAYMENT_TOKENS[symbol];
+    const payTo = acceptedValue["payTo"];
+    const timeout = acceptedValue["maxTimeoutSeconds"];
+    const amount = acceptedValue["amount"];
+    const promotional = amount === "0";
+    const signerAddress = extraValue["signerAddress"];
+    const hasSignerAddress = Object.prototype.hasOwnProperty.call(
+      extraValue,
+      "signerAddress",
+    );
+    if (
+      acceptedValue["scheme"] !== "exact"
+      || acceptedValue["network"] !== BSC_MAINNET_NETWORK
+      || (!promotional && amount !== PAID_AMOUNT)
+      || typeof payTo !== "string"
+      || payTo.toLowerCase() !== seller
+      || !Number.isSafeInteger(timeout)
+      || (timeout as number) <= 0
+      || (timeout as number) > 3_600
+      || extraValue["name"] !== token.name
+      || extraValue["version"] !== token.version
+      || extraValue["assetTransferMethod"] !== "eip3009"
+      || (
+        promotional
+          ? hasSignerAddress
+          : (
+            !hasSignerAddress
+            || typeof signerAddress !== "string"
+            || !EVM_ADDRESS_PATTERN.test(signerAddress)
+          )
+      )
+    ) {
+      invalidPaymentChallenge();
+    }
+    const extra: B402PaymentExtra = {
+      ...extraValue,
+      name: token.name,
+      version: token.version,
+      assetTransferMethod: "eip3009",
+    };
+    if (!promotional) extra.signerAddress = signerAddress as string;
+    acceptedBySymbol.set(symbol, {
+      promotional,
+      accepted: {
+        scheme: "exact",
+        network: BSC_MAINNET_NETWORK,
+        amount: amount as string,
+        asset: token.asset,
+        payTo: payTo.toLowerCase(),
+        maxTimeoutSeconds: timeout as number,
+        extra,
+      },
+    });
+  }
+  const selected = acceptedBySymbol.get(preferredToken);
+  if (selected === undefined) invalidPaymentChallenge();
   const resource: B402PaymentResource = {
     url: resourceUrl,
     description,
@@ -273,7 +429,8 @@ function parsePaymentChallenge(
   return {
     x402Version: 2,
     resource,
-    accepted,
+    accepted: selected.accepted,
+    promotional: selected.promotional,
   };
 }
 
@@ -627,6 +784,7 @@ export async function fetchPaymentChallenge(
   request: AsyncAnalysisRequest,
   expectedSeller: string,
   fetchImpl: FetchImpl = globalThis.fetch,
+  preferredToken: PaymentTokenSymbol = "U",
 ): Promise<PaidPaymentChallenge> {
   let body: string;
   try {
@@ -654,11 +812,70 @@ export async function fetchPaymentChallenge(
     });
   }
   try {
-    return parsePaymentChallenge(
+    return parseV2PaymentChallenge(
       endpoint,
       expectedSeller,
       await readJson(response),
+      response.headers.get("PAYMENT-REQUIRED"),
+      preferredToken,
     );
+  } catch (error) {
+    if (
+      error instanceof AsyncJobClientError
+      && error.code === "invalid_payment_challenge"
+    ) {
+      throw error;
+    }
+    throw new AsyncJobClientError("invalid_payment_challenge", {
+      httpStatus: response.status,
+    });
+  }
+}
+
+export async function beginAsyncAnalysis(
+  endpoint: string,
+  request: AsyncAnalysisRequest,
+  expectedSeller: string,
+  fetchImpl: FetchImpl = globalThis.fetch,
+  preferredToken: PaymentTokenSymbol = "U",
+): Promise<BeginAsyncAnalysisResult> {
+  let body: string;
+  try {
+    body = JSON.stringify(request);
+  } catch {
+    throw new AsyncJobClientError("invalid_request");
+  }
+  const response = await safeFetch(
+    fetchImpl,
+    routeUrl(endpoint, "/x402/analyze/async"),
+    {
+      method: "POST",
+      headers: {
+        Accept: "application/json",
+        "Content-Type": "application/json",
+      },
+      body,
+      redirect: "error",
+    },
+  );
+  if (response.status === 202) {
+    return {
+      kind: "created",
+      receipt: parseReceipt(endpoint, await readJson(response)),
+    };
+  }
+  if (response.status !== 402) throw await responseError(response);
+  try {
+    return {
+      kind: "payment_required",
+      challenge: parseV2PaymentChallenge(
+        endpoint,
+        expectedSeller,
+        await readJson(response),
+        response.headers.get("PAYMENT-REQUIRED"),
+        preferredToken,
+      ),
+    };
   } catch (error) {
     if (
       error instanceof AsyncJobClientError
@@ -717,12 +934,16 @@ export async function createAsyncAnalysis(
         headers: {
           Accept: "application/json",
           "Content-Type": "application/json",
-          "X-Payment": paymentProof,
+          "PAYMENT-SIGNATURE": paymentProof,
         },
         body,
         redirect: "error",
         signal: controller.signal,
       },
+    );
+    validateSettlementResponse(
+      response.status,
+      response.headers.get("PAYMENT-RESPONSE"),
     );
     if (response.status !== 202) throw await responseError(response);
     return parseReceipt(endpoint, await readJson(response));

@@ -1,6 +1,13 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { ERC8183Buyer, resolveRpcUrls } from "./erc8183.js";
+import {
+  assertSufficientUBalance,
+  ERC8183Buyer,
+  formatUAmount,
+  resolveRpcUrls,
+} from "./erc8183.js";
+
+const PAID_PRICE_ATOMIC = 210_000_000_000_000_000n;
 
 test("requires an explicit archive RPC URL", () => {
   assert.throws(
@@ -35,6 +42,63 @@ test("resolves an explicit archive RPC and optional transaction RPC", () => {
       logRpcUrl: "https://logs.example/v1/private-key",
     },
   );
+});
+
+test("compares the U balance to the exact signed atomic quote", () => {
+  assert.doesNotThrow(() => {
+    assertSufficientUBalance(PAID_PRICE_ATOMIC, PAID_PRICE_ATOMIC);
+  });
+  assert.throws(
+    () => assertSufficientUBalance(PAID_PRICE_ATOMIC - 1n, PAID_PRICE_ATOMIC),
+    /Insufficient U balance \(need ≥ 0\.21 U\)/,
+  );
+});
+
+test("formats canonical and non-float-safe atomic U quotes exactly", () => {
+  assert.equal(formatUAmount(PAID_PRICE_ATOMIC), "0.21");
+  assert.equal(formatUAmount(PAID_PRICE_ATOMIC + 1n), "0.210000000000000001");
+});
+
+test("forwards a non-float-safe signed atomic quote unchanged on chain", async () => {
+  const quoteAtomic = PAID_PRICE_ATOMIC + 1n;
+  const forwardedBudgets: bigint[] = [];
+  const transaction = (hash: string, blockNumber = 1) => ({
+    wait: async () => ({ hash, blockNumber }),
+  });
+  const buyer = Object.create(ERC8183Buyer.prototype) as ERC8183Buyer;
+  Object.assign(buyer as object, {
+    disputeWindow: async () => 86_400n,
+    commerce: {
+      createJob: async () => transaction("0xcreate"),
+      setBudget: async (_jobId: bigint, budget: bigint) => {
+        forwardedBudgets.push(budget);
+        return transaction("0xbudget");
+      },
+      fund: async (_jobId: bigint, budget: bigint) => {
+        forwardedBudgets.push(budget);
+        return transaction("0xfund", 123);
+      },
+    },
+    router: {
+      registerJob: async () => transaction("0xregister"),
+    },
+    uToken: {
+      approve: async (_spender: string, budget: bigint) => {
+        forwardedBudgets.push(budget);
+        return transaction("0xapprove");
+      },
+    },
+    parseJobId: async () => 42n,
+  });
+
+  const result = await buyer.buy({
+    provider: "0x0000000000000000000000000000000000000001",
+    description: "signed quote",
+    budgetU: formatUAmount(quoteAtomic),
+  });
+
+  assert.deepEqual(forwardedBudgets, [quoteAtomic, quoteAtomic, quoteAtomic]);
+  assert.equal(result.budgetU, "0.210000000000000001");
 });
 
 function buyerWithDeliverableUrl(value: unknown): ERC8183Buyer {
