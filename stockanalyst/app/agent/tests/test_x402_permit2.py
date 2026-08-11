@@ -658,3 +658,19 @@ def test_permit2_promotional_dispatch_is_forbidden() -> None:
 
     assert payment is None
     assert reason == "payment requirement is missing or invalid"
+
+
+def test_permit2_version_rejection_never_reflects_untrusted_input() -> None:
+    marker = "attacker-controlled-version-marker"
+    proof, expected = permit2_proof()
+    proof["x402Version"] = marker
+
+    payment, reason = verify.validate_payment_proof(
+        encoded_proof(proof),
+        expected_requirement=expected,
+        now=NOW,
+    )
+
+    assert payment is None
+    assert reason == "unsupported x402Version (expected 2)"
+    assert marker not in reason

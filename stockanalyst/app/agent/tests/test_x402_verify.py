@@ -317,6 +317,21 @@ class VerifiedPaymentTests(unittest.TestCase):
             self.assertEqual(free_address, "")
             self.assertNotIn(marker, reason)
 
+    def test_free_version_rejection_never_reflects_untrusted_input(
+        self,
+    ) -> None:
+        marker = "free-attacker-version-marker"
+        proof = json.loads(base64.b64decode(signed_free_proof(B402_PAY_TO)))
+        proof["x402Version"] = marker
+        encoded = base64.b64encode(json.dumps(proof).encode()).decode()
+
+        ok, reason, from_address = verify.verify_free_payment_proof(encoded)
+
+        self.assertFalse(ok)
+        self.assertEqual(reason, "unsupported x402Version (expected 2)")
+        self.assertEqual(from_address, "")
+        self.assertNotIn(marker, reason)
+
     def test_paid_and_free_paths_stably_reject_malformed_nested_values(
         self,
     ) -> None:

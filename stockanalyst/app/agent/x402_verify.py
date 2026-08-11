@@ -56,6 +56,7 @@ MAX_PAYMENT_PROOF_NESTING = 64
 _PAYMENT_SIGNATURE_REJECTION = (
     "Payment-Signature is not valid base64 JSON"
 )
+_X402_VERSION_REJECTION = "unsupported x402Version (expected 2)"
 _FREE_VALUE_REJECTION = (
     "free tier requires value=0; "
     "use /x402/analyze/async for paid analysis"
@@ -357,10 +358,7 @@ def validate_payment_proof(
         return None, _PAYMENT_SIGNATURE_REJECTION
 
     if proof.get("x402Version") != 2:
-        return None, (
-            f"unsupported x402Version: {proof.get('x402Version')!r} "
-            "(expected 2)"
-        )
+        return None, _X402_VERSION_REJECTION
 
     resource = proof.get("resource")
     if (
@@ -586,7 +584,7 @@ def verify_free_payment_proof(proof_header: str) -> tuple[bool, str, str]:
         return False, _PAYMENT_SIGNATURE_REJECTION, ""
 
     if proof.get("x402Version") != 2:
-        return False, f"unsupported x402Version: {proof.get('x402Version')!r} (expected 2)", ""
+        return False, _X402_VERSION_REJECTION, ""
     if proof.get("scheme", "exact") != "exact":
         return False, f"unsupported scheme: {proof.get('scheme')!r}", ""
     network = proof.get("network", f"eip155:{CHAIN_ID}")
