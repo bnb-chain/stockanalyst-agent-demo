@@ -24,7 +24,8 @@ from x402_job_service import (
 )
 from x402_job_store import JobConflict, StoredJob
 from x402_promo import PromoRateLimiter
-from x402_tokens import U_TOKEN, USD1_TOKEN
+from x402_settlement import SettlementOutcome
+from x402_tokens import U_TOKEN, USDC_TOKEN, USD1_TOKEN
 from x402_verify import CHAIN_ID, VerifiedPayment, validate_payment_proof
 
 ADDRESS = "0x1111111111111111111111111111111111111111"
@@ -54,6 +55,7 @@ def verified_payment(
         asset=token.address,
         token_symbol=token.symbol,
         promotional=promotional,
+        transfer_method=token.transfer_method,
     )
 
 
@@ -321,7 +323,10 @@ def make_service(
     return X402JobService(
         store=store or MemoryJobStore(),
         token_secret=TOKEN_SECRET,
-        settle=settle or AsyncMock(return_value=(True, "0xtx")),
+        settle=settle
+        or AsyncMock(
+            return_value=SettlementOutcome("settled", transaction="0xtx")
+        ),
         authorization_used=authorization_used or AsyncMock(return_value=False),
         report=report or AsyncMock(return_value=True),
         stream_work=stream_work or idle_stream,
@@ -353,35 +358,41 @@ async def seed_settling_job(
     *,
     lease_expires_at: int,
     payment: VerifiedPayment | None = None,
+    proof_header: str | None = None,
+    pending_settlement_reference: str | None = None,
 ) -> StoredJob:
     selected_payment = payment or verified_payment()
     identity = service.derive_identity(selected_payment)
-    stored = await store.create(
-        {
-            "version": 1,
-            "jobId": identity.job_id,
-            "paymentKey": identity.payment_key,
-            "paymentStatus": "settling",
-            "settlementReference": None,
-            "address": selected_payment.from_address,
-            "status": "settling",
-            "request": {
-                "symbols": ["BNB"],
-                "analysisType": "comprehensive",
-                "portfolio": [],
-                "riskProfile": {},
-            },
-            "jobTokenHash": identity.job_token_hash,
-            "attempt": 0,
-            "leaseOwner": "dead-owner",
-            "leaseExpiresAt": lease_expires_at,
-            "createdAt": NOW,
-            "updatedAt": NOW,
-            "expiresAt": NOW + 7 * 24 * 60 * 60 * 1000,
-            "errorCode": None,
-            "retryable": None,
-        }
-    )
+    record = {
+        "version": 1,
+        "jobId": identity.job_id,
+        "paymentKey": identity.payment_key,
+        "paymentStatus": "settling",
+        "settlementReference": None,
+        "address": selected_payment.from_address,
+        "status": "settling",
+        "request": {
+            "symbols": ["BNB"],
+            "analysisType": "comprehensive",
+            "portfolio": [],
+            "riskProfile": {},
+        },
+        "jobTokenHash": identity.job_token_hash,
+        "attempt": 0,
+        "leaseOwner": "dead-owner",
+        "leaseExpiresAt": lease_expires_at,
+        "createdAt": NOW,
+        "updatedAt": NOW,
+        "expiresAt": NOW + 7 * 24 * 60 * 60 * 1000,
+        "errorCode": None,
+        "retryable": None,
+    }
+    if proof_header is not None:
+        record["paymentProofDigest"] = hashlib.sha256(
+            proof_header.encode("ascii")
+        ).hexdigest()
+        record["pendingSettlementReference"] = pending_settlement_reference
+    stored = await store.create(record)
     assert stored is not None
     return stored
 
@@ -572,7 +583,9 @@ class X402JobIdentityTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_one_initial_reservation_submits_facilitator(self) -> None:
         store = MemoryJobStore(synchronize_creates=True)
-        settle = AsyncMock(return_value=(True, "0xtx"))
+        settle = AsyncMock(
+            return_value=SettlementOutcome("settled", transaction="0xtx")
+        )
         service = make_service(store=store, settle=settle)
 
         with patch(
@@ -586,8 +599,14 @@ class X402JobIdentityTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(first.job_id, second.job_id)
         self.assertEqual(first.job_token, second.job_token)
-        settle.assert_awaited_once_with(PROOF)
+        settle.assert_awaited_once_with(PROOF, "verify-and-settle")
         self.assertEqual(first.status, "queued")
+        durable = store.jobs[first.job_id].record
+        self.assertEqual(
+            durable["paymentProofDigest"],
+            hashlib.sha256(PROOF.encode("ascii")).hexdigest(),
+        )
+        self.assertIsNone(durable["pendingSettlementReference"])
 
     async def test_successful_settlement_reports_deterministic_event(self) -> None:
         report = AsyncMock(return_value=True)
@@ -919,15 +938,420 @@ class X402PromotionalJobCreationTests(unittest.IsolatedAsyncioTestCase):
 
 
 class X402JobSettlementTests(unittest.IsolatedAsyncioTestCase):
+    async def test_new_permit2_pending_settlement_is_bound_and_not_queued(
+        self,
+    ) -> None:
+        store = MemoryJobStore()
+        settle = AsyncMock(
+            return_value=SettlementOutcome(
+                "pending",
+                transaction="0xpending",
+            )
+        )
+        authorization_used = AsyncMock()
+        stream_work = Mock(side_effect=AssertionError("work must not start"))
+        payment = verified_payment(token=USDC_TOKEN)
+        service = make_service(
+            store=store,
+            settle=settle,
+            authorization_used=authorization_used,
+            stream_work=stream_work,
+        )
+
+        with (
+            patch(
+                "x402_job_service.validate_payment_proof",
+                return_value=(payment, ""),
+            ),
+            self.assertRaises(X402JobError) as raised,
+        ):
+            await service.create_job(PROOF, REQUEST)
+
+        self.assertEqual(raised.exception.code, "settlement_pending")
+        self.assertIs(raised.exception.retryable, True)
+        stored = store.jobs[service.derive_identity(payment).job_id].record
+        self.assertEqual(
+            {
+                key: stored.get(key)
+                for key in (
+                    "paymentStatus",
+                    "paymentProofDigest",
+                    "pendingSettlementReference",
+                    "settlementReference",
+                )
+            },
+            {
+                "paymentStatus": "settling",
+                "paymentProofDigest": hashlib.sha256(
+                    PROOF.encode("ascii")
+                ).hexdigest(),
+                "pendingSettlementReference": "0xpending",
+                "settlementReference": None,
+            },
+        )
+        settle.assert_awaited_once_with(PROOF, "verify-and-settle")
+        authorization_used.assert_not_awaited()
+        stream_work.assert_not_called()
+        self.assertFalse(service._tasks)
+
+    async def test_stale_permit2_pending_recovery_is_settle_only(self) -> None:
+        store = MemoryJobStore()
+        payment = verified_payment(token=USDC_TOKEN)
+        settle = AsyncMock(
+            return_value=SettlementOutcome(
+                "settled",
+                transaction="0xsettled",
+            )
+        )
+        authorization_used = AsyncMock()
+        service = make_service(
+            store=store,
+            settle=settle,
+            authorization_used=authorization_used,
+            clock=lambda: STALE_TIME,
+        )
+        await seed_settling_job(
+            service,
+            store,
+            lease_expires_at=NOW,
+            payment=payment,
+            proof_header=PROOF,
+            pending_settlement_reference="0xpending",
+        )
+
+        with (
+            patch(
+                "x402_job_service.validate_payment_proof",
+                return_value=(payment, ""),
+            ),
+            patch.object(service, "_spawn") as spawn,
+        ):
+            recovered = await service.create_job(PROOF, REQUEST)
+
+        self.assertEqual(recovered.status, "queued")
+        settle.assert_awaited_once_with(PROOF, "settle-only")
+        authorization_used.assert_not_awaited()
+        durable = store.jobs[recovered.job_id].record
+        self.assertEqual(durable["settlementReference"], "0xsettled")
+        self.assertIsNone(durable["pendingSettlementReference"])
+        spawn.assert_called_once_with(recovered.job_id)
+
+    async def test_permit2_proof_digest_mismatch_rejects_before_recovery(
+        self,
+    ) -> None:
+        store = MemoryJobStore()
+        payment = verified_payment(token=USDC_TOKEN)
+        settle = AsyncMock(
+            return_value=SettlementOutcome(
+                "settled",
+                transaction="0xsettled",
+            )
+        )
+        authorization_used = AsyncMock(return_value=False)
+        service = make_service(
+            store=store,
+            settle=settle,
+            authorization_used=authorization_used,
+            clock=lambda: STALE_TIME,
+        )
+        await seed_settling_job(
+            service,
+            store,
+            lease_expires_at=NOW,
+            payment=payment,
+            proof_header=PROOF,
+            pending_settlement_reference="0xpending",
+        )
+
+        with (
+            patch(
+                "x402_job_service.validate_payment_proof",
+                return_value=(payment, ""),
+            ),
+            self.assertRaises(X402JobError) as raised,
+        ):
+            await service.create_job("different-signed-proof", REQUEST)
+
+        self.assertEqual(raised.exception.code, "payment_rejected")
+        settle.assert_not_awaited()
+        authorization_used.assert_not_awaited()
+        self.assertEqual(store.replace_calls, 0)
+
+    async def test_settled_eip3009_job_rejects_a_different_bound_proof(
+        self,
+    ) -> None:
+        store = MemoryJobStore()
+        payment = verified_payment()
+        settle = AsyncMock(
+            return_value=SettlementOutcome("settled", transaction="0xsettled")
+        )
+        authorization_used = AsyncMock()
+        service = make_service(
+            store=store,
+            settle=settle,
+            authorization_used=authorization_used,
+        )
+
+        with (
+            patch(
+                "x402_job_service.validate_payment_proof",
+                return_value=(payment, ""),
+            ),
+            patch.object(service, "_spawn"),
+        ):
+            created = await service.create_job(PROOF, REQUEST)
+            with self.assertRaises(X402JobError) as raised:
+                await service.create_job("different-signed-proof", REQUEST)
+
+        self.assertEqual(created.status, "queued")
+        self.assertEqual(raised.exception.code, "payment_rejected")
+        settle.assert_awaited_once_with(PROOF, "verify-and-settle")
+        authorization_used.assert_not_awaited()
+
+    async def test_permit2_pending_recovery_after_deadline_is_settle_only(
+        self,
+    ) -> None:
+        store = MemoryJobStore()
+        payment = verified_payment(
+            token=USDC_TOKEN,
+            valid_before=STALE_TIME // 1000,
+        )
+        settle = AsyncMock(
+            return_value=SettlementOutcome(
+                "settled",
+                transaction="0xsettled-after-deadline",
+            )
+        )
+        authorization_used = AsyncMock()
+        service = make_service(
+            store=store,
+            settle=settle,
+            authorization_used=authorization_used,
+            clock=lambda: STALE_TIME,
+        )
+        await seed_settling_job(
+            service,
+            store,
+            lease_expires_at=NOW,
+            payment=payment,
+            proof_header=PROOF,
+            pending_settlement_reference="0xpending",
+        )
+
+        with (
+            patch(
+                "x402_job_service.validate_payment_proof",
+                return_value=(payment, ""),
+            ),
+            patch.object(service, "_spawn"),
+        ):
+            recovered = await service.create_job(PROOF, REQUEST)
+
+        self.assertEqual(recovered.status, "queued")
+        settle.assert_awaited_once_with(PROOF, "settle-only")
+        authorization_used.assert_not_awaited()
+
+    async def test_expired_unbroadcast_permit2_fails_without_chain_probe(
+        self,
+    ) -> None:
+        store = MemoryJobStore()
+        payment = verified_payment(
+            token=USDC_TOKEN,
+            valid_before=STALE_TIME // 1000,
+        )
+        settle = AsyncMock()
+        authorization_used = AsyncMock()
+        service = make_service(
+            store=store,
+            settle=settle,
+            authorization_used=authorization_used,
+            clock=lambda: STALE_TIME,
+        )
+        stored = await seed_settling_job(
+            service,
+            store,
+            lease_expires_at=NOW,
+            payment=payment,
+            proof_header=PROOF,
+        )
+
+        with (
+            patch(
+                "x402_job_service.validate_payment_proof",
+                return_value=(payment, ""),
+            ),
+            self.assertRaises(X402JobError) as raised,
+        ):
+            await service.create_job(PROOF, REQUEST)
+
+        self.assertEqual(raised.exception.code, "payment_rejected")
+        failed = store.jobs[str(stored.record["jobId"])].record
+        self.assertEqual(failed["paymentStatus"], "failed")
+        self.assertIsNone(failed["pendingSettlementReference"])
+        settle.assert_not_awaited()
+        authorization_used.assert_not_awaited()
+
+    async def test_rejected_permit2_recovery_clears_pending_transaction(
+        self,
+    ) -> None:
+        store = MemoryJobStore()
+        payment = verified_payment(token=USDC_TOKEN)
+        settle = AsyncMock(
+            return_value=SettlementOutcome(
+                "rejected",
+                reason="transaction rejected",
+            )
+        )
+        authorization_used = AsyncMock()
+        service = make_service(
+            store=store,
+            settle=settle,
+            authorization_used=authorization_used,
+            clock=lambda: STALE_TIME,
+        )
+        stored = await seed_settling_job(
+            service,
+            store,
+            lease_expires_at=NOW,
+            payment=payment,
+            proof_header=PROOF,
+            pending_settlement_reference="0xpending",
+        )
+
+        with (
+            patch(
+                "x402_job_service.validate_payment_proof",
+                return_value=(payment, ""),
+            ),
+            self.assertRaises(X402JobError) as raised,
+        ):
+            await service.create_job(PROOF, REQUEST)
+
+        self.assertEqual(raised.exception.code, "payment_rejected")
+        failed = store.jobs[str(stored.record["jobId"])].record
+        self.assertEqual(failed["paymentStatus"], "failed")
+        self.assertIsNone(failed["pendingSettlementReference"])
+        settle.assert_awaited_once_with(PROOF, "settle-only")
+        authorization_used.assert_not_awaited()
+
+    async def test_permit2_recovery_without_proof_digest_fails_closed(
+        self,
+    ) -> None:
+        store = MemoryJobStore()
+        payment = verified_payment(token=USDC_TOKEN)
+        settle = AsyncMock()
+        authorization_used = AsyncMock()
+        service = make_service(
+            store=store,
+            settle=settle,
+            authorization_used=authorization_used,
+            clock=lambda: STALE_TIME,
+        )
+        await seed_settling_job(
+            service,
+            store,
+            lease_expires_at=NOW,
+            payment=payment,
+        )
+
+        with (
+            patch(
+                "x402_job_service.validate_payment_proof",
+                return_value=(payment, ""),
+            ),
+            self.assertRaises(X402JobError) as raised,
+        ):
+            await service.create_job(PROOF, REQUEST)
+
+        self.assertEqual(raised.exception.code, "payment_rejected")
+        settle.assert_not_awaited()
+        authorization_used.assert_not_awaited()
+        self.assertEqual(store.replace_calls, 0)
+
+    async def test_non_ascii_proof_is_rejected_before_reservation(self) -> None:
+        store = MemoryJobStore()
+        settle = AsyncMock()
+        service = make_service(store=store, settle=settle)
+
+        with (
+            patch(
+                "x402_job_service.validate_payment_proof",
+                return_value=(verified_payment(token=USDC_TOKEN), ""),
+            ),
+            self.assertRaises(X402JobError) as raised,
+        ):
+            await service.create_job("signed-prööf", REQUEST)
+
+        self.assertEqual(raised.exception.code, "payment_rejected")
+        self.assertEqual(store.create_calls, 0)
+        settle.assert_not_awaited()
+
+    async def test_concurrent_permit2_pending_recovery_has_one_settle_owner(
+        self,
+    ) -> None:
+        store = ReconciliationRaceStore()
+        payment = verified_payment(token=USDC_TOKEN)
+        settle = AsyncMock(
+            return_value=SettlementOutcome(
+                "settled",
+                transaction="0xsettled-once",
+            )
+        )
+        authorization_used = AsyncMock()
+        first_service = make_service(
+            store=store,
+            settle=settle,
+            authorization_used=authorization_used,
+            clock=lambda: STALE_TIME,
+            owner="owner-a",
+        )
+        second_service = make_service(
+            store=store,
+            settle=settle,
+            authorization_used=authorization_used,
+            clock=lambda: STALE_TIME,
+            owner="owner-b",
+        )
+        await seed_settling_job(
+            first_service,
+            store,
+            lease_expires_at=NOW,
+            payment=payment,
+            proof_header=PROOF,
+            pending_settlement_reference="0xpending",
+        )
+
+        with (
+            patch(
+                "x402_job_service.validate_payment_proof",
+                return_value=(payment, ""),
+            ),
+            patch.object(first_service, "_spawn"),
+            patch.object(second_service, "_spawn"),
+        ):
+            first, second = await asyncio.gather(
+                first_service.create_job(PROOF, REQUEST),
+                second_service.create_job(PROOF, REQUEST),
+            )
+
+        self.assertEqual(first.job_id, second.job_id)
+        settle.assert_awaited_once_with(PROOF, "settle-only")
+        authorization_used.assert_not_awaited()
+
     async def test_settlement_reference_uses_visible_ascii_byte_boundary(
         self,
     ) -> None:
         accepted = make_service(
-            settle=AsyncMock(return_value=(True, "x" * 4_096)),
+            settle=AsyncMock(
+                return_value=SettlementOutcome(
+                    "settled",
+                    transaction="x" * 4_096,
+                )
+            ),
         )
         self.assertEqual(
-            await accepted._settle_payment(PROOF),
-            (True, "x" * 4_096),
+            await accepted._settle_payment(PROOF, "verify-and-settle"),
+            SettlementOutcome("settled", transaction="x" * 4_096),
         )
 
         invalid_references = (
@@ -937,22 +1361,26 @@ class X402JobSettlementTests(unittest.IsolatedAsyncioTestCase):
             "delete\x7f",
         )
         for reference in invalid_references:
+            malformed = SettlementOutcome("settled", transaction="0xvalid")
+            object.__setattr__(malformed, "transaction", reference)
             service = make_service(
-                settle=AsyncMock(return_value=(True, reference)),
+                settle=AsyncMock(return_value=malformed),
             )
             with (
                 self.subTest(reference=repr(reference)),
                 self.assertRaises(SettlementIndeterminate),
             ):
-                await service._settle_payment(PROOF)
+                await service._settle_payment(PROOF, "verify-and-settle")
 
     async def test_successful_settlement_requires_a_nonempty_reference(
         self,
     ) -> None:
         store = MemoryJobStore()
+        malformed = SettlementOutcome("settled", transaction="0xvalid")
+        object.__setattr__(malformed, "transaction", "")
         service = make_service(
             store=store,
-            settle=AsyncMock(return_value=(True, "")),
+            settle=AsyncMock(return_value=malformed),
         )
 
         with (
@@ -971,9 +1399,11 @@ class X402JobSettlementTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_overlong_settlement_reference_is_not_persisted(self) -> None:
         store = MemoryJobStore()
+        malformed = SettlementOutcome("settled", transaction="0xvalid")
+        object.__setattr__(malformed, "transaction", "x" * 4_097)
         service = make_service(
             store=store,
-            settle=AsyncMock(return_value=(True, "x" * 4_097)),
+            settle=AsyncMock(return_value=malformed),
         )
 
         with (
@@ -1068,7 +1498,12 @@ class X402JobSettlementTests(unittest.IsolatedAsyncioTestCase):
         stream_work = Mock(side_effect=AssertionError("work must not start"))
         service = make_service(
             store=store,
-            settle=AsyncMock(return_value=(False, "authorization rejected")),
+            settle=AsyncMock(
+                return_value=SettlementOutcome(
+                    "rejected",
+                    reason="authorization rejected",
+                )
+            ),
             stream_work=stream_work,
         )
 
@@ -1095,6 +1530,28 @@ class X402JobSettlementTests(unittest.IsolatedAsyncioTestCase):
         service = make_service(
             store=store,
             settle=AsyncMock(return_value={"success": True}),
+        )
+
+        with (
+            patch(
+                "x402_job_service.validate_payment_proof",
+                return_value=(verified_payment(), ""),
+            ),
+            self.assertRaises(X402JobError) as raised,
+        ):
+            await service.create_job(PROOF, REQUEST)
+
+        self.assertEqual(raised.exception.code, "settlement_pending")
+        identity = service.derive_identity(verified_payment())
+        self.assertEqual(store.jobs[identity.job_id].record["status"], "settling")
+
+    async def test_unknown_typed_settlement_status_is_indeterminate(self) -> None:
+        store = MemoryJobStore()
+        malformed = SettlementOutcome("settled", transaction="0xunexpected")
+        object.__setattr__(malformed, "status", "unknown")
+        service = make_service(
+            store=store,
+            settle=AsyncMock(return_value=malformed),
         )
 
         with (
@@ -1177,7 +1634,12 @@ class X402JobSettlementTests(unittest.IsolatedAsyncioTestCase):
     ) -> None:
         store = MemoryJobStore()
         authorization_used = AsyncMock(return_value=False)
-        settle = AsyncMock(return_value=(True, "0xreconciled"))
+        settle = AsyncMock(
+            return_value=SettlementOutcome(
+                "settled",
+                transaction="0xreconciled",
+            )
+        )
         service = make_service(
             store=store,
             authorization_used=authorization_used,
@@ -1194,14 +1656,19 @@ class X402JobSettlementTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result.status, "queued")
         authorization_used.assert_awaited_once()
-        settle.assert_awaited_once_with(PROOF)
+        settle.assert_awaited_once_with(PROOF, "verify-and-settle")
         stored = store.jobs[result.job_id].record
         self.assertEqual(stored["settlementReference"], "0xreconciled")
 
     async def test_concurrent_stale_claims_allow_one_facilitator_owner(self) -> None:
         store = ReconciliationRaceStore()
         authorization_used = AsyncMock(return_value=False)
-        settle = AsyncMock(return_value=(True, "0xreconciled"))
+        settle = AsyncMock(
+            return_value=SettlementOutcome(
+                "settled",
+                transaction="0xreconciled",
+            )
+        )
         first_service = make_service(
             store=store,
             authorization_used=authorization_used,
@@ -1229,7 +1696,7 @@ class X402JobSettlementTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(first.job_id, second.job_id)
         authorization_used.assert_awaited_once()
-        settle.assert_awaited_once_with(PROOF)
+        settle.assert_awaited_once_with(PROOF, "verify-and-settle")
 
     async def test_expired_proof_reconciles_existing_job_without_validator_patch(
         self,
@@ -1432,7 +1899,9 @@ class X402JobSettlementTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_false_accounting_result_stays_pending_and_retries(self) -> None:
         store = MemoryJobStore()
-        settle = AsyncMock(return_value=(True, "0xtx"))
+        settle = AsyncMock(
+            return_value=SettlementOutcome("settled", transaction="0xtx")
+        )
         report = AsyncMock(side_effect=[False, True])
         service = make_service(
             store=store,
@@ -1450,7 +1919,7 @@ class X402JobSettlementTests(unittest.IsolatedAsyncioTestCase):
             first = await service.create_job(PROOF, REQUEST)
             await wait_for_accounting(service)
 
-        settle.assert_awaited_once_with(PROOF)
+        settle.assert_awaited_once_with(PROOF, "verify-and-settle")
         self.assertEqual(report.await_count, 2)
         self.assertEqual(
             report.await_args_list[0].kwargs["event_id"],
@@ -1733,7 +2202,10 @@ class X402JobSettlementTests(unittest.IsolatedAsyncioTestCase):
         release_first_submission = asyncio.Event()
         submissions = 0
 
-        async def ambiguous_settle(_proof: str) -> tuple[bool, str]:
+        async def ambiguous_settle(
+            _proof: str,
+            _mode: str,
+        ) -> SettlementOutcome:
             nonlocal submissions
             submissions += 1
             # Two HTTP submissions may observe the same successful nonce use;
@@ -1741,8 +2213,14 @@ class X402JobSettlementTests(unittest.IsolatedAsyncioTestCase):
             if submissions == 1:
                 first_submission_started.set()
                 await release_first_submission.wait()
-                return True, "0xeip3009-transfer"
-            return True, "0xeip3009-transfer"
+                return SettlementOutcome(
+                    "settled",
+                    transaction="0xeip3009-transfer",
+                )
+            return SettlementOutcome(
+                "settled",
+                transaction="0xeip3009-transfer",
+            )
 
         authorization_used = AsyncMock(return_value=False)
         report = AsyncMock(return_value=True)
@@ -1796,7 +2274,7 @@ class X402JobSettlementTests(unittest.IsolatedAsyncioTestCase):
             awaitable: Any,
             *,
             timeout: float,
-        ) -> tuple[bool, str]:
+        ) -> SettlementOutcome:
             self.assertEqual(timeout, 60)
             return await awaitable
 
@@ -1823,7 +2301,7 @@ class X402JobSettlementTests(unittest.IsolatedAsyncioTestCase):
             awaitable: Any,
             *,
             timeout: float,
-        ) -> tuple[bool, str]:
+        ) -> SettlementOutcome:
             self.assertEqual(timeout, 60)
             awaitable.close()
             raise TimeoutError
@@ -1874,7 +2352,10 @@ class X402JobSettlementTests(unittest.IsolatedAsyncioTestCase):
             timeouts.append(float(kwargs["timeout"]))
             return original_client(*args, transport=transport, **kwargs)
 
-        async def settle(_proof_header: str) -> tuple[bool, str]:
+        async def settle(
+            _proof_header: str,
+            _mode: str,
+        ) -> SettlementOutcome:
             return await _settle_generic({})
 
         service = make_service(store=store, settle=settle)
@@ -2425,7 +2906,12 @@ class X402JobExecutionTests(unittest.IsolatedAsyncioTestCase):
         self,
     ) -> None:
         store = MemoryJobStore()
-        settle = AsyncMock(return_value=(True, "0xsettled-once"))
+        settle = AsyncMock(
+            return_value=SettlementOutcome(
+                "settled",
+                transaction="0xsettled-once",
+            )
+        )
         authorization_used = AsyncMock()
         calls = 0
 
@@ -2463,7 +2949,7 @@ class X402JobExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(durable["attempt"], 3)
         self.assertEqual(calls, 9)
         self.assertEqual(validate.call_count, 1)
-        settle.assert_awaited_once_with(PROOF)
+        settle.assert_awaited_once_with(PROOF, "verify-and-settle")
         authorization_used.assert_not_awaited()
 
     async def test_non_json_report_succeeds_without_retry(self) -> None:
