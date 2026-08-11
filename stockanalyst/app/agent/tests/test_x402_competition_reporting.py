@@ -11,6 +11,7 @@ from stockanalyst.app.agent.x402_job_service import (
     CreateJobResult,
     SettlementIndeterminate,
 )
+from stockanalyst.app.agent.x402_settlement import SettlementOutcome
 
 ADDRESS = "0x1111111111111111111111111111111111111111"
 NONCE = f"0x{'22' * 32}"
@@ -167,7 +168,10 @@ class X402CompetitionReportingTests(unittest.IsolatedAsyncioTestCase):
             patch.object(handler_module, "_B402_CLIENT", client),
             self.assertRaises(SettlementIndeterminate),
         ):
-            await handler_module._settle_via_facilitator(_payment_header())
+            await handler_module._settle_via_facilitator(
+                _payment_header(),
+                "verify-and-settle",
+            )
 
     async def test_facilitator_malformed_response_is_indeterminate(self) -> None:
         response = _FakeResponse(200, malformed=True)
@@ -250,23 +254,31 @@ class X402CompetitionReportingTests(unittest.IsolatedAsyncioTestCase):
             "insufficient_funds"
         )
         with patch.object(handler_module, "_B402_CLIENT", client):
-            settled, reason = await handler_module._settle_via_facilitator(
-                _payment_header()
+            outcome = await handler_module._settle_via_facilitator(
+                _payment_header(),
+                "verify-and-settle",
             )
 
-        self.assertFalse(settled)
-        self.assertEqual(reason, "insufficient_funds")
+        self.assertEqual(outcome.status, "rejected")
+        self.assertIsNone(outcome.transaction)
+        self.assertEqual(outcome.reason, "insufficient_funds")
 
     async def test_confirmed_b402_settlement_returns_transaction(self) -> None:
         client = AsyncMock()
-        client.verify_and_settle.return_value = "0x" + "12" * 32
+        transaction = "0x" + "12" * 32
+        client.verify_and_settle.return_value = SettlementOutcome(
+            "settled",
+            transaction=transaction,
+        )
         with patch.object(handler_module, "_B402_CLIENT", client):
-            settled, transaction = await handler_module._settle_via_facilitator(
-                _payment_header()
+            outcome = await handler_module._settle_via_facilitator(
+                _payment_header(),
+                "verify-and-settle",
             )
 
-        self.assertTrue(settled)
-        self.assertEqual(transaction, "0x" + "12" * 32)
+        self.assertEqual(outcome.status, "settled")
+        self.assertEqual(outcome.transaction, transaction)
+        self.assertIsNone(outcome.reason)
 
     async def test_b402_outcome_logs_do_not_include_external_values(self) -> None:
         transaction = "0x" + "ab" * 32
@@ -276,7 +288,7 @@ class X402CompetitionReportingTests(unittest.IsolatedAsyncioTestCase):
         )
         client = AsyncMock()
         client.verify_and_settle.side_effect = [
-            transaction,
+            SettlementOutcome("settled", transaction=transaction),
             handler_module.B402RejectedError(rejection),
         ]
 
@@ -284,21 +296,24 @@ class X402CompetitionReportingTests(unittest.IsolatedAsyncioTestCase):
             patch.object(handler_module, "_B402_CLIENT", client),
             self.assertLogs("seller-agent.x402", level="INFO") as captured,
         ):
-            settled, returned_transaction = (
+            settled = (
                 await handler_module._settle_via_facilitator(
-                    _payment_header()
+                    _payment_header(),
+                    "verify-and-settle",
                 )
             )
-            rejected, returned_reason = (
+            rejected = (
                 await handler_module._settle_via_facilitator(
-                    _payment_header()
+                    _payment_header(),
+                    "verify-and-settle",
                 )
             )
 
-        self.assertTrue(settled)
-        self.assertEqual(returned_transaction, transaction)
-        self.assertFalse(rejected)
-        self.assertEqual(returned_reason, rejection)
+        self.assertEqual(settled.status, "settled")
+        self.assertEqual(settled.transaction, transaction)
+        self.assertEqual(rejected.status, "rejected")
+        self.assertIsNone(rejected.transaction)
+        self.assertEqual(rejected.reason, rejection)
         rendered = "\n".join(captured.output)
         self.assertIn("outcome=settled backend=b402", rendered)
         self.assertIn("outcome=rejected backend=b402", rendered)
