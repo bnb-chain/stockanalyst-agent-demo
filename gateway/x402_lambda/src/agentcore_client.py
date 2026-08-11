@@ -38,7 +38,8 @@ class InvalidAgentResponse(AgentInvocationError):
 
 
 _RESPONSE_HEADERS = {
-    "content-type", "location", "retry-after", "cache-control", "vary", "x-payment-required",
+    "content-type", "location", "retry-after", "cache-control", "vary",
+    "payment-required", "payment-response",
 }
 _HEADER_NAME = re.compile(r"[a-z0-9-]+\Z")
 _MAX_RESPONSE_BYTES = 2 * 1024 * 1024

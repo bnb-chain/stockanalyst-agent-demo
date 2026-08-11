@@ -151,6 +151,29 @@ class AgentCoreClientTests(unittest.TestCase):
         with self.assertRaises(InvalidAgentResponse):
             client.invoke(ENVELOPE)
 
+    def test_response_accepts_v2_payment_headers_and_rejects_legacy(self):
+        headers = {
+            "payment-required": "eyJ4NDAyVmVyc2lvbiI6Mn0=",
+            "payment-response": "eyJzdWNjZXNzIjp0cnVlfQ==",
+        }
+        transport = AgentTransport(a2a_response(response_envelope(headers=headers)))
+        response = AgentCoreClient(
+            "https://agentcore.example.test/runtime",
+            lambda: "Bearer access-token",
+            transport,
+        ).invoke(ENVELOPE)
+        self.assertEqual(response["headers"], headers)
+
+        legacy = AgentTransport(a2a_response(response_envelope(
+            headers={"x-payment-required": "legacy"},
+        )))
+        with self.assertRaises(InvalidAgentResponse):
+            AgentCoreClient(
+                "https://agentcore.example.test/runtime",
+                lambda: "Bearer access-token",
+                legacy,
+            ).invoke(ENVELOPE)
+
     def test_rejects_jsonrpc_version_or_id_not_bound_to_request(self):
         for jsonrpc, response_id in (("1.0", REQUEST_ID), ("2.0", "different-request"), (None, REQUEST_ID)):
             with self.subTest(jsonrpc=jsonrpc, response_id=response_id), self.assertRaises(InvalidAgentResponse):

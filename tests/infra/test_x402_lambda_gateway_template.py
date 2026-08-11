@@ -23,9 +23,20 @@ def resource_section(text: str, logical_id: str, next_logical_id: str) -> str:
 
 
 class X402LambdaGatewayTemplateTests(unittest.TestCase):
+    def test_stage_defaults_to_mainnet(self) -> None:
+        text = TEMPLATE.read_text()
+        parameter = re.search(
+            r"(?ms)^  StageName:\n(?P<section>.*?)(?=^  AgentCoreInvokeUrl:)",
+            text,
+        )
+
+        self.assertIsNotNone(parameter)
+        self.assertIn("Default: mainnet", parameter.group("section"))
+        self.assertNotIn("Default: testnet", parameter.group("section"))
+
     def test_rest_api_does_not_enable_binary_json_media_type(self) -> None:
         text = TEMPLATE.read_text()
-        api = resource_section(text, "X402Api", "X402Adapter")
+        api = resource_section(text, "X402Api", "X402CustomDomain")
 
         self.assertNotIn("BinaryMediaTypes:", api)
 
@@ -43,8 +54,143 @@ class X402LambdaGatewayTemplateTests(unittest.TestCase):
         ):
             self.assertRegex(text, rf"(?ms)^          {re.escape(path)}:\n            {method}:")
         self.assertNotIn("{proxy+}", text)
-        self.assertNotIn("Path: /x402/free", text)
-        self.assertNotIn("AWS::ApiGateway::DomainName", text)
+        self.assertNotIn("/x402/free:", text)
+
+    def test_regional_custom_domain_maps_root_to_mainnet(self) -> None:
+        text = TEMPLATE.read_text()
+
+        self.assertIn("CustomDomainName:", text)
+        self.assertIn("Default: stock-agent.bnbchain.org", text)
+        self.assertIn("CustomDomainCertificateArn:", text)
+        self.assertRegex(
+            text,
+            r"(?s)X402CustomDomain:.*?Type: AWS::ApiGateway::DomainName.*?"
+            r"DomainName: !Ref CustomDomainName.*?Types:\n\s+- REGIONAL.*?"
+            r"RegionalCertificateArn: !Ref CustomDomainCertificateArn.*?"
+            r"SecurityPolicy: TLS_1_2",
+        )
+        mapping = resource_section(
+            text, "X402CustomDomainMapping", "X402Adapter"
+        )
+        self.assertIn("DomainName: !Ref X402CustomDomain", mapping)
+        self.assertIn("RestApiId: !Ref X402Api", mapping)
+        self.assertIn("Stage: !Ref StageName", mapping)
+        self.assertNotIn("BasePath:", mapping)
+
+    def test_default_endpoint_switch_is_explicit_and_defaults_open(self) -> None:
+        text = TEMPLATE.read_text()
+
+        self.assertRegex(
+            text,
+            r'(?s)DisableExecuteApiEndpoint:.*?Default: "false".*?'
+            r'AllowedValues: \["true", "false"\]',
+        )
+        self.assertIn(
+            'DisableDefaultEndpoint: !Equals [!Ref DisableExecuteApiEndpoint, "true"]',
+            text,
+        )
+        self.assertIn(
+            "DisableExecuteApiEndpoint: !If [DisableDefaultEndpoint, true, false]",
+            text,
+        )
+
+    def test_default_endpoint_switch_also_updates_the_managed_stage(self) -> None:
+        text = TEMPLATE.read_text()
+        api = resource_section(text, "X402Api", "X402CustomDomain")
+
+        self.assertIn("Variables:", api)
+        self.assertIn(
+            "DefaultEndpointDisabled: !Ref DisableExecuteApiEndpoint", api
+        )
+        self.assertNotIn("Type: AWS::ApiGateway::Deployment", text)
+
+    def test_default_endpoint_switch_forces_a_managed_api_deployment(self) -> None:
+        text = TEMPLATE.read_text()
+        api = resource_section(text, "X402Api", "X402CustomDomain")
+
+        self.assertIn("AlwaysDeploy: true", api)
+        self.assertNotIn("Type: AWS::ApiGateway::Deployment", text)
+
+    def test_lambda_receives_only_exact_nonsecret_custom_domain_setting(self) -> None:
+        text = TEMPLATE.read_text()
+        adapter = resource_section(text, "X402Adapter", "X402ApiInvokePermission")
+        environment = re.search(
+            r"(?m)^      Environment:\n        Variables:\n"
+            r"(?P<variables>(?:          .*\n)+)",
+            adapter,
+        )
+
+        self.assertIsNotNone(environment)
+        names = re.findall(
+            r"^\s{10}([A-Z0-9_]+):",
+            environment.group("variables"),
+            re.MULTILINE,
+        )
+        self.assertEqual(
+            names,
+            ["AGENTCORE_INVOKE_URL", "OAUTH_SECRET_ARN", "X402_CUSTOM_DOMAIN_NAME"],
+        )
+        self.assertIn("X402_CUSTOM_DOMAIN_NAME: !Ref CustomDomainName", adapter)
+
+    def test_dormant_free_waf_matcher_does_not_publish_free_openapi_route(self) -> None:
+        text = TEMPLATE.read_text()
+        web_acl = resource_section(text, "X402WebAcl", "X402WebAclAssociation")
+        create_rule = re.search(
+            r"(?ms)^        - Name: X402CreateRateLimit\n"
+            r"(?P<section>.*?)(?=^        - Name: X402ReadRateLimit)",
+            web_acl,
+        )
+
+        self.assertIsNotNone(create_rule)
+        section = create_rule.group("section")
+        self.assertRegex(
+            section,
+            r"(?s)FieldToMatch: \{Method: \{\}\}\n"
+            r"\s+PositionalConstraint: EXACTLY\n"
+            r"\s+SearchString: POST",
+        )
+        self.assertIn("OrStatement:", section)
+        for path in ("/x402/free", "/x402/analyze/async"):
+            self.assertRegex(
+                section,
+                rf"(?s)FieldToMatch: \{{UriPath: \{{\}}\}}\n"
+                rf"\s+PositionalConstraint: EXACTLY\n"
+                rf"\s+SearchString: {re.escape(path)}",
+            )
+        openapi = text.split("      DefinitionBody:", 1)[1].split(
+            "      AccessLogSetting:",
+            1,
+        )[0]
+        self.assertNotIn("/x402/free:", openapi)
+
+    def test_template_adds_no_shared_promotional_state_resources(self) -> None:
+        text = TEMPLATE.read_text()
+        resources = text.split("Resources:\n", 1)[1].split("Outputs:\n", 1)[0]
+        logical_ids = set(re.findall(r"(?m)^  ([A-Za-z0-9]+):$", resources))
+
+        self.assertEqual(logical_ids, {
+            "X402Api",
+            "X402CustomDomain",
+            "X402CustomDomainMapping",
+            "X402Adapter",
+            "X402ApiInvokePermission",
+            "X402ApiAccessLogGroup",
+            "X402AdapterLogGroup",
+            "X402Gateway5xxMetric",
+            "X402WebAcl",
+            "X402WebAclAssociation",
+            "X402LambdaErrors",
+            "X402LambdaThrottles",
+            "X402ApiServerErrors",
+        })
+        for forbidden in (
+            "AWS::Route53::",
+            "AWS::CloudFront::",
+            "AWS::IAM::",
+            "AWS::DynamoDB::",
+            "AWS::ElastiCache::",
+        ):
+            self.assertNotIn(forbidden, resources)
 
     def test_lambda_has_hardened_runtime_configuration_without_api_reference(self) -> None:
         text = TEMPLATE.read_text()
@@ -61,17 +207,21 @@ class X402LambdaGatewayTemplateTests(unittest.TestCase):
         )
         self.assertIn("Tracing: Active", adapter)
         self.assertIn("LoggingConfig:\n        LogFormat: Text", adapter)
+        self.assertIn("Role: !Ref LambdaExecutionRoleArn", adapter)
         self.assertNotIn("VpcConfig:", adapter)
         self.assertNotIn("X402Api", adapter)
         self.assertNotIn("X402_PUBLIC_BASE_URL", adapter)
         environment = re.search(
-            r"Environment:\n\s+Variables:\n(?P<variables>.*?)(?=\s{6}Policies:)",
+            r"(?m)^      Environment:\n        Variables:\n(?P<variables>(?:          .*\n)+)",
             adapter,
-            re.DOTALL,
         )
         self.assertIsNotNone(environment)
         names = re.findall(r"^\s{10}([A-Z0-9_]+):", environment.group("variables"), re.MULTILINE)
-        self.assertEqual(names, ["AGENTCORE_INVOKE_URL", "OAUTH_SECRET_ARN"])
+        self.assertEqual(
+            names,
+            ["AGENTCORE_INVOKE_URL", "OAUTH_SECRET_ARN", "X402_CUSTOM_DOMAIN_NAME"],
+        )
+        self.assertNotIn("\n      Policies:", adapter)
 
     def test_reserved_concurrency_is_optional_and_defaults_off(self) -> None:
         text = TEMPLATE.read_text()
@@ -93,13 +243,13 @@ class X402LambdaGatewayTemplateTests(unittest.TestCase):
             adapter,
         )
 
-    def test_lambda_secret_policy_is_one_resource_scoped_action(self) -> None:
+    def test_lambda_uses_supplied_execution_role_without_inline_permissions(self) -> None:
         text = TEMPLATE.read_text()
         adapter = resource_section(text, "X402Adapter", "X402ApiInvokePermission")
 
-        self.assertEqual(adapter.count("Action: secretsmanager:GetSecretValue"), 1)
-        self.assertIn("Resource: !Ref OAuthSecretArn", adapter)
-        self.assertNotIn("Action: secretsmanager:*", adapter)
+        self.assertEqual(adapter.count("Role: !Ref LambdaExecutionRoleArn"), 1)
+        self.assertNotIn("\n      Policies:", adapter)
+        self.assertNotRegex(adapter, r"(?m)^\s+Action:\s+[\"']?\*[\"']?$")
         self.assertNotRegex(adapter, r"Resource:\s+[\"']?\*[\"']?")
 
     def test_waf_has_rate_limit_and_observe_only_common_rules_but_no_body_claim(self) -> None:
@@ -161,7 +311,11 @@ class X402LambdaGatewayTemplateTests(unittest.TestCase):
 
         self.assertIn("Type: AWS::Lambda::Permission", text)
         self.assertIn("X402GatewayBaseUrl:", text)
-        self.assertIn("https://${X402Api}.execute-api.${AWS::Region}.${AWS::URLSuffix}/${StageName}", text)
+        self.assertIn('Value: !Sub "https://${CustomDomainName}"', text)
+        self.assertIn("X402RegionalDomainName:", text)
+        self.assertIn("Value: !GetAtt X402CustomDomain.RegionalDomainName", text)
+        self.assertIn("X402RegionalHostedZoneId:", text)
+        self.assertIn("Value: !GetAtt X402CustomDomain.RegionalHostedZoneId", text)
 
     def test_all_integrations_and_permission_target_the_live_alias(self) -> None:
         text = TEMPLATE.read_text()

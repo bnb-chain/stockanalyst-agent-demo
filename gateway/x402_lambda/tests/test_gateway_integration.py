@@ -70,17 +70,23 @@ class FakeOAuth:
 
 
 class FakeB402Client:
-    async def payment_extra(self, network: str, name: str, version: str) -> dict[str, str]:
+    async def payment_extras(
+        self, network: str, domains: tuple[tuple[str, str], ...]
+    ) -> dict[tuple[str, str], dict[str, str]]:
         return {
-            "name": name,
-            "version": version,
-            "assetTransferMethod": "eip3009",
-            "signerAddress": "0xd10bddc20e4dc42a1a19a9653e994991e25b8153",
+            domain: {
+                "name": domain[0],
+                "version": domain[1],
+                "assetTransferMethod": "eip3009",
+                "signerAddress": "0xd10bddc20e4dc42a1a19a9653e994991e25b8153",
+            }
+            for domain in domains
         }
 
 
 class FakeJobService:
     def __init__(self) -> None:
+        self.promo_free = False
         self.create_calls: list[tuple[str, dict[str, Any]]] = []
 
     async def create_job(self, payment_proof: str, request: dict[str, Any]) -> CreateJobResult:
@@ -234,7 +240,10 @@ class GatewayIntegrationTests(unittest.TestCase):
         response = self.invoke(api_event(
             method="POST",
             path="/x402/analyze/async",
-            headers={"X-Payment": "test-proof"},
+            headers={
+                "PAYMENT-SIGNATURE": "test-proof",
+                "X-Forwarded-For": "198.51.100.200",
+            },
             body=b'{"symbols":["AAPL"]}',
         ))
 
@@ -244,5 +253,8 @@ class GatewayIntegrationTests(unittest.TestCase):
         self.assertEqual(body["jobId"], JOB_ID)
         self.assertEqual(body["status"], "queued")
         self.assertEqual(self.job_service.create_calls, [("test-proof", {"symbols": ["AAPL"]})])
+        envelope = self.transport.requests[0]["params"]["message"]["parts"][0]["data"]["envelope"]
+        self.assertEqual(envelope["sourceIp"], "203.0.113.10")
+        self.assertNotIn("x-forwarded-for", envelope["headers"])
         request_id = self.transport.requests[0]["id"]
         self.assertEqual(request_id, self.transport.requests[0]["params"]["message"]["messageId"])
