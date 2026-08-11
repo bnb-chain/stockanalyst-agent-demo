@@ -228,6 +228,25 @@ function permit2Proof(
   })).toString("base64");
 }
 
+function eip3009Proof(challenge: PaidPaymentChallenge): string {
+  return Buffer.from(JSON.stringify({
+    x402Version: 2,
+    resource: challenge.resource,
+    accepted: challenge.accepted,
+    payload: {
+      signature: "0xprivate-eip3009-signature",
+      authorization: {
+        from: "0x3333333333333333333333333333333333333333",
+        to: challenge.accepted.payTo,
+        value: challenge.accepted.amount,
+        validAfter: "0",
+        validBefore: "2000000000",
+        nonce: `0x${"44".repeat(32)}`,
+      },
+    },
+  })).toString("base64");
+}
+
 type PreparePaidPendingCreate = (
   wallet: Wallet,
   challenge: PaidPaymentChallenge,
@@ -247,6 +266,36 @@ type PreparePaidPendingCreate = (
   },
 ) => Promise<ReturnType<typeof createPendingRecord>>;
 
+interface StartupContext {
+  symbols: string[];
+  portfolio?: unknown;
+  riskProfile?: unknown;
+}
+
+type RunAsyncStartup = (options: {
+  endpoint: string;
+  receiptPath: string;
+  pendingPath: string;
+  env: Readonly<Record<string, string | undefined>>;
+  dependencies?: Partial<{
+    fetch: FetchImpl;
+    loadContext: () => Promise<StartupContext>;
+    loadWallet: (
+      env: Readonly<Record<string, string | undefined>>,
+    ) => Promise<Wallet>;
+    createPermit2AllowanceReader: (
+      rpcUrl: string,
+      walletAddress: string,
+      token: "USDC" | "USDT",
+    ) => () => Promise<bigint>;
+    buildPaymentProof: (
+      wallet: Wallet,
+      challenge: PaidPaymentChallenge,
+    ) => Promise<string>;
+    log: (message: string) => void;
+  }>;
+}) => Promise<{ receipt: AsyncJobReceipt; symbols: string[] }>;
+
 function preparePaidPendingCreate(): PreparePaidPendingCreate {
   const candidate = (
     x402AsyncModule as unknown as Record<string, unknown>
@@ -257,6 +306,18 @@ function preparePaidPendingCreate(): PreparePaidPendingCreate {
     "x402 async must expose an injectable paid preflight seam",
   );
   return candidate as PreparePaidPendingCreate;
+}
+
+function runAsyncStartup(): RunAsyncStartup {
+  const candidate = (
+    x402AsyncModule as unknown as Record<string, unknown>
+  )["runAsyncStartup"];
+  assert.equal(
+    typeof candidate,
+    "function",
+    "x402 async must expose its real startup orchestration seam",
+  );
+  return candidate as RunAsyncStartup;
 }
 
 function decodeProof(proof: string): {
@@ -288,6 +349,394 @@ test("parses X402_PAYMENT_TOKEN as the exact four-token enum with U default", ()
       },
       value,
     );
+  }
+});
+
+test("real CLI startup rejects unsafe Permit2 preflight before every fetch and signature", async () => {
+  const runStartup = runAsyncStartup();
+  const wallet = { address: "0x3333333333333333333333333333333333333333" } as Wallet;
+  const cases: Array<{
+    name: string;
+    token: "USDC" | "USDT";
+    rpcUrl: string;
+    read: () => Promise<bigint>;
+    expected: RegExp;
+  }> = [
+    {
+      name: "below minimum",
+      token: "USDC",
+      rpcUrl: "https://rpc.invalid",
+      read: async () => 210000000000000000n - 1n,
+      expected: /below 0\.21/,
+    },
+    {
+      name: "above target",
+      token: "USDT",
+      rpcUrl: "https://rpc.invalid",
+      read: async () => 50n * 10n ** 18n + 1n,
+      expected: /exceeds 50/,
+    },
+    {
+      name: "missing RPC",
+      token: "USDC",
+      rpcUrl: "",
+      read: async () => {
+        throw new Error("BSC_RPC_URL is required for Permit2 allowance operations");
+      },
+      expected: /BSC_RPC_URL is required/,
+    },
+    {
+      name: "wrong chain",
+      token: "USDT",
+      rpcUrl: "https://rpc.invalid",
+      read: async () => {
+        throw new Error("BSC_RPC_URL provider network must have chain ID 56");
+      },
+      expected: /chain ID 56/,
+    },
+  ];
+
+  for (const testCase of cases) {
+    const directory = mkdtempSync(join(tmpdir(), "x402-startup-preflight-reject-"));
+    const pendingPath = join(directory, "pending.json");
+    const receiptPath = join(directory, "receipt.json");
+    let decryptions = 0;
+    let fetches = 0;
+    let signatures = 0;
+    try {
+      await assert.rejects(
+        runStartup({
+          endpoint: ENDPOINT,
+          receiptPath,
+          pendingPath,
+          env: {
+            X402_SELLER_WALLET: SELLER,
+            X402_PAYMENT_TOKEN: testCase.token,
+            BSC_RPC_URL: testCase.rpcUrl,
+          },
+          dependencies: {
+            loadContext: async () => ({ symbols: ["AAPL"] }),
+            loadWallet: async () => {
+              decryptions += 1;
+              return wallet;
+            },
+            createPermit2AllowanceReader: (rpcUrl, address, token) => {
+              assert.equal(rpcUrl, testCase.rpcUrl, testCase.name);
+              assert.equal(address, wallet.address, testCase.name);
+              assert.equal(token, testCase.token, testCase.name);
+              return testCase.read;
+            },
+            fetch: async () => {
+              fetches += 1;
+              throw new Error("unexpected fetch");
+            },
+            buildPaymentProof: async () => {
+              signatures += 1;
+              throw new Error("unexpected signature");
+            },
+            log: () => undefined,
+          },
+        }),
+        testCase.expected,
+        testCase.name,
+      );
+      assert.equal(decryptions, 1, testCase.name);
+      assert.equal(fetches, 0, testCase.name);
+      assert.equal(signatures, 0, testCase.name);
+      assert.equal(existsSync(pendingPath), false, testCase.name);
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  }
+});
+
+test("real CLI startup composes Task 7 preflight before challenge fetch and reuses its wallet", async () => {
+  const runStartup = runAsyncStartup();
+  const wallet = { address: "0x3333333333333333333333333333333333333333" } as Wallet;
+
+  for (const token of ["USDC", "USDT"] as const) {
+    const directory = mkdtempSync(join(tmpdir(), "x402-startup-preflight-order-"));
+    const pendingPath = join(directory, "pending.json");
+    const receiptPath = join(directory, "receipt.json");
+    const challenge = paymentChallenge({ token });
+    const required = paymentRequired([challenge]);
+    const events: string[] = [];
+    let fetchCount = 0;
+    try {
+      const result = await runStartup({
+        endpoint: ENDPOINT,
+        receiptPath,
+        pendingPath,
+        env: {
+          X402_SELLER_WALLET: SELLER,
+          X402_PAYMENT_TOKEN: token,
+          BSC_RPC_URL: "https://rpc.invalid",
+        },
+        dependencies: {
+          loadContext: async () => {
+            events.push("context");
+            return { symbols: ["AAPL"] };
+          },
+          loadWallet: async () => {
+            events.push("decrypt");
+            return wallet;
+          },
+          createPermit2AllowanceReader: (rpcUrl, address, selectedToken) => {
+            events.push(`reader:${selectedToken}`);
+            assert.equal(rpcUrl, "https://rpc.invalid");
+            assert.equal(address, wallet.address);
+            assert.equal(selectedToken, token);
+            return async () => {
+              events.push("allowance");
+              return 50n * 10n ** 18n;
+            };
+          },
+          buildPaymentProof: async (signingWallet, selectedChallenge) => {
+            events.push(`sign:${token}`);
+            assert.equal(signingWallet, wallet);
+            assert.equal(selectedChallenge.accepted.asset, PAYMENT_TOKENS[token].asset);
+            return permit2Proof(challenge);
+          },
+          fetch: async (_input, init) => {
+            fetchCount += 1;
+            events.push(fetchCount === 1 ? "fetch:challenge" : "fetch:create");
+            if (fetchCount === 1) {
+              assert.equal(new Headers(init?.headers).has("PAYMENT-SIGNATURE"), false);
+              return json(
+                { paymentRequired: required },
+                {
+                  status: 402,
+                  headers: { "PAYMENT-REQUIRED": base64Json(required) },
+                },
+              );
+            }
+            assert.equal(existsSync(pendingPath), true);
+            assert.equal(
+              new Headers(init?.headers).get("PAYMENT-SIGNATURE"),
+              permit2Proof(challenge),
+            );
+            return json(receipt(), { status: 202 });
+          },
+          log: () => undefined,
+        },
+      });
+
+      assert.equal(result.receipt.jobId, JOB_ID);
+      assert.deepEqual(events, [
+        "context",
+        "decrypt",
+        `reader:${token}`,
+        "allowance",
+        "fetch:challenge",
+        `sign:${token}`,
+        "fetch:create",
+      ]);
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  }
+});
+
+test("real CLI startup leaves U and USD1 challenge-first flow unchanged", async () => {
+  const runStartup = runAsyncStartup();
+  const wallet = { address: "0x3333333333333333333333333333333333333333" } as Wallet;
+
+  for (const token of ["U", "USD1"] as const) {
+    const directory = mkdtempSync(join(tmpdir(), "x402-startup-eip3009-order-"));
+    const pendingPath = join(directory, "pending.json");
+    const receiptPath = join(directory, "receipt.json");
+    const challenge = paymentChallenge({ token });
+    const required = paymentRequired([challenge]);
+    const events: string[] = [];
+    let fetchCount = 0;
+    try {
+      await runStartup({
+        endpoint: ENDPOINT,
+        receiptPath,
+        pendingPath,
+        env: {
+          X402_SELLER_WALLET: SELLER,
+          X402_PAYMENT_TOKEN: token,
+        },
+        dependencies: {
+          loadContext: async () => {
+            events.push("context");
+            return { symbols: ["AAPL"] };
+          },
+          loadWallet: async () => {
+            events.push("decrypt");
+            return wallet;
+          },
+          createPermit2AllowanceReader: () => {
+            events.push("reader");
+            throw new Error("EIP-3009 must not construct a Permit2 reader");
+          },
+          buildPaymentProof: async (signingWallet) => {
+            events.push("sign");
+            assert.equal(signingWallet, wallet);
+            return eip3009Proof(challenge);
+          },
+          fetch: async () => {
+            fetchCount += 1;
+            events.push(fetchCount === 1 ? "fetch:challenge" : "fetch:create");
+            if (fetchCount === 1) {
+              return json(
+                { paymentRequired: required },
+                {
+                  status: 402,
+                  headers: { "PAYMENT-REQUIRED": base64Json(required) },
+                },
+              );
+            }
+            return json(receipt(), { status: 202 });
+          },
+          log: () => undefined,
+        },
+      });
+      assert.deepEqual(events, [
+        "context",
+        "fetch:challenge",
+        "decrypt",
+        "sign",
+        "fetch:create",
+      ]);
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  }
+});
+
+test("pending-only startup ignores current payment env and resubmits the identical proof", async () => {
+  const runStartup = runAsyncStartup();
+  const directory = mkdtempSync(join(tmpdir(), "x402-startup-pending-recovery-"));
+  const pendingPath = join(directory, "pending.json");
+  const receiptPath = join(directory, "receipt.json");
+  const challenge = paymentChallenge({ token: "USDC" });
+  const proof = permit2Proof(challenge);
+  const request = { symbols: ["AAPL"], analysis_type: "comprehensive" };
+  const pending = createPendingRecord(proof, request);
+  persistPendingCreate(pendingPath, pending);
+  let submittedProof = "";
+  let submittedBody = "";
+  try {
+    const result = await runStartup({
+      endpoint: ENDPOINT,
+      receiptPath,
+      pendingPath,
+      env: {
+        X402_PAYMENT_TOKEN: "changed-invalid-value",
+        BSC_RPC_URL: "not a URL",
+      },
+      dependencies: {
+        loadContext: async () => {
+          throw new Error("recovery must not load context");
+        },
+        loadWallet: async () => {
+          throw new Error("recovery must not decrypt");
+        },
+        createPermit2AllowanceReader: () => {
+          throw new Error("recovery must not preflight");
+        },
+        buildPaymentProof: async () => {
+          throw new Error("recovery must not sign");
+        },
+        fetch: async (_input, init) => {
+          submittedProof = new Headers(init?.headers).get("PAYMENT-SIGNATURE") ?? "";
+          submittedBody = String(init?.body);
+          return json(receipt(), { status: 202 });
+        },
+        log: () => undefined,
+      },
+    });
+    assert.equal(result.receipt.jobId, JOB_ID);
+    assert.equal(submittedProof, proof);
+    assert.equal(submittedBody, JSON.stringify(request));
+    assert.equal(loadPendingCreate(pendingPath).paymentProof, proof);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("receipt and pending recovery ignores current payment env and reuses proof during settling", async () => {
+  const runStartup = runAsyncStartup();
+  const directory = mkdtempSync(join(tmpdir(), "x402-startup-receipt-recovery-"));
+  const pendingPath = join(directory, "pending.json");
+  const receiptPath = join(directory, "receipt.json");
+  const challenge = paymentChallenge({ token: "USDT" });
+  const proof = permit2Proof(challenge);
+  const pending = bindPendingToJob(
+    createPendingRecord(proof, { symbols: ["AAPL"] }),
+    JOB_ID,
+    JOB_TOKEN,
+  );
+  persistPendingCreate(pendingPath, pending);
+  persistAsyncJobReceipt(receiptPath, receipt({ status: "settling" }));
+  let startupFetches = 0;
+  try {
+    const startup = await runStartup({
+      endpoint: ENDPOINT,
+      receiptPath,
+      pendingPath,
+      env: {
+        X402_PAYMENT_TOKEN: "changed-invalid-value",
+        BSC_RPC_URL: "not a URL",
+      },
+      dependencies: {
+        loadWallet: async () => {
+          throw new Error("recovery must not decrypt");
+        },
+        createPermit2AllowanceReader: () => {
+          throw new Error("recovery must not preflight");
+        },
+        buildPaymentProof: async () => {
+          throw new Error("recovery must not sign");
+        },
+        fetch: async () => {
+          startupFetches += 1;
+          throw new Error("receipt startup must not fetch");
+        },
+        log: () => undefined,
+      },
+    });
+    assert.equal(startupFetches, 0);
+    assert.equal(loadPendingCreate(pendingPath).paymentProof, proof);
+
+    const clock = fakeClock(Date.now());
+    const submittedProofs: Array<string | null> = [];
+    let jobReads = 0;
+    const completed = await pollAsyncAnalysisWithPendingRecovery(
+      ENDPOINT,
+      startup.receipt,
+      pendingPath,
+      receiptPath,
+      async (input, init) => {
+        if (String(input).endsWith("/x402/analyze/async")) {
+          submittedProofs.push(new Headers(init?.headers).get("PAYMENT-SIGNATURE"));
+          return json(receipt({ status: "queued" }), { status: 202 });
+        }
+        jobReads += 1;
+        if (jobReads <= 2) {
+          return json(status("settling"), {
+            headers: { "Retry-After": "1" },
+          });
+        }
+        return json(status("succeeded", {
+          downloadUrl: REPORT_URL,
+          downloadUrlExpiresAt: EXPIRES_AT - 1,
+        }));
+      },
+      {
+        ...clock,
+        timeoutMs: 10_000,
+        defaultPollMilliseconds: 1_000,
+        settlingRecoveryMilliseconds: 1_000,
+      },
+      { ...clock, maxAttempts: 1 },
+    );
+    assert.equal(completed.status, "succeeded");
+    assert.deepEqual(submittedProofs, [proof]);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
   }
 });
 
