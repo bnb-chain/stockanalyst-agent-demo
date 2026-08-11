@@ -12,26 +12,31 @@ TypeScript buyer client for the [Stock Analysis Agent](../stockanalyst/README.md
 | USDT | `0x55d398326f99059fF775485246999027B3197955` | `permit2-exact` | 0.21 USDT |
 
 B402 capabilities may be partial. The client validates the live supported
-subset and fails closed if the selected token is absent. For
-`permit2-exact`, `spenderAddress` comes from the live B402 capability and is
-signed into the proof. The ERC-20 token allowance targets canonical Permit2
-`0x000000000022D473030F116dDEE9F6B43aC78BA3`, never that dynamic spender.
+subset and fails closed if the selected token is absent. `extra.signerAddress`
+is facilitator EOA metadata; it is not the Permit2 spender and is not part of
+`permit2-exact` typed data. `extra.spenderAddress` is the live B402 proxy and
+the `permit2-exact` typed-data spender; the ERC-20 approval target remains
+canonical Permit2 `0x000000000022D473030F116dDEE9F6B43aC78BA3`.
 
 Use the explicit `npm run x402:allowance`, `npm run x402:approve`, and
-`npm run x402:revoke` commands with `-- USDC` or `-- USDT`. Approval requires
-the exact interactive answer `yes` unless `--yes` was passed, resets a
-differing nonzero allowance to zero, and then sets exactly 50 tokens. Revoke
-sets zero. A 50-token allowance covers 238 complete 0.21 payments and leaves
-0.02 token. `BSC_RPC_URL` is used only for USDC/USDT allowance reads,
+`npm run x402:revoke` commands with `-- USDC` or `-- USDT`. Both approve and
+revoke require confirmation; `--yes` is an explicit noninteractive bypass.
+Approval resets a differing nonzero allowance to zero and then sets exactly 50
+tokens. Revoke sets zero. A 50-token allowance covers 238 complete 0.21
+payments and leaves 0.02 token. `BSC_RPC_URL` is used only for USDC/USDT allowance reads,
 approval/revoke, and paid preflight; U/USD1 and local signing do not use it.
 `npm run x402:async` never approves or revokes; it only checks that the
 existing allowance is within the inclusive 0.21-to-50 safety range.
 
-Promotional mode exposes only U and USD1; USDC and USDT are excluded. The
-proofless promo branch never approves. The async client persists the exact
-proof before its first paid submission, so a pending Permit2 settlement is
-resumed with the same proof after an ambiguous response or restart; it never
-signs a replacement proof for that job. See
+In promotional mode, `paymentRequired=false` and the active `accepts=[]`;
+`supportedAssets` may still list all four tokens as registry metadata and is
+not an active payment requirement. There is no USDC/USDT promotional proof,
+B402 verify/settle, or automatic approval. On a genuinely new CLI run with
+`X402_PAYMENT_TOKEN=USDC` or `USDT`, the zero-POST safety policy may perform a
+read-only Permit2 preflight before discovering the proofless promotional
+response; it still performs no approval. Permit2 recovery is settle-only and
+reuses the exact same persisted proof; it does not call `/verify` again and
+creates no new signature, nonce, or approval. See
 [`docs/x402-api-usage.md`](../docs/x402-api-usage.md) for the complete API flow.
 
 | Tier | Command | Cost | Settlement | Report | Speed |

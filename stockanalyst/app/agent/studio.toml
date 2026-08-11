@@ -35,6 +35,37 @@ runtime_arn = "arn:aws:bedrock-agentcore:us-east-1:201243086760:runtime/stockana
 # Public mainnet x402 gateway base; clients append /x402/* routes.
 #   X402_GATEWAY_PUBLIC_BASE_URL=https://stock-agent.bnbchain.org
 
+# Names-only contract for the protected runtime environment. Values remain in
+# the deployment secret and are never recorded in this tracked file.
+# BEGIN RUNTIME SECRET NAME CONTRACT
+# runtime-secret-name: ALPHA_VANTAGE_API_KEY
+# runtime-secret-name: B402_ACCESS_TOKEN
+# runtime-secret-name: B402_BASE_URL
+# runtime-secret-name: B402_CLIENT_ID
+# runtime-secret-name: B402_PAY_TO_ADDRESS
+# runtime-secret-name: B402_PRIVATE_KEY
+# runtime-secret-name: COMPETITION_AI_CALLS_URL
+# runtime-secret-name: COMPETITION_INTERNAL_TOKEN
+# runtime-secret-name: DELIVERABLE_PUBLIC_BASE
+# runtime-secret-name: DELIVERABLE_S3_BUCKET
+# runtime-secret-name: DELIVERABLE_S3_PREFIX
+# runtime-secret-name: GNEWS_API_KEY
+# runtime-secret-name: OAUTH_SCOPE
+# runtime-secret-name: OAUTH_TOKEN_URL
+# runtime-secret-name: OPENROUTER_API_KEY
+# runtime-secret-name: U_TOKEN_DOMAIN_NAME
+# runtime-secret-name: U_TOKEN_DOMAIN_VERSION
+# runtime-secret-name: WALLET_KEYSTORE_JSON
+# runtime-secret-name: WALLET_PASSWORD
+# runtime-secret-name: X402_ASYNC_ACCEPT_NEW_JOBS
+# runtime-secret-name: X402_CHAIN_ID
+# runtime-secret-name: X402_JOB_S3_BUCKET
+# runtime-secret-name: X402_JOB_S3_PREFIX
+# runtime-secret-name: X402_JOB_TOKEN_SECRET
+# runtime-secret-name: X402_PROMO_FREE_MODE
+# runtime-secret-name: X402_TOKEN_ADDRESS
+# END RUNTIME SECRET NAME CONTRACT
+
 [wallet]
 # Local keystore signer. The Agent is the SOLE key-holder/signer.
 # The keystore lives at the WORKSPACE root — outside app/agent (the AgentCore
@@ -103,11 +134,11 @@ allowed_hosts = ["llm.pieverse.io"]
 
 [payments.x402.seller]
 # x402 / Binance Pay seller channel — alternative to ERC-8183 for lower-friction
-# payments. Exposes durable asynchronous jobs; buyers pay with a signed EIP-3009
-# authorization and poll with a private job token.
+# payments. Exposes durable asynchronous jobs; buyers pay with EIP-3009 for
+# U/USD1 or Permit2 exact for USDC/USDT and poll with a private job token.
 # Payment verification is FIXED CODE in x402_verify.py — never LLM-callable.
 enabled = true
-price_wei = "210000000000000000"       # exact 0.21 U or USD1 (18 decimals)
+price_wei = "210000000000000000"       # exact 0.21 selected token (18 decimals)
 min_price_wei = "210000000000000000"   # 0.21-token floor
 endpoint = "/x402/analyze/async"
 # Price info:  GET /x402/price
@@ -151,10 +182,19 @@ public = true
 # USD1: 0x8d0D000Ee44948FC98c9B98A4FA4921476f08B0d
 #       domain "World Liberty Financial USD", version "1", 18 decimals,
 #       exact amount 0.21 USD1
-# Paid requirements use a valid signerAddress and B402 settlement.
+# USDC: 0x8AC76a51cc950d9822D68b83fE1Ad97B32Cd580d
+#       domain "USD Coin", version "2", 18 decimals, permit2-exact,
+#       exact amount 0.21 USDC
+# USDT: 0x55d398326f99059fF775485246999027B3197955
+#       domain "Tether USD", version "1", 18 decimals, permit2-exact,
+#       exact amount 0.21 USDT
+# Paid requirements use a valid signerAddress and B402 settlement. The signer
+# is facilitator EOA metadata, while the live spenderAddress is the B402 proxy
+# and Permit2 typed-data spender. ERC-20 approval still targets canonical
+# Permit2 0x000000000022D473030F116dDEE9F6B43aC78BA3.
 # Promotional access is proofless: paymentRequired=false, accepts=[],
-# and no payment proof is required; it never invokes B402 verify/settle.
-# USDC and USDT are deferred because their supported flow requires Permit2.
+# and no payment proof is required; it never invokes B402 verify/settle or
+# automatic approval. supportedAssets may still list all four registry entries.
 #
 # ── Promotional asynchronous access (manual production control) ───────────
 # Disabled by default. Enable or disable explicitly, then redeploy:
@@ -170,7 +210,7 @@ public = true
 #   bag env set U_TOKEN_DOMAIN_VERSION 1
 #
 # These legacy variables support older local integrations only. They cannot
-# add, replace, or override entries in the fixed U/USD1 registry above.
+# add, replace, or override entries in the fixed four-token registry above.
 #   bag env set X402_CHAIN_ID      56
 #   bag env set X402_TOKEN_ADDRESS 0xcE24439F2D9C6a2289F741120FE202248B666666
 #

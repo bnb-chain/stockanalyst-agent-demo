@@ -22,24 +22,32 @@ The public paid asynchronous API charges exactly 0.21 of the selected
 | USDT | `0x55d398326f99059fF775485246999027B3197955` | `permit2-exact` | 0.21 USDT |
 
 B402 capabilities may be partial, so a paid challenge contains only the live
-supported subset. For `permit2-exact`, `spenderAddress` comes from the live
-B402 capability and is signed into the payment proof. The ERC-20 token
-allowance targets canonical Permit2
-`0x000000000022D473030F116dDEE9F6B43aC78BA3`, not that dynamic spender.
+supported subset. `extra.signerAddress` is facilitator EOA metadata; it is not
+the Permit2 spender and is not part of `permit2-exact` typed data.
+`extra.spenderAddress` is the live B402 proxy and the `permit2-exact`
+typed-data spender; the ERC-20 approval target remains canonical Permit2
+`0x000000000022D473030F116dDEE9F6B43aC78BA3`.
 
 The explicit buyer commands are `npm run x402:allowance`,
 `npm run x402:approve`, and `npm run x402:revoke`, with `-- USDC` or
-`-- USDT`. Approval sets an exact 50-token cap and revoke sets zero. A 50-token
-allowance covers 238 complete 0.21 payments and leaves 0.02 token.
+`-- USDT`. Both approve and revoke require confirmation; `--yes` is an explicit
+noninteractive bypass. Approval sets an exact 50-token cap and revoke sets
+zero. A 50-token allowance covers 238 complete 0.21 payments and leaves 0.02
+token.
 `BSC_RPC_URL` is used only for USDC/USDT allowance reads, approval/revoke, and
 paid preflight; U/USD1 and local signing do not use it.
 `npm run x402:async` never approves or revokes; it checks the existing
 allowance before starting a new Permit2 payment.
 
-Promotional mode exposes only U and USD1; USDC and USDT are excluded. A
-promotional run is proofless and never approves. Durable recovery retains the
-original signed request: a pending Permit2 settlement is resumed with the same
-proof and never receives a replacement signature. The complete buyer and HTTP
+In promotional mode, `paymentRequired=false` and the active `accepts=[]`;
+`supportedAssets` may still list all four tokens as registry metadata and is
+not an active payment requirement. There is no USDC/USDT promotional proof,
+B402 verify/settle, or automatic approval. On a genuinely new CLI run with
+`X402_PAYMENT_TOKEN=USDC` or `USDT`, the zero-POST safety policy may perform a
+read-only Permit2 preflight before discovering the proofless promotional
+response; it still performs no approval. Permit2 recovery is settle-only and
+reuses the exact same persisted proof; it does not call `/verify` again and
+creates no new signature, nonce, or approval. The complete buyer and HTTP
 runbook is in [`docs/x402-api-usage.md`](../docs/x402-api-usage.md).
 
 ---
@@ -294,8 +302,8 @@ replace, or override this registry.
 `GET /x402/price` exposes the ordered four-token registry in `supportedAssets`.
 This field is capability metadata only. Paid `accepts` entries are the partial
 live B402-supported subset. In promotional mode, `paymentRequired` remains
-`false`, `accepts` remains empty, and only U/USD1 are eligible, so clients must
-not interpret `supportedAssets` as a payment request or try to sign it.
+`false` and `accepts` remains empty for every token, so clients must not
+interpret `supportedAssets` as a payment request or try to sign it.
 
 Promotional mode uses the same async route but sits outside the payment
 protocol. When `X402_PROMO_FREE_MODE=1`, callers POST directly without a wallet
@@ -891,8 +899,9 @@ bag deploy agent --force-deploy-broken-storage
 ### 主网 x402 促销模式
 
 公网 API Gateway 只发布 price、async create、私有 job status 和 resume 四个
-路由；`/x402/free` 仍已退役。买家可以用 `X402_PAYMENT_TOKEN=U`（默认）
-或 `X402_PAYMENT_TOKEN=USD1` 严格选择 token。U 的主网合约为
+路由；`/x402/free` 仍已退役。买家可以用 `X402_PAYMENT_TOKEN=U`（默认）、
+`X402_PAYMENT_TOKEN=USD1`、`X402_PAYMENT_TOKEN=USDC` 或
+`X402_PAYMENT_TOKEN=USDT` 严格选择 token。U 的主网合约为
 `0xcE24439F2D9C6a2289F741120FE202248B666666`，EIP-712 domain 名为
 `United Stables`；USD1 为 `0x8d0D000Ee44948FC98c9B98A4FA4921476f08B0d`，
 domain 名为 `World Liberty Financial USD`。两者 version 均为 `1`、均为 18 位
@@ -905,7 +914,7 @@ domain 名为 `World Liberty Financial USD`。两者 version 均为 `1`、均为
 
 `GET /x402/price` 始终通过 `supportedAssets` 按 U、USD1、USDC、USDT 顺序公布
 能力元数据。该字段只表示服务支持哪些资产，不是付款要求；实时 B402
-`accepts` 可以只包含其中一部分。促销模式下只允许 U/USD1，且
+`accepts` 可以只包含其中一部分。促销模式不发布任何 active accepts，
 `paymentRequired=false` 且 `accepts=[]` 保持不变，客户端不得把
 `supportedAssets` 当作支付结构或尝试签名。
 
@@ -921,9 +930,9 @@ bag env set X402_PROMO_FREE_MODE 0
 每次成功 POST 都创建新任务并消耗一次额度，相同请求的重试也不去重。限额是
 单 IP 滚动 24 小时内 30 次，且只保存在当前进程：重启会清空，多副本不共享。
 可信 IP 只来自 API Gateway `requestContext`，不接受请求头伪造的来源地址。
-促销模式只开放 U/USD1，明确排除 USDC/USDT。设回
-`X402_PROMO_FREE_MODE=0` 后恢复四 token 的 HTTP 402 付费流程；每次价格严格为所选
-token 的 0.21。
+促销模式对所有 token 都不发布付款要求或证明；`supportedAssets` 仍列出四 token，
+但只作为 registry 能力元数据。设回 `X402_PROMO_FREE_MODE=0` 后恢复四 token 的
+HTTP 402 付费流程；每次价格严格为所选 token 的 0.21。
 
 ### 为异步 x402 任务配置私有存储
 

@@ -25,28 +25,35 @@ Paid asynchronous analysis supports four fixed 18-decimal tokens at exactly
 | USDT | `0x55d398326f99059fF775485246999027B3197955` | `permit2-exact` | 0.21 USDT |
 
 B402 capabilities may be partial: the seller advertises only the supported
-subset returned by the live facilitator. For `permit2-exact`, `spenderAddress`
-comes from the live B402 capability and is signed into that payment proof. The
-token allowance instead targets canonical Permit2
-`0x000000000022D473030F116dDEE9F6B43aC78BA3`, never the dynamic spender.
+subset returned by the live facilitator. `extra.signerAddress` is facilitator
+EOA metadata; it is not the Permit2 spender and is not part of `permit2-exact`
+typed data. `extra.spenderAddress` is the live B402 proxy and the
+`permit2-exact` typed-data spender; the ERC-20 approval target remains
+canonical Permit2 `0x000000000022D473030F116dDEE9F6B43aC78BA3`.
 
 From `buyer-client/`, inspect and explicitly manage a USDC or USDT allowance
 with `npm run x402:allowance`, `npm run x402:approve`, and
 `npm run x402:revoke`; pass the token after `--`, for example
-`npm run x402:approve -- USDC`. Approval requires exact confirmation and sets
-an exact 50-token cap (resetting a differing nonzero allowance to zero first);
-revoke sets it to zero. A 50-token allowance covers 238 complete 0.21 payments
+`npm run x402:approve -- USDC`. Both approve and revoke require confirmation;
+`--yes` is an explicit noninteractive bypass. Approval sets an exact 50-token
+cap (resetting a differing nonzero allowance to zero first), while revoke sets
+it to zero. A 50-token allowance covers 238 complete 0.21 payments
 and leaves 0.02 token. `BSC_RPC_URL` is used only for USDC/USDT allowance
 reads, approval/revoke, and paid preflight; U/USD1 and local signing do not use
 it. `npm run x402:async` never approves or revokes: it only checks that a
 Permit2 allowance is between 0.21 and 50 before a new paid flow.
 
-Promotional mode exposes only U and USD1; USDC and USDT are excluded. A
-proofless promotional `npm run x402:async` never approves. For paid recovery,
-the exact proof and request are persisted before submission; a pending Permit2
-settlement is resumed with the same proof after retry or restart and is never
-re-signed. See [the x402 API usage guide](docs/x402-api-usage.md) for the HTTP
-contract, selection rules, and recovery details.
+In promotional mode, `paymentRequired=false` and the active `accepts=[]`;
+`supportedAssets` may still list all four tokens as registry metadata and is
+not an active payment requirement. There is no USDC/USDT promotional proof,
+B402 verify/settle, or automatic approval. On a genuinely new CLI run with
+`X402_PAYMENT_TOKEN=USDC` or `USDT`, the zero-POST safety policy may perform a
+read-only Permit2 preflight before discovering the proofless promotional
+response; it still performs no approval. Permit2 recovery is settle-only and
+reuses the exact same persisted proof; it does not call `/verify` again and
+creates no new signature, nonce, or approval. See
+[the x402 API usage guide](docs/x402-api-usage.md) for the HTTP contract,
+selection rules, and recovery details.
 
 Three ways to pay — pick the one that fits your use case:
 

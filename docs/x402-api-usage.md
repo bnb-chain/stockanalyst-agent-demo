@@ -23,10 +23,11 @@ amount, network, and metadata match this table. Do not synthesize a missing
 requirement or fall back to another token silently.
 
 U and USD1 use EIP-3009 `TransferWithAuthorization`. USDC and USDT use
-`permit2-exact`: `spenderAddress` comes from the live B402 capability and must
-be copied into and signed with the returned requirement. This dynamic spender
-is not the ERC-20 approval target. The token allowance always targets canonical
-Permit2 `0x000000000022D473030F116dDEE9F6B43aC78BA3`.
+`permit2-exact`. `extra.signerAddress` is facilitator EOA metadata; it is not
+the Permit2 spender and is not part of `permit2-exact` typed data.
+`extra.spenderAddress` is the live B402 proxy and the `permit2-exact`
+typed-data spender; the ERC-20 approval target remains canonical Permit2
+`0x000000000022D473030F116dDEE9F6B43aC78BA3`.
 
 ## Explicit Permit2 allowance management
 
@@ -44,8 +45,8 @@ npm run x402:revoke -- USDC
 ```
 
 The three scripts are `npm run x402:allowance`, `npm run x402:approve`, and
-`npm run x402:revoke`. Approval requires typing exactly `yes` unless the
-operator explicitly supplies `--yes`. A differing nonzero allowance is first
+`npm run x402:revoke`. Both approve and revoke require confirmation; `--yes` is
+an explicit noninteractive bypass. A differing nonzero allowance is first
 reset to zero and then set to exactly 50 tokens; revoke sets exactly zero. A
 50-token allowance covers 238 complete 0.21 payments and leaves 0.02 token.
 Values below 0.21 or above 50 fail the paid preflight.
@@ -69,9 +70,10 @@ needed.
    private job token. Neither proof, signature, job token, nor private report
    URL is printed.
 
-If a POST response is lost or a process restarts, the pending Permit2
-settlement is resumed with the same proof, nonce, requirement metadata, and
-request body. The client does not sign a replacement authorization. Pending
+If a POST response is lost or a process restarts, Permit2 recovery is
+settle-only and reuses the exact same persisted proof; it does not call
+`/verify` again and creates no new signature, nonce, or approval. The proof
+includes the original requirement metadata and request body. Pending
 and receipt recovery also run before current token/RPC configuration is read,
 so recovery is not blocked by a later environment change. A stale lock may be
 removed only after confirming no async client process is running; never delete
@@ -79,12 +81,15 @@ the pending record merely to bypass recovery.
 
 ## Promotional mode
 
-Promotional mode exposes only U and USD1; USDC and USDT are excluded. With
-`X402_PROMO_FREE_MODE=1`, a create can return HTTP 202 without a wallet or
-`Payment-Signature`; it never invokes B402 verify/settle, Permit2, RPC, or a
-chain write. The `npm run x402:async` promotional path never approves.
-`supportedAssets` remains capability metadata and must not be interpreted as a
-payment requirement when `paymentRequired=false` and `accepts=[]`.
+In promotional mode, `paymentRequired=false` and the active `accepts=[]`;
+`supportedAssets` may still list all four tokens as registry metadata and is
+not an active payment requirement. There is no USDC/USDT promotional proof,
+B402 verify/settle, or automatic approval. With `X402_PROMO_FREE_MODE=1`, a
+create returns HTTP 202 without a wallet or `Payment-Signature` and performs no
+chain write. On a genuinely new CLI run with `X402_PAYMENT_TOKEN=USDC` or
+`USDT`, the zero-POST safety policy may perform a read-only Permit2 preflight
+before discovering the proofless promotional response; it still performs no
+approval.
 
 The promotional quota is 30 accepted creates per trusted IP in a rolling 24
 hours and is process-local. Restarts clear it and replicas do not share it.

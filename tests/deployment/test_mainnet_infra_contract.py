@@ -1,9 +1,12 @@
 import ast
+import hashlib
+import json
 from pathlib import Path
 import re
 from tempfile import TemporaryDirectory
 import tomllib
 import unittest
+import yaml
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -35,6 +38,11 @@ PUBLIC_FOUR_TOKEN_DOCUMENTS = (
     BUYER_README,
     X402_API_USAGE,
 )
+TRACKED_X402_GUIDANCE = (
+    *PUBLIC_FOUR_TOKEN_DOCUMENTS,
+    BUYER_ENV,
+    STUDIO,
+)
 PAID_TOKEN_TABLE = """| Token | BSC address | Method | Price |
 | --- | --- | --- | --- |
 | U | `0xcE24439F2D9C6a2289F741120FE202248B666666` | `eip3009` | 0.21 U |
@@ -42,7 +50,7 @@ PAID_TOKEN_TABLE = """| Token | BSC address | Method | Price |
 | USDC | `0x8AC76a51cc950d9822D68b83fE1Ad97B32Cd580d` | `permit2-exact` | 0.21 USDC |
 | USDT | `0x55d398326f99059fF775485246999027B3197955` | `permit2-exact` | 0.21 USDT |"""
 CANONICAL_PERMIT2 = "0x000000000022D473030F116dDEE9F6B43aC78BA3"
-RUNTIME_SECRET_NAMES = frozenset(
+EXPECTED_RUNTIME_SECRET_NAMES = frozenset(
     {
         "ALPHA_VANTAGE_API_KEY",
         "B402_ACCESS_TOKEN",
@@ -72,51 +80,60 @@ RUNTIME_SECRET_NAMES = frozenset(
         "X402_TOKEN_ADDRESS",
     }
 )
-INFRASTRUCTURE_RESOURCE_IDS = {
-    ROOT / "infra" / "agentcore-mainnet-fixed-egress.yaml": frozenset(
-        {
-            "EgressElasticIp",
-            "PrivateSubnet",
-            "NatGateway",
-            "PrivateRouteTable",
-            "PrivateDefaultRoute",
-            "PrivateSubnetRouteTableAssociation",
-            "RuntimeSecurityGroup",
-            "S3GatewayEndpoint",
-        }
+INFRASTRUCTURE_RESOURCE_TYPES = {
+    ROOT / "infra" / "agentcore-mainnet-fixed-egress.yaml": {
+        "EgressElasticIp": "AWS::EC2::EIP",
+        "PrivateSubnet": "AWS::EC2::Subnet",
+        "NatGateway": "AWS::EC2::NatGateway",
+        "PrivateRouteTable": "AWS::EC2::RouteTable",
+        "PrivateDefaultRoute": "AWS::EC2::Route",
+        "PrivateSubnetRouteTableAssociation": "AWS::EC2::SubnetRouteTableAssociation",
+        "RuntimeSecurityGroup": "AWS::EC2::SecurityGroup",
+        "S3GatewayEndpoint": "AWS::EC2::VPCEndpoint",
+    },
+    ROOT / "infra" / "stockanalyst-mainnet-prereqs.yaml": {
+        "MainnetJobBucket": "AWS::S3::Bucket",
+        "MainnetJobTokenSecret": "AWS::SecretsManager::Secret",
+        "MainnetRuntimeRole": "AWS::IAM::Role",
+        "MainnetGatewayLambdaRole": "AWS::IAM::Role",
+    },
+    ROOT / "infra" / "x402-lambda-gateway.yaml": {
+        "X402Api": "AWS::Serverless::Api",
+        "X402CustomDomain": "AWS::ApiGateway::DomainName",
+        "X402CustomDomainMapping": "AWS::ApiGateway::BasePathMapping",
+        "X402Adapter": "AWS::Serverless::Function",
+        "X402ApiInvokePermission": "AWS::Lambda::Permission",
+        "X402ApiAccessLogGroup": "AWS::Logs::LogGroup",
+        "X402AdapterLogGroup": "AWS::Logs::LogGroup",
+        "X402Gateway5xxMetric": "AWS::Logs::MetricFilter",
+        "X402WebAcl": "AWS::WAFv2::WebACL",
+        "X402WebAclAssociation": "AWS::WAFv2::WebACLAssociation",
+        "X402LambdaErrors": "AWS::CloudWatch::Alarm",
+        "X402LambdaThrottles": "AWS::CloudWatch::Alarm",
+        "X402ApiServerErrors": "AWS::CloudWatch::Alarm",
+    },
+}
+# SHA-256 of each parsed Resources mapping after canonical JSON serialization.
+# This freezes every existing resource property/reference while ignoring YAML
+# presentation and comments, so documentation-only payment changes cannot
+# silently mutate the deployment graph.
+INFRASTRUCTURE_RESOURCE_GRAPH_SHA256 = {
+    ROOT / "infra" / "agentcore-mainnet-fixed-egress.yaml": (
+        "5d05d012df86c8866563c59e26718f9b884d3d5cbb11595a46efd4bc7325119f"
     ),
-    ROOT / "infra" / "stockanalyst-mainnet-prereqs.yaml": frozenset(
-        {
-            "MainnetJobBucket",
-            "MainnetJobTokenSecret",
-            "MainnetRuntimeRole",
-            "MainnetGatewayLambdaRole",
-        }
+    ROOT / "infra" / "stockanalyst-mainnet-prereqs.yaml": (
+        "897c991179ebc4ac87391409f9deb284da6f01c77d323cbcdea812275dfb69ab"
     ),
-    ROOT / "infra" / "x402-lambda-gateway.yaml": frozenset(
-        {
-            "X402Api",
-            "X402CustomDomain",
-            "X402CustomDomainMapping",
-            "X402Adapter",
-            "X402ApiInvokePermission",
-            "X402ApiAccessLogGroup",
-            "X402AdapterLogGroup",
-            "X402Gateway5xxMetric",
-            "X402WebAcl",
-            "X402WebAclAssociation",
-            "X402LambdaErrors",
-            "X402LambdaThrottles",
-            "X402ApiServerErrors",
-        }
+    ROOT / "infra" / "x402-lambda-gateway.yaml": (
+        "bfb2583f1768bc553d849d1ed0558913648da8b433139bee61f5911ea296da92"
     ),
 }
-X402_GATEWAY_ROUTES = frozenset(
+X402_GATEWAY_ROUTE_METHODS = frozenset(
     {
-        "/x402/price",
-        "/x402/analyze/async",
-        "/x402/jobs/{jobId}",
-        "/x402/jobs/{jobId}/resume",
+        ("/x402/price", "get"),
+        ("/x402/analyze/async", "post"),
+        ("/x402/jobs/{jobId}", "get"),
+        ("/x402/jobs/{jobId}/resume", "post"),
     }
 )
 LIVE_PUBLIC_X402_DOCUMENTS = (
@@ -200,9 +217,48 @@ def forbidden_x402_dependency_imports(source: str) -> list[str]:
     return sorted(forbidden)
 
 
-def cloudformation_resource_ids(source: str) -> frozenset[str]:
-    resources = source.partition("\nResources:\n")[2].partition("\nOutputs:\n")[0]
-    return frozenset(re.findall(r"(?m)^  ([A-Za-z0-9]+):$", resources))
+class CloudFormationLoader(yaml.SafeLoader):
+    pass
+
+
+def _construct_cloudformation_tag(
+    loader: CloudFormationLoader,
+    tag_suffix: str,
+    node: yaml.Node,
+) -> dict[str, object]:
+    if isinstance(node, yaml.ScalarNode):
+        value: object = loader.construct_scalar(node)
+    elif isinstance(node, yaml.SequenceNode):
+        value = loader.construct_sequence(node)
+    else:
+        value = loader.construct_mapping(node)
+    key = "Ref" if tag_suffix == "Ref" else f"Fn::{tag_suffix}"
+    return {key: value}
+
+
+CloudFormationLoader.add_multi_constructor("!", _construct_cloudformation_tag)
+
+
+def load_cloudformation(path: Path) -> dict[str, object]:
+    document = yaml.load(path.read_text(encoding="utf-8"), Loader=CloudFormationLoader)
+    if not isinstance(document, dict):
+        raise AssertionError(f"CloudFormation document is not a mapping: {path}")
+    return document
+
+
+def declared_runtime_secret_names(studio: str) -> list[str]:
+    block = re.search(
+        r"(?ms)^# BEGIN RUNTIME SECRET NAME CONTRACT$\n"
+        r"(?P<names>(?:# runtime-secret-name: [A-Z0-9_]+\n)+)"
+        r"^# END RUNTIME SECRET NAME CONTRACT$",
+        studio,
+    )
+    if block is None:
+        return []
+    return re.findall(
+        r"(?m)^# runtime-secret-name: ([A-Z0-9_]+)$",
+        block.group("names"),
+    )
 
 
 class MainnetInfrastructureContractTests(unittest.TestCase):
@@ -214,7 +270,6 @@ class MainnetInfrastructureContractTests(unittest.TestCase):
                 normalized = " ".join(documentation.split())
                 self.assertIn(PAID_TOKEN_TABLE, documentation)
                 for required in (
-                    "`spenderAddress` comes from the live B402 capability",
                     f"canonical Permit2 `{CANONICAL_PERMIT2}`",
                     "A 50-token allowance covers 238 complete 0.21 payments and leaves 0.02 token.",
                     "`npm run x402:allowance`",
@@ -222,17 +277,42 @@ class MainnetInfrastructureContractTests(unittest.TestCase):
                     "`npm run x402:revoke`",
                     "`BSC_RPC_URL` is used only for USDC/USDT",
                     "`npm run x402:async` never approves or revokes",
-                    "Promotional mode exposes only U and USD1; USDC and USDT are excluded.",
-                    "pending Permit2 settlement is resumed with the same proof",
                     "B402 capabilities may be partial",
+                    "`extra.signerAddress` is facilitator EOA metadata; it is not the Permit2 spender and is not part of `permit2-exact` typed data.",
+                    f"`extra.spenderAddress` is the live B402 proxy and the `permit2-exact` typed-data spender; the ERC-20 approval target remains canonical Permit2 `{CANONICAL_PERMIT2}`.",
+                    "Permit2 recovery is settle-only and reuses the exact same persisted proof; it does not call `/verify` again and creates no new signature, nonce, or approval.",
+                    "Both approve and revoke require confirmation; `--yes` is an explicit noninteractive bypass.",
+                    "In promotional mode, `paymentRequired=false` and the active `accepts=[]`; `supportedAssets` may still list all four tokens as registry metadata and is not an active payment requirement.",
+                    "There is no USDC/USDT promotional proof, B402 verify/settle, or automatic approval.",
                 ):
                     self.assertIn(required, normalized)
 
+    def test_tracked_guidance_rejects_stale_or_unsafe_payment_advice(self) -> None:
+        for path in TRACKED_X402_GUIDANCE:
+            with self.subTest(path=path.relative_to(ROOT)):
+                documentation = " ".join(path.read_text(encoding="utf-8").split())
+                for forbidden in (
+                    r"(?i)USDC(?:/| and )USDT.{0,80}(?:defer|暂缓)",
+                    r"(?i)(?:only|strict).{0,24}U.{0,16}(?:or|/).{0,16}USD1",
+                    r"(?i)fixed U/USD1(?:\s+mainnet)? registry",
+                    r"买家可以用\s+`X402_PAYMENT_TOKEN=U`（默认）\s+或\s+`X402_PAYMENT_TOKEN=USD1`\s+严格选择",
+                    r"(?i)approve MaxUint(?:256)?",
+                    r"(?i)approve unlimited",
+                    r"(?i)set an unlimited allowance",
+                    r"(?i)automatic Permit2 approval",
+                    r"(?i)(?<!never )automatically approves Permit2",
+                ):
+                    self.assertNotRegex(documentation, forbidden)
+
     def test_runtime_secret_name_contract_remains_the_existing_26_names(self) -> None:
-        self.assertEqual(len(RUNTIME_SECRET_NAMES), 26)
-        self.assertNotIn("BSC_RPC_URL", RUNTIME_SECRET_NAMES)
+        declared = declared_runtime_secret_names(STUDIO.read_text(encoding="utf-8"))
+
+        self.assertEqual(len(declared), 26)
+        self.assertEqual(len(declared), len(set(declared)))
+        self.assertEqual(frozenset(declared), EXPECTED_RUNTIME_SECRET_NAMES)
+        self.assertNotIn("BSC_RPC_URL", declared)
         self.assertFalse(
-            RUNTIME_SECRET_NAMES.intersection(
+            EXPECTED_RUNTIME_SECRET_NAMES.intersection(
                 {
                     "PERMIT2_ADDRESS",
                     "PERMIT2_SPENDER_ADDRESS",
@@ -243,23 +323,126 @@ class MainnetInfrastructureContractTests(unittest.TestCase):
         )
 
     def test_permit2_adds_no_infrastructure_resources_or_routes(self) -> None:
-        combined_templates = ""
-        for path, expected_resources in INFRASTRUCTURE_RESOURCE_IDS.items():
+        templates: dict[Path, dict[str, object]] = {}
+        for path, expected_types in INFRASTRUCTURE_RESOURCE_TYPES.items():
             with self.subTest(path=path.relative_to(ROOT)):
-                source = path.read_text(encoding="utf-8")
-                combined_templates += source
-                self.assertEqual(cloudformation_resource_ids(source), expected_resources)
+                template = load_cloudformation(path)
+                templates[path] = template
+                resources = template["Resources"]
+                self.assertIsInstance(resources, dict)
+                self.assertEqual(
+                    {name: resource["Type"] for name, resource in resources.items()},
+                    expected_types,
+                )
+                canonical_resources = json.dumps(
+                    resources,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    ensure_ascii=True,
+                ).encode("utf-8")
+                self.assertEqual(
+                    hashlib.sha256(canonical_resources).hexdigest(),
+                    INFRASTRUCTURE_RESOURCE_GRAPH_SHA256[path],
+                )
 
-        self.assertNotRegex(
-            combined_templates,
-            r"(?i)permit2|BSC_RPC_URL|redis|dynamodb|database",
+        gateway = templates[ROOT / "infra" / "x402-lambda-gateway.yaml"]
+        gateway_resources = gateway["Resources"]
+        api = gateway_resources["X402Api"]["Properties"]
+        paths = api["DefinitionBody"]["paths"]
+        self.assertEqual(
+            frozenset(
+                (path, method)
+                for path, methods in paths.items()
+                for method in methods
+            ),
+            X402_GATEWAY_ROUTE_METHODS,
         )
-        gateway = (ROOT / "infra" / "x402-lambda-gateway.yaml").read_text(
-            encoding="utf-8"
+        adapter = gateway_resources["X402Adapter"]["Properties"]
+        self.assertEqual(
+            {
+                "Runtime": adapter["Runtime"],
+                "Handler": adapter["Handler"],
+                "CodeUri": adapter["CodeUri"],
+                "AutoPublishAlias": adapter["AutoPublishAlias"],
+                "Role": adapter["Role"],
+                "Environment": adapter["Environment"],
+            },
+            {
+                "Runtime": "python3.13",
+                "Handler": "handler.lambda_handler",
+                "CodeUri": "../gateway/x402_lambda/src",
+                "AutoPublishAlias": "live",
+                "Role": {"Ref": "LambdaExecutionRoleArn"},
+                "Environment": {
+                    "Variables": {
+                        "AGENTCORE_INVOKE_URL": {"Ref": "AgentCoreInvokeUrl"},
+                        "OAUTH_SECRET_ARN": {"Ref": "OAuthSecretArn"},
+                        "X402_CUSTOM_DOMAIN_NAME": {"Ref": "CustomDomainName"},
+                    }
+                },
+            },
+        )
+        self.assertNotIn("Policies", adapter)
+        self.assertNotIn("VpcConfig", adapter)
+
+        prereqs = templates[ROOT / "infra" / "stockanalyst-mainnet-prereqs.yaml"]
+        prereq_resources = prereqs["Resources"]
+        bucket = prereq_resources["MainnetJobBucket"]
+        self.assertEqual(bucket["DeletionPolicy"], "Retain")
+        self.assertEqual(bucket["UpdateReplacePolicy"], "Retain")
+        self.assertEqual(bucket["Properties"]["BucketName"], {"Ref": "JobBucketName"})
+        self.assertEqual(
+            bucket["Properties"]["PublicAccessBlockConfiguration"],
+            {
+                "BlockPublicAcls": True,
+                "BlockPublicPolicy": True,
+                "IgnorePublicAcls": True,
+                "RestrictPublicBuckets": True,
+            },
+        )
+        runtime_role = prereq_resources["MainnetRuntimeRole"]["Properties"]
+        self.assertEqual(runtime_role["RoleName"], "bnbagent-stockanalyst-mainnet-runtime")
+        self.assertEqual(
+            [policy["PolicyName"] for policy in runtime_role["Policies"]],
+            [
+                "stockanalyst-mainnet-runtime-telemetry",
+                "stockanalyst-mainnet-runtime-secrets",
+                "stockanalyst-mainnet-runtime-storage",
+            ],
+        )
+
+        network = templates[ROOT / "infra" / "agentcore-mainnet-fixed-egress.yaml"]
+        network_resources = network["Resources"]
+        self.assertEqual(
+            network_resources["NatGateway"]["Properties"],
+            {
+                "AllocationId": {"Fn::GetAtt": "EgressElasticIp.AllocationId"},
+                "ConnectivityType": "public",
+                "SubnetId": {"Ref": "PublicSubnetId"},
+                "Tags": [
+                    {"Key": "Name", "Value": "stockanalyst-mainnet-fixed-egress-nat"},
+                    {"Key": "Project", "Value": "stockanalyst-agent"},
+                    {"Key": "Purpose", "Value": "fixed-egress"},
+                    {"Key": "ManagedBy", "Value": "cloudformation"},
+                    {"Key": "Environment", "Value": "mainnet"},
+                ],
+            },
         )
         self.assertEqual(
-            frozenset(re.findall(r"(?m)^          (/x402/[^:]+):$", gateway)),
-            X402_GATEWAY_ROUTES,
+            network_resources["PrivateDefaultRoute"]["Properties"],
+            {
+                "RouteTableId": {"Ref": "PrivateRouteTable"},
+                "DestinationCidrBlock": "0.0.0.0/0",
+                "NatGatewayId": {"Ref": "NatGateway"},
+            },
+        )
+        self.assertEqual(
+            network_resources["RuntimeSecurityGroup"]["Properties"]["VpcId"],
+            {"Ref": "VpcId"},
+        )
+        self.assertEqual(
+            network_resources["S3GatewayEndpoint"]["Properties"]["RouteTableIds"],
+            [{"Ref": "PrivateRouteTable"}],
         )
 
     def test_public_x402_contract_uses_only_v2_headers(self) -> None:

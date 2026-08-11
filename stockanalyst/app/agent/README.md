@@ -12,20 +12,30 @@ The valuable agent and **sole key-holder/signer** for the stockanalyst seller. S
 | USDT | `0x55d398326f99059fF775485246999027B3197955` | `permit2-exact` | 0.21 USDT |
 
 B402 capabilities may be partial; requirements expose only the live supported
-subset. For `permit2-exact`, `spenderAddress` comes from the live B402
-capability. The token allowance targets canonical Permit2
-`0x000000000022D473030F116dDEE9F6B43aC78BA3`, not the dynamic B402 spender.
+subset. `extra.signerAddress` is facilitator EOA metadata; it is not the
+Permit2 spender and is not part of `permit2-exact` typed data.
+`extra.spenderAddress` is the live B402 proxy and the `permit2-exact`
+typed-data spender; the ERC-20 approval target remains canonical Permit2
+`0x000000000022D473030F116dDEE9F6B43aC78BA3`.
 Buyer allowance operations are explicit: `npm run x402:allowance`,
 `npm run x402:approve`, and `npm run x402:revoke` accept only USDC or USDT.
-Approval caps allowance at exactly 50 tokens. A 50-token allowance covers 238
-complete 0.21 payments and leaves 0.02 token. `BSC_RPC_URL` is used only for
-USDC/USDT allowance reads, approval/revoke, and paid preflight; U/USD1 and
-local signing do not use it. `npm run x402:async` never approves or revokes.
+Both approve and revoke require confirmation; `--yes` is an explicit
+noninteractive bypass. Approval caps allowance at exactly 50 tokens. A
+50-token allowance covers 238 complete 0.21 payments and leaves 0.02 token.
+`BSC_RPC_URL` is used only for USDC/USDT allowance reads, approval/revoke, and
+paid preflight; U/USD1 and local signing do not use it. `npm run x402:async`
+never approves or revokes.
 
-Promotional mode exposes only U and USD1; USDC and USDT are excluded. It is
-proofless and never approves. If a paid response is lost, a pending Permit2
-settlement is resumed with the same proof rather than signing a replacement.
-See the [x402 API usage guide](../../../docs/x402-api-usage.md).
+In promotional mode, `paymentRequired=false` and the active `accepts=[]`;
+`supportedAssets` may still list all four tokens as registry metadata and is
+not an active payment requirement. There is no USDC/USDT promotional proof,
+B402 verify/settle, or automatic approval. On a genuinely new CLI run with
+`X402_PAYMENT_TOKEN=USDC` or `USDT`, the zero-POST safety policy may perform a
+read-only Permit2 preflight before discovering the proofless promotional
+response; it still performs no approval. Permit2 recovery is settle-only and
+reuses the exact same persisted proof; it does not call `/verify` again and
+creates no new signature, nonce, or approval. See the
+[x402 API usage guide](../../../docs/x402-api-usage.md).
 
 ## Key files
 
