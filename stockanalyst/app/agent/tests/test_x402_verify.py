@@ -613,6 +613,27 @@ class VerifiedPaymentTests(unittest.TestCase):
         )
         self.assertEqual(first.nonce, "0x" + "22" * 32)
         self.assertEqual(first.value, verify.PRICE_WEI)
+        self.assertEqual(first.transfer_method, "eip3009")
+
+    def test_payment_signature_decoder_enforces_exact_nesting_boundary(
+        self,
+    ) -> None:
+        at_limit: object = 0
+        for _ in range(62):
+            at_limit = [at_limit]
+        accepted = base64.b64encode(
+            json.dumps({"value": at_limit}).encode()
+        ).decode()
+
+        over_limit: object = 0
+        for _ in range(63):
+            over_limit = [over_limit]
+        rejected = base64.b64encode(
+            json.dumps({"value": over_limit}).encode()
+        ).decode()
+
+        self.assertIsNotNone(verify.decode_payment_signature(accepted))
+        self.assertIsNone(verify.decode_payment_signature(rejected))
 
     def test_pure_validation_rejects_json_float_value(self) -> None:
         proof = signed_proof(float(verify.PRICE_WEI))
