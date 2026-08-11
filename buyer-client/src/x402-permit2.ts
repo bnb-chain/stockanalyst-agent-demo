@@ -59,6 +59,11 @@ export interface Permit2CliDependencies {
   createContext(options: Permit2CliContextOptions): Promise<Permit2AllowanceContext>;
 }
 
+export interface Permit2CliProcess {
+  writeError(message: string): void;
+  setExitCode(code: number): void;
+}
+
 const ERC20_ALLOWANCE_ABI = [
   "function allowance(address owner, address spender) view returns (uint256)",
   "function approve(address spender, uint256 amount) returns (bool)",
@@ -139,6 +144,7 @@ export async function readPermit2Allowance(
 function logAllowanceSummary(
   context: Permit2AllowanceContext,
   currentAllowance: bigint,
+  targetAllowance: bigint,
   transactionCount: number,
 ): void {
   const token = requirePermit2Token(context.token);
@@ -149,7 +155,7 @@ function logAllowanceSummary(
   log(`Token contract: ${PAYMENT_TOKENS[token].asset}`);
   log(`Canonical Permit2: ${PERMIT2_ADDRESS}`);
   log(`Current allowance: ${currentAllowance}`);
-  log(`Target allowance: ${PERMIT2_ALLOWANCE_TARGET}`);
+  log(`Target allowance: ${targetAllowance}`);
   log(`Transaction count: ${transactionCount}`);
 }
 
@@ -185,7 +191,12 @@ export async function approvePermit2Allowance(
   const transactionCount = currentAllowance === PERMIT2_ALLOWANCE_TARGET
     ? 0
     : currentAllowance === 0n ? 1 : 2;
-  logAllowanceSummary(context, currentAllowance, transactionCount);
+  logAllowanceSummary(
+    context,
+    currentAllowance,
+    PERMIT2_ALLOWANCE_TARGET,
+    transactionCount,
+  );
   if (transactionCount === 0) return;
   await requireConfirmation(context, "approve");
   if (currentAllowance !== 0n) {
@@ -198,7 +209,7 @@ export async function revokePermit2Allowance(
   context: Permit2AllowanceContext,
 ): Promise<void> {
   const currentAllowance = await readPermit2Allowance(context);
-  logAllowanceSummary(context, currentAllowance, 1);
+  logAllowanceSummary(context, currentAllowance, 0n, 1);
   await requireConfirmation(context, "revoke");
   await sendApproval(context.contract, 0n);
 }
@@ -338,6 +349,40 @@ const DEFAULT_CLI_DEPENDENCIES: Permit2CliDependencies = {
   createContext: createDefaultCliContext,
 };
 
+const SAFE_CLI_ERROR_MESSAGES = new Set([
+  "Usage: x402-permit2.ts <allowance|approve|revoke> <USDC|USDT> [--yes]",
+  "Permit2 allowance token must be exactly USDC or USDT",
+  "Only the optional --yes flag is supported",
+  "--yes is only valid for approve or revoke",
+  "BSC_RPC_URL is required for Permit2 allowance operations",
+  "BSC_RPC_URL must be a valid HTTP(S) URL",
+  "BSC_RPC_URL provider network must have chain ID 56",
+  "KEYSTORE_PATH is required for Permit2 allowance operations",
+  "WALLET_PASSWORD is required for Permit2 allowance operations",
+  "ERC-20 allowance read must return bigint",
+  "Permit2 allowance is below 0.21; run npm run x402:approve -- <USDC|USDT>",
+  "Permit2 allowance exceeds 50; reset it to 50 or revoke it",
+  'Permit2 approve declined: exact answer "yes" is required',
+  'Permit2 revoke declined: exact answer "yes" is required',
+  "Permit2 approve declined",
+  "Permit2 revoke declined",
+  "Permit2 approval transaction must have receipt status 1",
+]);
+
+const SAFE_CLI_UNKNOWN_ERROR =
+  "Permit2 allowance command failed; verify RPC configuration, wallet funds, and transaction status";
+
+function formatPermit2CliError(error: unknown): string {
+  try {
+    if (error instanceof Error && SAFE_CLI_ERROR_MESSAGES.has(error.message)) {
+      return error.message;
+    }
+  } catch {
+    // Unknown provider errors may have hostile getters. Never inspect further.
+  }
+  return SAFE_CLI_UNKNOWN_ERROR;
+}
+
 export async function runPermit2AllowanceCli(
   args: readonly string[],
   env: Readonly<Record<string, string | undefined>> = process.env,
@@ -365,7 +410,28 @@ export async function runPermit2AllowanceCli(
     return;
   }
   const currentAllowance = await readPermit2Allowance(context);
-  logAllowanceSummary(context, currentAllowance, 0);
+  logAllowanceSummary(context, currentAllowance, PERMIT2_ALLOWANCE_TARGET, 0);
+}
+
+const DEFAULT_CLI_PROCESS: Permit2CliProcess = {
+  writeError: (message) => console.error(message),
+  setExitCode: (code) => {
+    process.exitCode = code;
+  },
+};
+
+export async function runPermit2AllowanceCliMain(
+  args: readonly string[],
+  env: Readonly<Record<string, string | undefined>> = process.env,
+  dependencies: Permit2CliDependencies = DEFAULT_CLI_DEPENDENCIES,
+  cliProcess: Permit2CliProcess = DEFAULT_CLI_PROCESS,
+): Promise<void> {
+  try {
+    await runPermit2AllowanceCli(args, env, dependencies);
+  } catch (error: unknown) {
+    cliProcess.setExitCode(1);
+    cliProcess.writeError(formatPermit2CliError(error));
+  }
 }
 
 function isDirectExecution(): boolean {
@@ -375,8 +441,5 @@ function isDirectExecution(): boolean {
 }
 
 if (isDirectExecution()) {
-  void runPermit2AllowanceCli(process.argv.slice(2)).catch((error: unknown) => {
-    console.error(error instanceof Error ? error.message : String(error));
-    process.exitCode = 1;
-  });
+  void runPermit2AllowanceCliMain(process.argv.slice(2));
 }

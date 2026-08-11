@@ -20,6 +20,7 @@ import {
   readPermit2Allowance,
   revokePermit2Allowance,
   runPermit2AllowanceCli,
+  runPermit2AllowanceCliMain,
   type Permit2AllowanceContext,
   type Permit2CliDependencies,
   type Permit2TokenContract,
@@ -474,13 +475,22 @@ test("approve --yes bypasses the interactive prompt", async () => {
   assert.equal(runtime.approvals.length, 1);
 });
 
-test("revoke sends only a zero approval to canonical Permit2", async () => {
+test("revoke prints the complete zero-target summary and sends only zero", async () => {
   const runtime = fakeAllowanceRuntime({ allowance: PERMIT2_ALLOWANCE_TARGET, yes: true });
 
   await revokePermit2Allowance(runtime.context);
 
   assert.deepEqual(runtime.approvals, [{ spender: PERMIT2_ADDRESS, amount: 0n }]);
-  assert.match(runtime.logs.join("\n"), /Transaction count: 1/);
+  assert.deepEqual(runtime.logs, [
+    "Chain: 56",
+    `Wallet: ${WALLET}`,
+    "Token: USDC",
+    `Token contract: ${PAYMENT_TOKENS.USDC.asset}`,
+    `Canonical Permit2: ${PERMIT2_ADDRESS}`,
+    `Current allowance: ${PERMIT2_ALLOWANCE_TARGET}`,
+    "Target allowance: 0",
+    "Transaction count: 1",
+  ]);
 });
 
 test("CLI dispatches allowance, approve --yes, and revoke with injected mocks", async () => {
@@ -497,4 +507,66 @@ test("CLI dispatches allowance, approve --yes, and revoke with injected mocks", 
   await runPermit2AllowanceCli(["revoke", "USDC", "--yes"], {}, dependencies);
 
   assert.deepEqual(actions, ["USDC:false", "USDT:true", "USDC:true"]);
+});
+
+test("CLI main redacts unknown provider and transaction errors and exits nonzero", async () => {
+  const maliciousProviderError = new Error([
+    "SERVER_ERROR requestUrl=https://buyer:API_KEY_MARKER@bsc.example/v1",
+    '{"body":{"nested":"NESTED_JSON_MARKER"}}',
+  ].join("\n"));
+  const maliciousTransactionError = {
+    message: "eth_sendRawTransaction RAW_TX_MARKER 0x02f8deadbeef",
+    error: { body: "SIGNATURE_MARKER", nested: { apiKey: "API_KEY_MARKER" } },
+    toString: () => "NESTED_JSON_MARKER",
+  };
+  const cases: Array<{
+    args: string[];
+    configure(runtime: FakeAllowanceRuntime): void;
+  }> = [
+    {
+      args: ["allowance", "USDC"],
+      configure: (runtime) => {
+        runtime.context.provider.getNetwork = async () => {
+          throw maliciousProviderError;
+        };
+      },
+    },
+    {
+      args: ["approve", "USDC", "--yes"],
+      configure: (runtime) => {
+        runtime.context.contract.approve = async () => {
+          throw maliciousTransactionError;
+        };
+      },
+    },
+  ];
+
+  for (const testCase of cases) {
+    const runtime = fakeAllowanceRuntime({ allowance: 0n, yes: true });
+    testCase.configure(runtime);
+    const stderr: string[] = [];
+    const exitCodes: number[] = [];
+    const dependencies: Permit2CliDependencies = {
+      createContext: async () => runtime.context,
+    };
+
+    await runPermit2AllowanceCliMain(
+      testCase.args,
+      {},
+      dependencies,
+      {
+        writeError: (message) => stderr.push(message),
+        setExitCode: (code) => exitCodes.push(code),
+      },
+    );
+
+    assert.deepEqual(stderr, [
+      "Permit2 allowance command failed; verify RPC configuration, wallet funds, and transaction status",
+    ]);
+    assert.deepEqual(exitCodes, [1]);
+    assert.doesNotMatch(
+      `${runtime.logs.join("\n")}\n${stderr.join("\n")}`,
+      /API_KEY_MARKER|RAW_TX_MARKER|SIGNATURE_MARKER|NESTED_JSON_MARKER|requestUrl|eth_sendRawTransaction/,
+    );
+  }
 });
