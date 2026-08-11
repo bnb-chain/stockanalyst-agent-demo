@@ -2,14 +2,46 @@
 
 TypeScript buyer client for the [Stock Analysis Agent](../stockanalyst/README.md). Supports these flows:
 
+## BSC Mainnet x402 payment contract
+
+| Token | BSC address | Method | Price |
+| --- | --- | --- | --- |
+| U | `0xcE24439F2D9C6a2289F741120FE202248B666666` | `eip3009` | 0.21 U |
+| USD1 | `0x8d0D000Ee44948FC98c9B98A4FA4921476f08B0d` | `eip3009` | 0.21 USD1 |
+| USDC | `0x8AC76a51cc950d9822D68b83fE1Ad97B32Cd580d` | `permit2-exact` | 0.21 USDC |
+| USDT | `0x55d398326f99059fF775485246999027B3197955` | `permit2-exact` | 0.21 USDT |
+
+B402 capabilities may be partial. The client validates the live supported
+subset and fails closed if the selected token is absent. For
+`permit2-exact`, `spenderAddress` comes from the live B402 capability and is
+signed into the proof. The ERC-20 token allowance targets canonical Permit2
+`0x000000000022D473030F116dDEE9F6B43aC78BA3`, never that dynamic spender.
+
+Use the explicit `npm run x402:allowance`, `npm run x402:approve`, and
+`npm run x402:revoke` commands with `-- USDC` or `-- USDT`. Approval requires
+the exact interactive answer `yes` unless `--yes` was passed, resets a
+differing nonzero allowance to zero, and then sets exactly 50 tokens. Revoke
+sets zero. A 50-token allowance covers 238 complete 0.21 payments and leaves
+0.02 token. `BSC_RPC_URL` is used only for USDC/USDT allowance reads,
+approval/revoke, and paid preflight; U/USD1 and local signing do not use it.
+`npm run x402:async` never approves or revokes; it only checks that the
+existing allowance is within the inclusive 0.21-to-50 safety range.
+
+Promotional mode exposes only U and USD1; USDC and USDT are excluded. The
+proofless promo branch never approves. The async client persists the exact
+proof before its first paid submission, so a pending Permit2 settlement is
+resumed with the same proof after an ambiguous response or restart; it never
+signs a replacement proof for that job. See
+[`docs/x402-api-usage.md`](../docs/x402-api-usage.md) for the complete API flow.
+
 | Tier | Command | Cost | Settlement | Report | Speed |
 |------|---------|------|------------|--------|-------|
 | **x402 Free (legacy)** | `npm run x402:free` | 0 U | none | retired public endpoint | — |
-| **x402 Paid Async** | `npm run x402:async` | 0.21 U or 0.21 USD1 | Binance Pay facilitator | private polling + download | create returns quickly |
+| **x402 Paid Async** | `npm run x402:async` | 0.21 U, USD1, USDC, or USDT | Binance Pay facilitator | private polling + download | create returns quickly |
 | **ERC-8183** (on-chain escrow) | `npm run dev` | 0.21 U | trustless escrow | full analysis | 5–15 min |
 
-x402 payments use **BSC Mainnet (chain ID 56)** and accept **U (United
-Stables)** or **USD1 (World Liberty Financial USD)**. The legacy free client proves wallet
+x402 payments use **BSC Mainnet (chain ID 56)** and accept the live supported
+subset of **U, USD1, USDC, and USDT**. The legacy free client proves wallet
 identity with the mainnet U EIP-712 domain, but its public endpoint is retired.
 Both full-analysis flows read the buyer's portfolio from a local **UOMP Memory
 Guard** and produce the same HTML + PDF report.
@@ -54,8 +86,9 @@ Guard** and produce the same HTML + PDF report.
 ## Prerequisites
 
 - **Node.js 18+** (for native `fetch` + `ReadableStream`)
-- For x402 paid async: **U or USD1 on BSC Mainnet**. The buyer signs the
-  facilitator requirement and does not submit its own on-chain transaction.
+- For x402 paid async: **U, USD1, USDC, or USDT on BSC Mainnet**, provided the
+  token appears in the live capability subset. U/USD1 use EIP-3009;
+  USDC/USDT require a separately managed Permit2 allowance.
 - For ERC-8183 only: **tBNB** for gas and the testnet U token —
   [BSC Testnet Faucet](https://testnet.bnbchain.org/faucet-smart)
 - **UOMP Guard** running locally on port 9374
@@ -144,7 +177,7 @@ PROVIDER_ADDRESS=0x1FF095E1C5Cf4bC72a3DC54be17B6cf85043Fb67
 # ── x402 (BSC Mainnet; local agent may use localhost) ─────────────
 X402_ENDPOINT=https://stock-agent.bnbchain.org
 X402_SELLER_WALLET=0xd10BdDC20E4DC42A1a19a9653e994991e25b8153
-# Optional strict token selector: U (default) or USD1.
+# Optional strict token selector: U (default), USD1, USDC, or USDT.
 X402_PAYMENT_TOKEN=U
 # Optional async-client polling deadline; default is 30 minutes.
 X402_POLL_TIMEOUT_MS=1800000
@@ -251,10 +284,10 @@ Expected output:
 ## Quick start — x402 paid async
 
 This flow completes payment quickly, stores a private job receipt, and polls
-while the report runs in the background. The challenge advertises its supported
-subset of mainnet U and USD1 in stable order. The CLI selects U by default;
-integrators can pass `"U"` or `"USD1"` as the preferred-token argument to
-`fetchPaymentChallenge`.
+while the report runs in the background. The challenge advertises the partial
+live subset of U, USD1, USDC, and USDT in registry order. The CLI selects U by
+default; integrators can pass any exact registered symbol as the preferred-token
+argument to `fetchPaymentChallenge`.
 
 ```bash
 cd buyer-client
@@ -393,7 +426,7 @@ Buyer                              Agent (localhost:9000)
   │◀── 202 jobId + private jobToken ───────│
   │                                        │
   │  paid mode only:                       ├─ promo=0: B402 /supported
-  │◀── 402 accepts[U, USD1] + resource ─────│  amount 210000000000000000
+  │◀── 402 live supported subset + resource ─│  amount 210000000000000000
   │  sign exact returned requirement       │
   │  PAYMENT-SIGNATURE: base64(selected proof) ▶│  validate → B402 verify/settle
   │◀── 202 jobId + private jobToken ───────│
@@ -402,20 +435,22 @@ Buyer                              Agent (localhost:9000)
   │  GET private presigned S3 URL ────────▶│  full markdown report
 ```
 
-The current paid flow and retained legacy free client use **x402 v2 / EIP-712
-EIP-3009 (TransferWithAuthorization)** on **BSC Mainnet (chain ID 56)**. Paid
-requirements may select either of these exact token domains:
+The current paid flow uses **x402 v2** on **BSC Mainnet (chain ID 56)**.
+U/USD1 use EIP-712 EIP-3009 `TransferWithAuthorization`; USDC/USDT use the
+exact Permit2 proof described above. The retained legacy free client is U-only.
+Paid requirements may select these exact tokens:
 
-| Symbol | EIP-712 name | Version | Decimals | Exact paid amount | Mainnet contract |
-|--------|--------------|---------|----------|-------------------|------------------|
-| U | United Stables | 1 | 18 | `210000000000000000` (`0.21 × 10^18`) | `0xcE24439F2D9C6a2289F741120FE202248B666666` |
-| USD1 | World Liberty Financial USD | 1 | 18 | `210000000000000000` (`0.21 × 10^18`) | `0x8d0D000Ee44948FC98c9B98A4FA4921476f08B0d` |
+| Symbol | Method | Domain name/version | Decimals | Exact paid amount | Mainnet contract |
+|--------|--------|---------------------|----------|-------------------|------------------|
+| U | `eip3009` | United Stables / 1 | 18 | `210000000000000000` (`0.21 × 10^18`) | `0xcE24439F2D9C6a2289F741120FE202248B666666` |
+| USD1 | `eip3009` | World Liberty Financial USD / 1 | 18 | `210000000000000000` (`0.21 × 10^18`) | `0x8d0D000Ee44948FC98c9B98A4FA4921476f08B0d` |
+| USDC | `permit2-exact` | USD Coin / 2 | 18 | `210000000000000000` (`0.21 × 10^18`) | `0x8AC76a51cc950d9822D68b83fE1Ad97B32Cd580d` |
+| USDT | `permit2-exact` | Tether USD / 1 | 18 | `210000000000000000` (`0.21 × 10^18`) | `0x55d398326f99059fF775485246999027B3197955` |
 
-Set `X402_PAYMENT_TOKEN=U` or `X402_PAYMENT_TOKEN=USD1`; the default is U and
-any other spelling is rejected. The seller's fixed registry controls these
-assets. Legacy `X402_TOKEN_ADDRESS` and U-domain environment settings are
-compatibility inputs only and cannot replace or override the registry. USDC
-and USDT are deferred because their supported transfer path requires Permit2.
+Set `X402_PAYMENT_TOKEN` to exactly `U`, `USD1`, `USDC`, or `USDT`; the default
+is U and any other spelling is rejected. The seller's fixed registry controls
+these assets. Legacy `X402_TOKEN_ADDRESS` and U-domain environment settings are
+compatibility inputs only and cannot replace or override the registry.
 
 When `X402_PROMO_FREE_MODE=1`, callers POST directly without a wallet or
 `Payment-Signature`. Promotional access is free. The same full async analysis runs, but the request does not enter
@@ -445,12 +480,14 @@ trusted IP in the rolling 24-hour window, including an identical retry. The
 limiter is process-local: a restart clears it and replicas do not share
 counters. In the public deployment, the trusted source IP comes from API
 Gateway request context, never a caller-supplied forwarding header. Setting
-`X402_PROMO_FREE_MODE=0` restores the paid U/USD1 HTTP 402 flow. That paid flow costs
-0.21 U or 0.21 USD1. The old
+`X402_PROMO_FREE_MODE=0` restores the four-token paid HTTP 402 flow. The
+EIP-3009 subset costs 0.21 U or 0.21 USD1; Permit2 costs 0.21 USDC or 0.21
+USDT when supported live. The old
 `/x402/free` route remains retired.
 
-The client signs structured typed data; no `eth_sign` / `personal_sign` is
-involved:
+For the U/USD1 EIP-3009 method, the client signs the following structured typed
+data; no `eth_sign` / `personal_sign` is involved. Permit2 uses the separate
+exact returned requirement described above:
 
 ```typescript
 // ethers v6 signTypedData — use the explicitly selected mainnet requirement
@@ -552,13 +589,13 @@ To call the agent from your own code, here are the minimal integration points:
    persist its `jobId`, `jobToken`, status path, and expiry. Do not sign or send
    a payment proof.
 3. If the response is HTTP 402, validate every advertised `accepts[]` entry
-   against the mainnet U/USD1 registry, reject duplicates or unknown assets,
-   and explicitly select U or USD1. The paid amount must be exactly
+   against the four-token mainnet registry, reject duplicates or unknown
+   assets, and explicitly select one live-supported token. The paid amount must be exactly
    `210000000000000000` and
-   include a valid B402 signer.
-4. Copy the complete `resource`, selected requirement, and `extra`, sign the
-   EIP-712 EIP-3009 authorization with chain ID 56 and the selected token
-   contract, then repeat the POST with the official V2 proof in `Payment-Signature`.
+   include method-appropriate B402 metadata.
+4. Copy the complete `resource`, selected requirement, and `extra`. Sign the
+   EIP-3009 authorization for U/USD1 or the exact Permit2 authorization for
+   USDC/USDT, then repeat the POST with the V2 proof in `Payment-Signature`.
 5. Persist the returned private job receipt.
 6. Poll the status path with `X-Job-Token`; resume when instructed.
 7. Download the report from the returned private presigned URL.

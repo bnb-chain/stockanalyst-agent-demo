@@ -12,15 +12,51 @@ End-to-end demo of a **personalized AI stock analyst** bought and paid for on BN
 
 The agent aggregates 5 independent data sources (yfinance, FRED macro, SEC EDGAR insider trades, Alpha Vantage AI sentiment, GNews headlines), computes 10 technical indicators (RSI, MACD, Bollinger, MA50/200 golden/death cross, ADX trend strength, OBV, ATR, VaR 95%), and writes a structured report with explicit bull/bear thesis, portfolio P&L vs your actual cost basis, and a hard recommendation with target price.
 
+## BSC Mainnet x402 payments
+
+Paid asynchronous analysis supports four fixed 18-decimal tokens at exactly
+0.21 token per completed payment:
+
+| Token | BSC address | Method | Price |
+| --- | --- | --- | --- |
+| U | `0xcE24439F2D9C6a2289F741120FE202248B666666` | `eip3009` | 0.21 U |
+| USD1 | `0x8d0D000Ee44948FC98c9B98A4FA4921476f08B0d` | `eip3009` | 0.21 USD1 |
+| USDC | `0x8AC76a51cc950d9822D68b83fE1Ad97B32Cd580d` | `permit2-exact` | 0.21 USDC |
+| USDT | `0x55d398326f99059fF775485246999027B3197955` | `permit2-exact` | 0.21 USDT |
+
+B402 capabilities may be partial: the seller advertises only the supported
+subset returned by the live facilitator. For `permit2-exact`, `spenderAddress`
+comes from the live B402 capability and is signed into that payment proof. The
+token allowance instead targets canonical Permit2
+`0x000000000022D473030F116dDEE9F6B43aC78BA3`, never the dynamic spender.
+
+From `buyer-client/`, inspect and explicitly manage a USDC or USDT allowance
+with `npm run x402:allowance`, `npm run x402:approve`, and
+`npm run x402:revoke`; pass the token after `--`, for example
+`npm run x402:approve -- USDC`. Approval requires exact confirmation and sets
+an exact 50-token cap (resetting a differing nonzero allowance to zero first);
+revoke sets it to zero. A 50-token allowance covers 238 complete 0.21 payments
+and leaves 0.02 token. `BSC_RPC_URL` is used only for USDC/USDT allowance
+reads, approval/revoke, and paid preflight; U/USD1 and local signing do not use
+it. `npm run x402:async` never approves or revokes: it only checks that a
+Permit2 allowance is between 0.21 and 50 before a new paid flow.
+
+Promotional mode exposes only U and USD1; USDC and USDT are excluded. A
+proofless promotional `npm run x402:async` never approves. For paid recovery,
+the exact proof and request are persisted before submission; a pending Permit2
+settlement is resumed with the same proof after retry or restart and is never
+re-signed. See [the x402 API usage guide](docs/x402-api-usage.md) for the HTTP
+contract, selection rules, and recovery details.
+
 Three ways to pay — pick the one that fits your use case:
 
 | Tier | Command | Cost | Settlement | Speed |
 |------|---------|------|------------|-------|
 | **Free** quick quote | `npm run x402:free` | 0 U | none (identity proof only) | ~1s |
-| **Paid** full analysis via x402 | `npm run x402:async` | 0.21 U or 0.21 USD1 | Binance Pay facilitator | async job |
+| **Paid** full analysis via x402 | `npm run x402:async` | 0.21 U, USD1, USDC, or USDT | Binance Pay facilitator | async job |
 | **Paid** full analysis via ERC-8183 | `npm run dev` | 0.21 U | on-chain escrow (trustless) | 5–15 min |
 
-- **Seller** (`stockanalyst/`) — stock analysis agent deployed on BNB Chain platform; serves both x402 (durable private jobs, EIP-712 EIP-3009) and ERC-8183 (on-chain escrow, A2A + Cognito) in parallel. LLM: **kimi-k2.6** with extended thinking.
+- **Seller** (`stockanalyst/`) — stock analysis agent deployed on BNB Chain platform; serves both x402 (durable private jobs, EIP-3009 or Permit2 exact) and ERC-8183 (on-chain escrow, A2A + Cognito) in parallel. LLM: **kimi-k2.6** with extended thinking.
 - **Buyer** (`buyer-client/`) — TypeScript client that reads the user's portfolio and cost basis from a local UOMP Guard and supports all three payment tiers.
 
 ## Architecture
@@ -43,7 +79,7 @@ Three ways to pay — pick the one that fits your use case:
         │◄── JSON: quick quote table ─────────                  (~1s)
         │
         ├─── x402 paid async ─────────────► public x402 API Gateway
-        │    sign 0.21-U/USD1 EIP-712 proof └─ seller agent → Binance Pay facilitator
+        │    sign exact 0.21-token proof    └─ seller agent → Binance Pay facilitator
         │    POST /x402/analyze/async          kimi-k2.6 background analysis
         │◄── jobId + private token ────────
         │    poll status → presigned URL ──► private S3 report
@@ -76,8 +112,8 @@ Three ways to pay — pick the one that fits your use case:
 
 | | x402 Free | x402 Paid | ERC-8183 |
 |---|---|---|---|
-| Cost | 0 U | 0.21 U or 0.21 USD1 | 0.21 U |
-| Signing | EIP-712 (0-U identity proof) | EIP-712 EIP-3009 | EIP-191 quote + on-chain txs |
+| Cost | 0 U | 0.21 U, USD1, USDC, or USDT | 0.21 U |
+| Signing | EIP-712 (0-U identity proof) | EIP-3009 or Permit2 exact | EIP-191 quote + on-chain txs |
 | On-chain settlement | none | Binance Pay facilitator | escrow contract (trustless) |
 | Report | quick quote table | full analysis | full analysis |
 | LLM | none (yfinance only) | kimi-k2.6 | kimi-k2.6 |
@@ -97,7 +133,7 @@ node guard-mock.mjs
 # Terminal 3 — buyer (pick one)
 cd buyer-client
 SYMBOL=AAPL npm run x402:free    # free: 0 U, quick quote, ~1s
-npm run x402:async               # paid: 0.21 U or 0.21 USD1, durable async analysis
+npm run x402:async               # paid: exact 0.21 selected token, durable async analysis
 npm run dev                      # paid: 0.21 U, full analysis, ERC-8183 trustless
 ```
 
@@ -183,7 +219,7 @@ UOMP_GUARD_URL=http://127.0.0.1:9374
 UOMP_GUARD_TOKEN=demo-guard-token
 ```
 
-Buyer wallet needs: ≥ 0.01 tBNB (gas) + ≥ 0.21 U (for ERC-8183); x402 accepts 0.21 U or 0.21 USD1.
+Buyer wallet needs: ≥ 0.01 tBNB (gas) + ≥ 0.21 U (for ERC-8183); paid x402 accepts exactly 0.21 U, USD1, USDC, or USDT when its live capability is available. The EIP-3009 subset remains 0.21 U or 0.21 USD1.
 
 ### 3. Run
 
@@ -197,7 +233,7 @@ node guard-mock.mjs
 cd buyer-client
 
 SYMBOL=AAPL npm run x402:free   # free: 0 U, quick quote, ~1s, no LLM
-npm run x402:async              # paid: 0.21 U or 0.21 USD1, durable async analysis
+npm run x402:async              # paid: exact 0.21 selected token, durable async analysis
 npm run dev                      # paid: 0.21 U, full analysis, ERC-8183 trustless (~5–15min)
 ```
 

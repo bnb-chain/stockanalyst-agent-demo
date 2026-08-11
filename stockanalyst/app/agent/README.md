@@ -2,6 +2,31 @@
 
 The valuable agent and **sole key-holder/signer** for the stockanalyst seller. See the [project README](../../README.md) for full documentation.
 
+## BSC Mainnet x402 contract
+
+| Token | BSC address | Method | Price |
+| --- | --- | --- | --- |
+| U | `0xcE24439F2D9C6a2289F741120FE202248B666666` | `eip3009` | 0.21 U |
+| USD1 | `0x8d0D000Ee44948FC98c9B98A4FA4921476f08B0d` | `eip3009` | 0.21 USD1 |
+| USDC | `0x8AC76a51cc950d9822D68b83fE1Ad97B32Cd580d` | `permit2-exact` | 0.21 USDC |
+| USDT | `0x55d398326f99059fF775485246999027B3197955` | `permit2-exact` | 0.21 USDT |
+
+B402 capabilities may be partial; requirements expose only the live supported
+subset. For `permit2-exact`, `spenderAddress` comes from the live B402
+capability. The token allowance targets canonical Permit2
+`0x000000000022D473030F116dDEE9F6B43aC78BA3`, not the dynamic B402 spender.
+Buyer allowance operations are explicit: `npm run x402:allowance`,
+`npm run x402:approve`, and `npm run x402:revoke` accept only USDC or USDT.
+Approval caps allowance at exactly 50 tokens. A 50-token allowance covers 238
+complete 0.21 payments and leaves 0.02 token. `BSC_RPC_URL` is used only for
+USDC/USDT allowance reads, approval/revoke, and paid preflight; U/USD1 and
+local signing do not use it. `npm run x402:async` never approves or revokes.
+
+Promotional mode exposes only U and USD1; USDC and USDT are excluded. It is
+proofless and never approves. If a paid response is lost, a pending Permit2
+settlement is resumed with the same proof rather than signing a replacement.
+See the [x402 API usage guide](../../../docs/x402-api-usage.md).
+
 ## Key files
 
 | File | Purpose |
@@ -21,7 +46,7 @@ The valuable agent and **sole key-holder/signer** for the stockanalyst seller. S
 |-------|------|------|-----|
 | `GET /x402/free` | none | 0-U signing challenge | no |
 | `POST /x402/free` | 0-U EIP-712, 10/24h per wallet | free JSON quote | no |
-| `POST /x402/analyze/async` | EIP-712 EIP-3009 | 0.21 U per analysis | kimi-k2.6 |
+| `POST /x402/analyze/async` | EIP-3009 or Permit2 exact | 0.21 selected token per analysis | kimi-k2.6 |
 | A2A `notify_funded` | ERC-8183 + Cognito Bearer | 0.21 U (escrow) | kimi-k2.6 |
 
 ## Run locally
