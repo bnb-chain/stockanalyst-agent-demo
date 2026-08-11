@@ -12,7 +12,7 @@ import copy
 import json
 import os
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Protocol, Self
 from urllib.parse import urlsplit
@@ -199,23 +199,38 @@ class B402Client:
         name: str,
         version: str,
     ) -> dict[str, Any]:
-        kinds = await self._get_supported_kinds()
-        for kind in kinds:
-            extra = kind.get("extra")
-            if (
-                kind.get("x402Version") == 2
-                and kind.get("scheme") == "exact"
-                and kind.get("network") == network
-                and isinstance(extra, dict)
-                and extra.get("name") == name
-                and extra.get("version") == version
-                and extra.get("assetTransferMethod") == "eip3009"
-                and _is_evm_address(extra.get("signerAddress"))
-            ):
-                return copy.deepcopy(extra)
+        domain = (name, version)
+        selected = await self.payment_extras(network, (domain,))
+        if domain in selected:
+            return selected[domain]
         raise B402RejectedError(
             f"B402 does not support exact eip3009 {name} {version} on {network}"
         )
+
+    async def payment_extras(
+        self,
+        network: str,
+        domains: Sequence[tuple[str, str]],
+    ) -> dict[tuple[str, str], dict[str, Any]]:
+        kinds = await self._get_supported_kinds()
+        selected: dict[tuple[str, str], dict[str, Any]] = {}
+        for domain in domains:
+            name, version = domain
+            for kind in kinds:
+                extra = kind.get("extra")
+                if (
+                    kind.get("x402Version") == 2
+                    and kind.get("scheme") == "exact"
+                    and kind.get("network") == network
+                    and isinstance(extra, dict)
+                    and extra.get("name") == name
+                    and extra.get("version") == version
+                    and extra.get("assetTransferMethod") == "eip3009"
+                    and _is_evm_address(extra.get("signerAddress"))
+                ):
+                    selected[domain] = copy.deepcopy(extra)
+                    break
+        return selected
 
     async def verify_and_settle(
         self,

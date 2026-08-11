@@ -19,25 +19,25 @@ import logging
 import os
 import re
 import time
-from collections.abc import AsyncGenerator, Callable
+from collections.abc import AsyncGenerator, Callable, Mapping
 from typing import Any
 from urllib.parse import parse_qs
 
 import httpx
 
 from competition_reporting import report_competition_call
-from x402_verify import (
-    CHAIN_ID,
-    FREE_TIER_LIMIT,
-    MIN_PRICE_WEI,
-    PRICE_WEI,
-    SELLER_WALLET,
-    build_free_payment_challenge,
-    build_payment_challenge,
-    verify_free_payment_proof,
-)
-
 if __package__:
+    from .x402_verify import (
+        CHAIN_ID,
+        FREE_TIER_LIMIT,
+        PRICE_WEI,
+        build_free_payment_challenge,
+        build_payment_challenge,
+        build_payment_requirement,
+        decode_payment_signature,
+        verify_free_payment_proof,
+    )
+    from .x402_tokens import TOKENS, U_TOKEN, supported_assets
     from .b402_client import (
         B402Client,
         B402Config,
@@ -50,8 +50,20 @@ if __package__:
         SettlementIndeterminate,
         X402JobError,
         X402JobService,
+        is_valid_settlement_reference,
     )
 else:
+    from x402_verify import (
+        CHAIN_ID,
+        FREE_TIER_LIMIT,
+        PRICE_WEI,
+        build_free_payment_challenge,
+        build_payment_challenge,
+        build_payment_requirement,
+        decode_payment_signature,
+        verify_free_payment_proof,
+    )
+    from x402_tokens import TOKENS, U_TOKEN, supported_assets
     from b402_client import (
         B402Client,
         B402Config,
@@ -64,6 +76,7 @@ else:
         SettlementIndeterminate,
         X402JobError,
         X402JobService,
+        is_valid_settlement_reference,
     )
 
 logger = logging.getLogger("seller-agent.x402")
@@ -78,6 +91,15 @@ class BodyTooLarge(ValueError):
 
 class RequestDisconnected(ValueError):
     pass
+
+
+class InvalidHeaderValue(ValueError):
+    pass
+
+
+def _encode_payment_header(value: Mapping[str, Any]) -> bytes:
+    body = json.dumps(value, separators=(",", ":"), allow_nan=False).encode()
+    return base64.b64encode(body)
 
 
 # ── Settlement configuration (priority: B402 > generic facilitator > demo) ─────
@@ -103,7 +125,7 @@ X402_DEMO_MODE = os.environ.get("X402_DEMO_MODE", "").strip().lower() in ("1", "
 if _B402_CLIENT is not None:
     logger.info("x402: Binance B402 V2 RSA facilitator active")
 elif FACILITATOR_URL:
-    logger.info("x402: generic facilitator active — %s", FACILITATOR_URL)
+    logger.info("x402: generic facilitator active")
 elif X402_DEMO_MODE:
     logger.warning(
         "x402: DEMO MODE active (X402_DEMO_MODE=1) — EIP-712 signatures are verified "
@@ -127,11 +149,9 @@ async def _settle_via_facilitator(proof_b64: str) -> tuple[bool, str]:
     Returns (True, txHash) on success, (False, error_reason) on failure.
     """
     # Decode proof (shared by all settlement paths)
-    try:
-        raw   = base64.b64decode(proof_b64.strip())
-        proof = json.loads(raw)
-    except Exception as exc:
-        return False, f"could not decode proof: {exc}"
+    proof = decode_payment_signature(proof_b64)
+    if proof is None:
+        return False, "Payment-Signature is not valid base64 JSON"
 
     accepted = proof.get("accepted")
     if not isinstance(accepted, dict):
@@ -146,10 +166,10 @@ async def _settle_via_facilitator(proof_b64: str) -> tuple[bool, str]:
     if _B402_CLIENT is not None:
         try:
             transaction = await _B402_CLIENT.verify_and_settle(proof)
-            logger.info("x402 B402 settled: txHash=%s", transaction)
+            logger.info("x402 facilitator outcome=settled backend=b402")
             return True, transaction
         except B402RejectedError as exc:
-            logger.warning("x402 B402 rejected: %s", exc)
+            logger.warning("x402 facilitator outcome=rejected backend=b402")
             return False, str(exc)
         except B402IndeterminateError as exc:
             raise SettlementIndeterminate() from exc
@@ -187,17 +207,24 @@ async def _settle_generic(payload: dict) -> tuple[bool, str]:
             data = resp.json()
         if not isinstance(data, dict):
             raise SettlementIndeterminate()
-        if data.get("success"):
-            txhash = str(data.get("transaction") or "")
-            logger.info("x402 facilitator settled: txHash=%s", txhash)
+        success = data.get("success")
+        if type(success) is not bool:
+            raise SettlementIndeterminate()
+        if success is True:
+            txhash = data.get("transaction")
+            if not is_valid_settlement_reference(txhash):
+                raise SettlementIndeterminate()
+            logger.info("x402 facilitator outcome=settled backend=generic")
             return True, txhash
+        if "transaction" in data and data["transaction"] != "":
+            raise SettlementIndeterminate()
         reason = str(data.get("errorReason") or data.get("error") or "facilitator rejected")
-        logger.warning("x402 facilitator rejected: %s", reason)
+        logger.warning("x402 facilitator outcome=rejected backend=generic")
         return False, reason
     except SettlementIndeterminate:
         raise
     except Exception as exc:
-        logger.exception("x402 facilitator call failed")
+        logger.warning("x402 facilitator outcome=indeterminate backend=generic")
         raise SettlementIndeterminate() from exc
 
 
@@ -307,11 +334,11 @@ class X402Handler:
                 404,
                 {"error": "not found", "x402_routes": [
                     "GET  /x402/price",
-                    "POST /x402/analyze/async  (+ X-Payment header)  → paid, asynchronous report",
+                    "POST /x402/analyze/async  (+ Payment-Signature header)  → paid, asynchronous report",
                     "GET  /x402/jobs/{jobId}  (+ X-Job-Token header)",
                     "POST /x402/jobs/{jobId}/resume  (+ X-Job-Token header)",
                     "GET  /x402/free?symbol=AAPL",
-                    "POST /x402/free     (+ X-Payment header)  → free, 0 U, quick quote",
+                    "POST /x402/free     (+ Payment-Signature header)  → free, 0 U, quick quote",
                 ]},
                 extra_headers=async_headers,
             )
@@ -320,8 +347,28 @@ class X402Handler:
 
     async def _handle_price(self, scope, send) -> None:
         """GET /x402/price — price info without payment."""
+        promo_free = bool(
+            self._job_service is not None
+            and self._job_service.promo_free is True
+        )
+        if promo_free:
+            await _send_json(send, 200, {
+                "x402Version": 2,
+                "promoFree": True,
+                "paymentRequired": False,
+                "price_u": "0.0",
+                "price_wei": "0",
+                "asset": None,
+                "network": f"eip155:{CHAIN_ID}",
+                "payTo": None,
+                "accepts": [],
+                "supportedAssets": supported_assets(),
+                "signingScheme": None,
+                "facilitator": None,
+            })
+            return
         try:
-            extra = await self._paid_payment_extra()
+            requirements = await self._paid_requirements()
         except Exception:
             logger.warning("x402 payment configuration unavailable")
             await _send_payment_backend_unavailable(send)
@@ -329,18 +376,29 @@ class X402Handler:
         challenge = build_payment_challenge(
             [],
             _public_resource(scope, "/x402/analyze/async"),
-            extra,
+            requirements,
         )
-        accept    = (challenge.get("accepts") or [{}])[0]
+        accepts = challenge.get("accepts") or []
+        accept = next(
+            (
+                item
+                for item in accepts
+                if str(item.get("asset", "")).lower()
+                == U_TOKEN.address.lower()
+            ),
+            accepts[0],
+        )
         await _send_json(send, 200, {
             "x402Version":  2,
-            "price_u":      "1.0",
+            "promoFree":    False,
+            "paymentRequired": True,
+            "price_u":      "0.21",
             "price_wei":    accept.get("amount", str(PRICE_WEI)),
-            "min_price_u":  "0.5",
-            "min_price_wei": str(MIN_PRICE_WEI),
             "asset":        accept.get("asset"),
             "network":      accept.get("network"),
             "payTo":        accept.get("payTo"),
+            "accepts":      accepts,
+            "supportedAssets": supported_assets(),
             "signingScheme": "eip3009",
             "facilitator": (
                 "binance-b402-v2"
@@ -349,21 +407,23 @@ class X402Handler:
             ),
         })
 
-    async def _paid_payment_extra(self) -> dict:
-        if self._b402_client is not None:
-            return await self._b402_client.payment_extra(
-                f"eip155:{CHAIN_ID}",
-                os.environ.get("U_TOKEN_DOMAIN_NAME", "U"),
-                os.environ.get("U_TOKEN_DOMAIN_VERSION", "1"),
+    async def _paid_requirements(self) -> list[dict[str, Any]]:
+        if self._b402_client is None:
+            raise B402IndeterminateError("payment backend unavailable")
+        extras = await self._b402_client.payment_extras(
+            f"eip155:{CHAIN_ID}",
+            tuple(token.domain for token in TOKENS),
+        )
+        requirements = [
+            build_payment_requirement(token, extras[token.domain])
+            for token in TOKENS
+            if token.domain in extras
+        ]
+        if not requirements:
+            raise B402RejectedError(
+                "no configured payment token is supported"
             )
-        if FACILITATOR_URL or X402_DEMO_MODE:
-            return {
-                "name": os.environ.get("U_TOKEN_DOMAIN_NAME", "U"),
-                "version": os.environ.get("U_TOKEN_DOMAIN_VERSION", "1"),
-                "assetTransferMethod": "eip3009",
-                "signerAddress": SELLER_WALLET.lower(),
-            }
-        raise B402IndeterminateError("payment backend unavailable")
+        return requirements
 
     async def _handle_async_analyze(self, scope, receive, send) -> None:
         """POST /x402/analyze/async — settle and return a durable job handle."""
@@ -396,40 +456,59 @@ class X402Handler:
             )
             return
 
-        payment_header = _header(scope, b"x-payment")
-        if not payment_header:
+        promo_free = self._job_service.promo_free is True
+        payment_header = ""
+        if not promo_free:
+            try:
+                payment_header = _header(scope, b"payment-signature")
+            except InvalidHeaderValue:
+                await _send_job_error(
+                    send,
+                    X402JobError("payment_rejected"),
+                    token_authenticated=False,
+                )
+                return
+        if not promo_free and not payment_header:
             symbols = _parse_symbols(req.get("symbols") or "")
             try:
-                extra = await self._paid_payment_extra()
+                requirements = await self._paid_requirements()
                 challenge = build_payment_challenge(
                     symbols,
                     _public_resource(scope, "/x402/analyze/async"),
-                    extra,
+                    requirements,
                 )
             except Exception:
                 logger.warning("x402 payment configuration unavailable")
                 await _send_payment_backend_unavailable(send)
                 return
-            challenge_json = json.dumps(challenge).encode()
             await _send_json(
                 send,
                 402,
                 {
                     "error": "Payment Required",
                     "description": (
-                        "Retry this request with a valid X-Payment header."
+                        "Retry this request with a valid Payment-Signature header."
                     ),
                     "paymentRequired": challenge,
                 },
                 extra_headers=[
-                    (b"x-payment-required", challenge_json),
+                    (b"payment-required", _encode_payment_header(challenge)),
                     *_async_response_headers(),
                 ],
             )
             return
 
         try:
-            result = await self._job_service.create_job(payment_header, req)
+            if promo_free:
+                result = await self._job_service.create_promotional_job(
+                    req,
+                    source_ip=scope.get("x402_source_ip"),
+                )
+            else:
+                result = await self._job_service.create_job(
+                    payment_header,
+                    req,
+                )
         except X402JobError as exc:
             await _send_job_error(send, exc, token_authenticated=False)
             return
@@ -445,6 +524,14 @@ class X402Handler:
             return
 
         status_url = f"/x402/jobs/{result.job_id}"
+        response_headers = [
+            (b"location", status_url.encode()),
+            (b"retry-after", b"10"),
+        ]
+        if result.payment_response is not None:
+            response_headers.append(
+                (b"payment-response", _encode_payment_header(result.payment_response))
+            )
         await _send_json(
             send,
             202,
@@ -455,16 +542,20 @@ class X402Handler:
                 "statusUrl": status_url,
                 "expiresAt": result.expires_at,
             },
-            extra_headers=[
-                (b"location", status_url.encode()),
-                (b"retry-after", b"10"),
-                *_async_response_headers(),
-            ],
+            extra_headers=[*response_headers, *_async_response_headers()],
         )
 
     async def _handle_job_get(self, scope, send, job_id: str) -> None:
         """GET /x402/jobs/{jobId} — return an authenticated job view."""
-        token = _header(scope, b"x-job-token")
+        try:
+            token = _header(scope, b"x-job-token")
+        except InvalidHeaderValue:
+            await _send_job_error(
+                send,
+                X402JobError("job_not_found"),
+                token_authenticated=True,
+            )
+            return
         try:
             view = await self._job_service.get_job(job_id, token)
         except X402JobError as exc:
@@ -498,7 +589,15 @@ class X402Handler:
 
     async def _handle_job_resume(self, scope, send, job_id: str) -> None:
         """POST /x402/jobs/{jobId}/resume — resume eligible failed work."""
-        token = _header(scope, b"x-job-token")
+        try:
+            token = _header(scope, b"x-job-token")
+        except InvalidHeaderValue:
+            await _send_job_error(
+                send,
+                X402JobError("job_not_found"),
+                token_authenticated=True,
+            )
+            return
         try:
             view = await self._job_service.resume_job(job_id, token)
         except X402JobError as exc:
@@ -533,12 +632,11 @@ class X402Handler:
             symbol,
             _public_resource(scope, "/x402/free"),
         )
-        challenge_json = json.dumps(challenge).encode()
         await send({
             "type": "http.response.start",
             "status": 402,
             "headers": [
-                (b"x-payment-required", challenge_json),
+                (b"payment-required", _encode_payment_header(challenge)),
                 (b"content-type", b"application/json"),
             ],
         })
@@ -585,26 +683,31 @@ class X402Handler:
             })
             return
 
-        headers_dict: dict[bytes, bytes] = dict(scope.get("headers") or [])
-        payment_header = (headers_dict.get(b"x-payment") or b"").decode().strip()
+        try:
+            payment_header = _header(scope, b"payment-signature")
+        except InvalidHeaderValue:
+            await _send_json(send, 402, {
+                "error": "Free tier access denied",
+                "detail": "Payment-Signature is not valid base64 JSON",
+            })
+            return
 
         if not payment_header:
             challenge = build_free_payment_challenge(
                 symbol,
                 _public_resource(scope, "/x402/free"),
             )
-            challenge_json = json.dumps(challenge).encode()
             await send({
                 "type": "http.response.start",
                 "status": 402,
                 "headers": [
-                    (b"x-payment-required", challenge_json),
+                    (b"payment-required", _encode_payment_header(challenge)),
                     (b"content-type", b"application/json"),
                 ],
             })
             body = json.dumps({
                 "error": "Payment Required",
-                "description": "Retry with a valid X-Payment header (0 U EIP-712 signature).",
+                "description": "Retry with a valid Payment-Signature header (0 U EIP-712 signature).",
                 "paymentRequired": challenge,
             }).encode()
             await send({"type": "http.response.body", "body": body, "more_body": False})
@@ -612,7 +715,7 @@ class X402Handler:
 
         ok, msg, from_addr = verify_free_payment_proof(payment_header)
         if not ok:
-            logger.warning("x402 free tier rejected for %s: %s", symbol, msg)
+            logger.warning("x402 free tier outcome=rejected")
             await _send_json(send, 402, {
                 "error": "Free tier access denied",
                 "detail": msg,
@@ -629,16 +732,16 @@ class X402Handler:
                 called_at=int(time.time() * 1000),
             )
         except ValueError:
-            logger.exception("x402 verified free payment identity extraction failed")
+            logger.warning("x402 free tier identity outcome=invalid")
         except Exception:
-            logger.exception("x402 free-tier competition accounting failed")
+            logger.warning("x402 free tier accounting outcome=failed")
 
-        logger.info("x402 free tier: generating quote for %s (from=%s, %s)", symbol, from_addr, msg)
+        logger.info("x402 free tier outcome=accepted")
         report: dict[str, str] | None = None
         try:
             async for event_name, data in self._free_work(symbol):
                 if event_name == "error":
-                    logger.warning("x402 free quote generation failed for %s", symbol)
+                    logger.warning("x402 free quote outcome=failed")
                     await _send_free_unavailable(send)
                     return
                 if event_name == "report" and isinstance(data, dict):
@@ -651,12 +754,12 @@ class X402Handler:
                     ):
                         report = {"content": content, "format": report_format}
         except Exception:
-            logger.exception("x402 free quote generation failed for %s", symbol)
+            logger.warning("x402 free quote outcome=failed")
             await _send_free_unavailable(send)
             return
 
         if report is None:
-            logger.warning("x402 free quote returned no report for %s", symbol)
+            logger.warning("x402 free quote outcome=empty")
             await _send_free_unavailable(send)
             return
         await _send_json(send, 200, report)
@@ -691,7 +794,10 @@ def _header(scope, name: bytes) -> str:
     expected = name.lower()
     for header_name, value in scope.get("headers") or []:
         if header_name.lower() == expected:
-            return value.decode("utf-8", errors="ignore").strip()
+            try:
+                return value.decode("utf-8", errors="strict")
+            except UnicodeDecodeError as exc:
+                raise InvalidHeaderValue("invalid request header") from exc
     return ""
 
 
@@ -735,6 +841,10 @@ async def _send_job_error(
     headers = _async_response_headers(
         token_authenticated=token_authenticated
     )
+    if error.payment_response is not None:
+        headers.append(
+            (b"payment-response", _encode_payment_header(error.payment_response))
+        )
     if code == "job_not_found":
         await _send_json(
             send,
@@ -768,6 +878,17 @@ async def _send_job_error(
             send,
             402,
             {"errorCode": "payment_rejected"},
+            extra_headers=headers,
+        )
+    elif code == "promo_rate_limited":
+        retry_after = error.retry_after_seconds
+        headers.append(
+            (b"retry-after", str(retry_after or 1).encode())
+        )
+        await _send_json(
+            send,
+            429,
+            {"errorCode": "promo_rate_limited", "retryable": True},
             extra_headers=headers,
         )
     elif code in {
@@ -822,8 +943,15 @@ async def _send_payment_backend_unavailable(send) -> None:
 def _payment_identity(proof_header: str) -> tuple[str, str]:
     """Extract canonical wallet and nonce after proof verification succeeded."""
     try:
-        proof = json.loads(base64.b64decode(proof_header.strip()))
-        authorization = (proof.get("payload") or {}).get("authorization") or {}
+        proof = decode_payment_signature(proof_header)
+        if proof is None:
+            raise ValueError("invalid payment proof")
+        payload = proof.get("payload")
+        if not isinstance(payload, dict):
+            raise ValueError("invalid payment payload")
+        authorization = payload.get("authorization")
+        if not isinstance(authorization, dict):
+            raise ValueError("invalid payment authorization")
         address = str(authorization["from"]).lower()
         address_bytes = bytes.fromhex(address.removeprefix("0x"))
         nonce_bytes = bytes.fromhex(

@@ -144,7 +144,9 @@ from x402_job_service import (
     load_job_token_secret,
 )
 from x402_job_store import X402JobStore
-from x402_verify import U_TOKEN_BSC_TESTNET, VerifiedPayment
+from x402_promo import promo_free_mode
+from x402_tokens import token_by_asset
+from x402_verify import VerifiedPayment
 
 
 def build_x402_job_service(
@@ -154,6 +156,7 @@ def build_x402_job_service(
     s3_client: Any | None = None,
 ) -> X402JobService | None:
     """Build the optional asynchronous x402 runtime from complete config."""
+    promo_free = promo_free_mode(env)
     bucket = env.get("X402_JOB_S3_BUCKET", "").strip()
     secret = env.get("X402_JOB_TOKEN_SECRET", "")
     if not bucket and not secret:
@@ -169,6 +172,9 @@ def build_x402_job_service(
     )
 
     async def authorization_used(payment: VerifiedPayment) -> bool:
+        payment_token = token_by_asset(payment.asset)
+        if payment_token is None:
+            raise X402JobError("invalid_payment_asset")
         client = get_8183_client()
         authorizer = client.w3.to_checksum_address(payment.from_address)
         abi = [
@@ -184,7 +190,7 @@ def build_x402_job_service(
             }
         ]
         token = client.w3.eth.contract(
-            address=U_TOKEN_BSC_TESTNET,
+            address=payment_token.address,
             abi=abi,
         )
         return bool(
@@ -204,6 +210,7 @@ def build_x402_job_service(
         report=report_competition_call,
         stream_work=stream_work,
         accept_new_jobs=accept_new_jobs,
+        promo_free=promo_free,
     )
 
 # --- Paymaster patch -----------------------------------------------------------
@@ -363,7 +370,10 @@ def _try_parse_report(text: str) -> StockReport | None:
         json_str = _extract_json(text)
         return StockReport.model_validate_json(json_str)
     except Exception as exc:
-        _log.warning("report parse/validation failed: %s", exc)
+        _log.warning(
+            "report parse/validation failed (%s)",
+            type(exc).__name__,
+        )
         return None
 
 
@@ -475,9 +485,18 @@ async def _stream_runner(
 
     report = _try_parse_report(raw)
     if report is None:
-        # Fallback: deliver raw text (buyer still gets something)
-        _log.warning("x402 stream: structured parse failed; delivering raw text (session %s)", session_id)
-        yield "report", {"content": raw, "format": "text"}
+        if not raw:
+            _log.warning(
+                "x402 stream: empty final response (session %s)",
+                session_id,
+            )
+        else:
+            _log.warning(
+                "x402 stream: structured parse failed; delivering raw text "
+                "(session %s)",
+                session_id,
+            )
+            yield "report", {"content": raw, "format": "text"}
     else:
         if symbols:
             returned = {a.symbol.upper() for a in report.analyses}
@@ -537,7 +556,7 @@ def _format_free_report(symbol: str, quote: dict) -> str:
         (
             "> **Full analysis** (RSI / MACD / Bollinger Bands, options sentiment, "
             "insider activity, portfolio rebalancing) "
-            "→ **Paid tier (1.0 U)** via `POST /x402/analyze/async`"
+            "→ **Paid tier (0.21 U)** via `POST /x402/analyze/async`"
         ),
     ]
     return "\n".join(lines)
@@ -762,7 +781,7 @@ if __name__ == "__main__":
         #
         # Port layout:
         #   a2a_port  (9000) → A2A only — behind AgentCore Cognito gateway (ERC-8183 flow)
-        #   x402_port (9001) → x402 only — public, X-Payment auth, no Cognito (x402 flow)
+        #   x402_port (9001) → x402 only — public, Payment-Signature auth, no Cognito (x402 flow)
         #
         # In local dev X402_PORT is NOT set; the combined single-port mode below is used instead.
 

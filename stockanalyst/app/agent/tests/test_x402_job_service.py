@@ -7,7 +7,7 @@ import threading
 import unittest
 from dataclasses import replace
 from typing import Any
-from unittest.mock import ANY, AsyncMock, patch
+from unittest.mock import ANY, AsyncMock, Mock, patch
 
 import httpx
 
@@ -17,12 +17,15 @@ from x402_handler import _settle_generic
 from x402_job_service import (
     CreateJobResult,
     JobIdentityCollision,
+    SettlementIndeterminate,
     X402JobError,
     X402JobService,
     load_job_token_secret,
 )
 from x402_job_store import JobConflict, StoredJob
+from x402_promo import PromoRateLimiter
 from x402_verify import CHAIN_ID, VerifiedPayment, validate_payment_proof
+from x402_tokens import U_TOKEN, USD1_TOKEN
 
 ADDRESS = "0x1111111111111111111111111111111111111111"
 NONCE = "0x" + "22" * 32
@@ -33,16 +36,24 @@ STALE_TIME = NOW + 120_001
 TOKEN_SECRET = b"test-only-token-secret-with-32-bytes"
 
 
-def verified_payment(*, valid_before: int = NOW // 1000 + 600) -> VerifiedPayment:
+def verified_payment(
+    *,
+    valid_before: int = NOW // 1000 + 600,
+    token=U_TOKEN,
+    promotional: bool = False,
+) -> VerifiedPayment:
     return VerifiedPayment(
         proof={},
         from_address=ADDRESS,
         to_address="0x2222222222222222222222222222222222222222",
-        value=10**18,
+        value=210_000_000_000_000_000,
         valid_after=NOW // 1000 - 60,
         valid_before=valid_before,
         nonce=NONCE,
         nonce_bytes=bytes.fromhex(NONCE.removeprefix("0x")),
+        asset=token.address,
+        token_symbol=token.symbol,
+        promotional=promotional,
     )
 
 
@@ -291,6 +302,9 @@ def make_service(
     heartbeat_sleep: Any = asyncio.sleep,
     accounting_sleep: Any = None,
     accounting_retry_attempts: int = 3,
+    promo_free: bool = False,
+    promo_limiter: PromoRateLimiter | None = None,
+    accept_new_jobs: bool = True,
 ) -> X402JobService:
     async def idle_stream(
         _prompt: str,
@@ -317,6 +331,9 @@ def make_service(
         heartbeat_sleep=heartbeat_sleep,
         accounting_sleep=accounting_sleep or immediate_accounting_sleep,
         accounting_retry_attempts=accounting_retry_attempts,
+        promo_free=promo_free,
+        promo_limiter=promo_limiter,
+        accept_new_jobs=accept_new_jobs,
     )
 
 
@@ -388,6 +405,8 @@ async def seed_execution_job(
             "jobId": identity.job_id,
             "paymentKey": identity.payment_key,
             "paymentStatus": "settled",
+            "paymentMode": "paid",
+            "asset": U_TOKEN.address.lower(),
             "settlementReference": "0xtx",
             "address": ADDRESS,
             "status": status,
@@ -442,6 +461,92 @@ class X402JobIdentityTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(first, second)
         self.assertRegex(first.job_id, r"^x402_[0-9a-f]{32}$")
         self.assertEqual(len(base64.urlsafe_b64decode(first.job_token + "==")), 32)
+
+    async def test_u_identity_and_event_keep_legacy_material(self) -> None:
+        service = make_service()
+        payment = verified_payment(token=U_TOKEN)
+        legacy_material = f"{CHAIN_ID}:{ADDRESS}:{NONCE}".encode()
+        expected_key = hashlib.sha256(legacy_material).hexdigest()
+
+        identity = service.derive_identity(payment)
+
+        self.assertEqual(identity.payment_key, expected_key)
+        self.assertEqual(identity.job_id, f"x402_{expected_key[:32]}")
+        self.assertEqual(
+            service._competition_event_id(payment),
+            f"b402:{CHAIN_ID}:{ADDRESS}:{NONCE}",
+        )
+
+    async def test_usd1_identity_and_event_are_asset_scoped(self) -> None:
+        service = make_service()
+        u_payment = verified_payment(token=U_TOKEN)
+        usd1_payment = verified_payment(token=USD1_TOKEN)
+        equivalent_usd1 = replace(
+            usd1_payment,
+            asset=USD1_TOKEN.address.upper().replace("0X", "0x"),
+        )
+        normalized_asset = USD1_TOKEN.address.lower()
+        scoped_material = (
+            f"asset:{normalized_asset}:{CHAIN_ID}:{ADDRESS}:{NONCE}".encode()
+        )
+        expected_key = hashlib.sha256(scoped_material).hexdigest()
+
+        u_identity = service.derive_identity(u_payment)
+        usd1_identity = service.derive_identity(usd1_payment)
+
+        self.assertNotEqual(usd1_identity, u_identity)
+        self.assertEqual(usd1_identity.payment_key, expected_key)
+        self.assertEqual(
+            service.derive_identity(equivalent_usd1),
+            usd1_identity,
+        )
+        self.assertEqual(
+            service._competition_event_id(usd1_payment),
+            f"b402:{CHAIN_ID}:{ADDRESS}:{NONCE}:{normalized_asset}",
+        )
+
+    async def test_paid_u_legacy_usd1_and_promotional_identities_are_isolated(
+        self,
+    ) -> None:
+        service = make_service()
+        paid_u = service.derive_identity(
+            verified_payment(token=U_TOKEN, promotional=False)
+        )
+        paid_usd1 = service.derive_identity(
+            verified_payment(token=USD1_TOKEN, promotional=False)
+        )
+        promo_u = service.derive_identity(
+            verified_payment(token=U_TOKEN, promotional=True)
+        )
+        legacy_key = hashlib.sha256(
+            f"{CHAIN_ID}:{ADDRESS}:{NONCE}".encode()
+        ).hexdigest()
+
+        self.assertEqual(paid_u.job_id, f"x402_{legacy_key[:32]}")
+        self.assertNotEqual(paid_u.job_id, paid_usd1.job_id)
+        self.assertNotEqual(paid_u.job_id, promo_u.job_id)
+
+    async def test_promotional_identity_is_asset_scoped(self) -> None:
+        service = make_service()
+        promo_u = service.derive_identity(
+            verified_payment(token=U_TOKEN, promotional=True)
+        )
+        promo_usd1 = service.derive_identity(
+            verified_payment(token=USD1_TOKEN, promotional=True)
+        )
+
+        self.assertNotEqual(promo_u.job_id, promo_usd1.job_id)
+
+    async def test_identity_rejects_unknown_asset(self) -> None:
+        service = make_service()
+        payment = replace(
+            verified_payment(),
+            asset="0x" + "99" * 20,
+            token_symbol="UNKNOWN",
+        )
+
+        with self.assertRaisesRegex(X402JobError, "invalid_payment_identity"):
+            service.derive_identity(payment)
 
     async def test_equivalent_payment_representations_derive_same_handle(
         self,
@@ -545,7 +650,372 @@ class X402JobIdentityTests(unittest.IsolatedAsyncioTestCase):
             await service.create_job(PROOF, REQUEST)
 
 
+class X402PromotionalJobCreationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_proofless_create_is_queued_without_payment_side_effects(
+        self,
+    ) -> None:
+        store = MemoryJobStore()
+        settle = AsyncMock()
+        authorization_used = AsyncMock()
+        limiter = PromoRateLimiter(limit=1, clock=lambda: NOW / 1000)
+        service = make_service(
+            store=store,
+            settle=settle,
+            authorization_used=authorization_used,
+            promo_free=True,
+            promo_limiter=limiter,
+        )
+
+        with (
+            patch(
+                "x402_job_service.validate_payment_proof",
+                side_effect=AssertionError("promo must not validate payment"),
+            ) as validate,
+            patch.object(service, "_spawn") as spawn,
+        ):
+            result = await service.create_promotional_job(
+                REQUEST,
+                source_ip="198.51.100.8",
+            )
+
+        validate.assert_not_called()
+        settle.assert_not_awaited()
+        authorization_used.assert_not_awaited()
+        spawn.assert_called_once_with(result.job_id)
+        record = store.jobs[result.job_id].record
+        self.assertEqual(record["status"], "queued")
+        self.assertEqual(record["paymentStatus"], "promotional")
+        self.assertEqual(record["paymentMode"], "promotional")
+        self.assertIsNone(record["asset"])
+        self.assertIsNone(record["address"])
+        self.assertNotIn("sourceIp", record)
+        self.assertNotIn("proof", record)
+
+    async def test_proofless_create_requires_a_trusted_source_ip(self) -> None:
+        store = MemoryJobStore()
+        service = make_service(store=store, promo_free=True)
+
+        with self.assertRaises(X402JobError) as raised:
+            await service.create_promotional_job(REQUEST, source_ip=None)
+
+        self.assertEqual(raised.exception.code, "promo_source_ip_required")
+        self.assertEqual(store.create_calls, 0)
+
+    async def test_proofless_create_rejects_invalid_ip_without_consuming_quota(
+        self,
+    ) -> None:
+        limiter = PromoRateLimiter(limit=1, clock=lambda: NOW / 1000)
+        service = make_service(
+            store=MemoryJobStore(),
+            promo_free=True,
+            promo_limiter=limiter,
+        )
+
+        with self.assertRaises(X402JobError) as raised:
+            await service.create_promotional_job(
+                REQUEST,
+                source_ip="not-an-ip",
+            )
+
+        self.assertEqual(raised.exception.code, "promo_source_ip_required")
+        limiter.reserve("198.51.100.8").commit()
+
+    async def test_invalid_request_does_not_consume_promotional_quota(
+        self,
+    ) -> None:
+        limiter = PromoRateLimiter(limit=1, clock=lambda: NOW / 1000)
+        service = make_service(
+            store=MemoryJobStore(),
+            promo_free=True,
+            promo_limiter=limiter,
+        )
+
+        with self.assertRaises(X402JobError) as raised:
+            await service.create_promotional_job(
+                {"symbols": []},
+                source_ip="198.51.100.8",
+            )
+
+        self.assertEqual(raised.exception.code, "invalid_request")
+        limiter.reserve("198.51.100.8").commit()
+
+    async def test_paused_mode_does_not_consume_promotional_quota(self) -> None:
+        limiter = PromoRateLimiter(limit=1, clock=lambda: NOW / 1000)
+        service = make_service(
+            store=MemoryJobStore(),
+            promo_free=True,
+            promo_limiter=limiter,
+            accept_new_jobs=False,
+        )
+
+        with self.assertRaises(X402JobError) as raised:
+            await service.create_promotional_job(
+                REQUEST,
+                source_ip="198.51.100.8",
+            )
+
+        self.assertEqual(raised.exception.code, "async_jobs_paused")
+        limiter.reserve("198.51.100.8").commit()
+
+    async def test_paid_mode_rejects_proofless_create(self) -> None:
+        store = MemoryJobStore()
+        limiter = PromoRateLimiter(limit=1, clock=lambda: NOW / 1000)
+        service = make_service(
+            store=store,
+            promo_free=False,
+            promo_limiter=limiter,
+        )
+
+        with self.assertRaises(X402JobError) as raised:
+            await service.create_promotional_job(
+                REQUEST,
+                source_ip="198.51.100.8",
+            )
+
+        self.assertEqual(raised.exception.code, "payment_required")
+        self.assertEqual(store.create_calls, 0)
+        limiter.reserve("198.51.100.8").commit()
+
+    async def test_signed_create_is_disabled_while_promo_is_enabled(self) -> None:
+        service = make_service(store=MemoryJobStore(), promo_free=True)
+
+        with (
+            patch(
+                "x402_job_service.validate_payment_proof",
+                side_effect=AssertionError("promo must not validate payment"),
+            ) as validate,
+            self.assertRaises(X402JobError) as raised,
+        ):
+            await service.create_job(PROOF, REQUEST)
+
+        self.assertEqual(raised.exception.code, "payment_not_required")
+        validate.assert_not_called()
+
+    async def test_store_failure_rolls_back_promotional_reservation(self) -> None:
+        class FailingCreateStore(MemoryJobStore):
+            async def create(self, record: dict[str, Any]) -> StoredJob | None:
+                raise RuntimeError("s3 unavailable")
+
+        limiter = PromoRateLimiter(limit=1, clock=lambda: NOW / 1000)
+        service = make_service(
+            store=FailingCreateStore(),
+            promo_free=True,
+            promo_limiter=limiter,
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "s3 unavailable"):
+            await service.create_promotional_job(
+                REQUEST,
+                source_ip="198.51.100.8",
+            )
+
+        limiter.reserve("198.51.100.8").commit()
+
+    async def test_identical_promotional_requests_create_distinct_jobs(
+        self,
+    ) -> None:
+        store = MemoryJobStore()
+        limiter = PromoRateLimiter(limit=2, clock=lambda: NOW / 1000)
+        service = make_service(
+            store=store,
+            promo_free=True,
+            promo_limiter=limiter,
+        )
+
+        with patch.object(service, "_spawn"):
+            first = await service.create_promotional_job(
+                REQUEST,
+                source_ip="198.51.100.8",
+            )
+            second = await service.create_promotional_job(
+                REQUEST,
+                source_ip="198.51.100.8",
+            )
+
+        self.assertNotEqual(first.job_id, second.job_id)
+        self.assertNotEqual(first.job_token, second.job_token)
+        self.assertEqual(len(store.jobs), 2)
+        self.assertEqual(
+            sum(len(events) for events in limiter._events.values()),
+            2,
+        )
+        with self.assertRaisesRegex(RuntimeError, "promo_rate_limited"):
+            limiter.reserve("198.51.100.8")
+
+    async def test_random_identity_collision_retries_without_extra_quota(
+        self,
+    ) -> None:
+        store = MemoryJobStore()
+        limiter = PromoRateLimiter(limit=2, clock=lambda: NOW / 1000)
+        service = make_service(
+            store=store,
+            promo_free=True,
+            promo_limiter=limiter,
+        )
+        collision = service._identity_from_payment_key((b"a" * 32).hex())
+        unique = service._identity_from_payment_key((b"b" * 32).hex())
+
+        with (
+            patch.object(service, "_spawn"),
+            patch.object(
+                service,
+                "_new_promotional_identity",
+                side_effect=[collision, collision, unique],
+            ),
+        ):
+            first = await service.create_promotional_job(
+                REQUEST,
+                source_ip="198.51.100.8",
+            )
+            second = await service.create_promotional_job(
+                REQUEST,
+                source_ip="198.51.100.8",
+            )
+
+        self.assertNotEqual(first.job_id, second.job_id)
+        self.assertEqual(store.create_calls, 3)
+        self.assertEqual(
+            sum(len(events) for events in limiter._events.values()),
+            2,
+        )
+
+    async def test_random_identity_collision_exhaustion_rolls_back_quota(
+        self,
+    ) -> None:
+        store = MemoryJobStore()
+        limiter = PromoRateLimiter(limit=2, clock=lambda: NOW / 1000)
+        service = make_service(
+            store=store,
+            promo_free=True,
+            promo_limiter=limiter,
+        )
+        collision = service._identity_from_payment_key((b"a" * 32).hex())
+
+        with (
+            patch.object(service, "_spawn"),
+            patch.object(
+                service,
+                "_new_promotional_identity",
+                return_value=collision,
+            ),
+        ):
+            await service.create_promotional_job(
+                REQUEST,
+                source_ip="198.51.100.8",
+            )
+            with self.assertRaises(X402JobError) as raised:
+                await service.create_promotional_job(
+                    REQUEST,
+                    source_ip="198.51.100.8",
+                )
+
+        self.assertEqual(raised.exception.code, "promo_identity_unavailable")
+        self.assertEqual(store.create_calls, 4)
+        self.assertEqual(
+            sum(len(events) for events in limiter._events.values()),
+            1,
+        )
+        limiter.reserve("198.51.100.8").commit()
+
+
 class X402JobSettlementTests(unittest.IsolatedAsyncioTestCase):
+    async def test_settlement_reference_uses_visible_ascii_byte_boundary(
+        self,
+    ) -> None:
+        accepted = make_service(
+            settle=AsyncMock(return_value=(True, "x" * 4_096)),
+        )
+        self.assertEqual(
+            await accepted._settle_payment(PROOF),
+            (True, "x" * 4_096),
+        )
+
+        invalid_references = (
+            "x" * 4_094 + "\U0001f600",
+            "contains space",
+            "line\nbreak",
+            "delete\x7f",
+        )
+        for reference in invalid_references:
+            service = make_service(
+                settle=AsyncMock(return_value=(True, reference)),
+            )
+            with (
+                self.subTest(reference=repr(reference)),
+                self.assertRaises(SettlementIndeterminate),
+            ):
+                await service._settle_payment(PROOF)
+
+    async def test_successful_settlement_requires_a_nonempty_reference(
+        self,
+    ) -> None:
+        store = MemoryJobStore()
+        service = make_service(
+            store=store,
+            settle=AsyncMock(return_value=(True, "")),
+        )
+
+        with (
+            patch(
+                "x402_job_service.validate_payment_proof",
+                return_value=(verified_payment(), ""),
+            ),
+            self.assertRaises(SettlementIndeterminate),
+        ):
+            await service.create_job(PROOF, REQUEST)
+
+        identity = service.derive_identity(verified_payment())
+        stored = store.jobs[identity.job_id].record
+        self.assertEqual(stored["paymentStatus"], "settling")
+        self.assertIsNone(stored["settlementReference"])
+
+    async def test_overlong_settlement_reference_is_not_persisted(self) -> None:
+        store = MemoryJobStore()
+        service = make_service(
+            store=store,
+            settle=AsyncMock(return_value=(True, "x" * 4_097)),
+        )
+
+        with (
+            patch(
+                "x402_job_service.validate_payment_proof",
+                return_value=(verified_payment(), ""),
+            ),
+            self.assertRaises(SettlementIndeterminate),
+        ):
+            await service.create_job(PROOF, REQUEST)
+
+        identity = service.derive_identity(verified_payment())
+        stored = store.jobs[identity.job_id].record
+        self.assertEqual(stored["paymentStatus"], "settling")
+        self.assertIsNone(stored["settlementReference"])
+
+    async def test_overlong_stored_reference_is_not_publicly_projected(
+        self,
+    ) -> None:
+        store = MemoryJobStore()
+        service = make_service(store=store)
+        stored = await seed_settling_job(
+            service,
+            store,
+            lease_expires_at=NOW,
+        )
+        corrupted = StoredJob(
+            record={
+                **stored.record,
+                "paymentStatus": "settled",
+                "status": "queued",
+                "settlementReference": "x" * 4_097,
+            },
+            etag=stored.etag,
+        )
+        identity = service.derive_identity(verified_payment())
+
+        with self.assertRaises(X402JobError) as raised:
+            service._create_result(identity, corrupted)
+
+        self.assertEqual(raised.exception.code, "job_state_unavailable")
+
     async def test_indeterminate_settlement_stays_recoverable_after_response_loss(
         self,
     ) -> None:
@@ -595,9 +1065,11 @@ class X402JobSettlementTests(unittest.IsolatedAsyncioTestCase):
         self,
     ) -> None:
         store = MemoryJobStore()
+        stream_work = Mock(side_effect=AssertionError("work must not start"))
         service = make_service(
             store=store,
             settle=AsyncMock(return_value=(False, "authorization rejected")),
+            stream_work=stream_work,
         )
 
         with (
@@ -615,6 +1087,8 @@ class X402JobSettlementTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(failed["status"], "failed")
         self.assertEqual(failed["paymentStatus"], "failed")
         self.assertEqual(failed["errorCode"], "payment_failed")
+        stream_work.assert_not_called()
+        self.assertFalse(service._tasks)
 
     async def test_malformed_settlement_result_is_indeterminate(self) -> None:
         store = MemoryJobStore()
@@ -685,6 +1159,15 @@ class X402JobSettlementTests(unittest.IsolatedAsyncioTestCase):
 
         await wait_for_accounting(service)
         self.assertEqual(result.status, "queued")
+        self.assertEqual(
+            result.payment_response,
+            {
+                "success": True,
+                "transaction": "",
+                "network": "eip155:56",
+                "payer": ADDRESS,
+            },
+        )
         authorization_used.assert_awaited_once()
         settle.assert_not_awaited()
         report.assert_awaited_once()
@@ -1755,32 +2238,269 @@ class X402JobExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(raised.exception.code, "attempts_exhausted")
         self.assertFalse(service.is_busy())
 
-    async def test_missing_report_is_a_deterministic_failure(self) -> None:
+    async def test_empty_analysis_retries_twice_then_succeeds(self) -> None:
         store = MemoryJobStore()
+        settle = AsyncMock()
+        authorization_used = AsyncMock()
+        sessions: list[str] = []
+        calls = 0
 
-        async def no_report(
+        async def stream(
             _prompt: str,
-            _session_id: str,
+            session_id: str,
             _symbols: list[str],
         ) -> Any:
-            yield "progress", {"stage": "collecting"}
+            nonlocal calls
+            calls += 1
+            sessions.append(session_id)
+            if calls == 3:
+                yield "report", {
+                    "content": "usable report",
+                    "format": "text",
+                }
             yield "done", {}
 
-        service = make_service(store=store, stream_work=no_report)
+        service = make_service(
+            store=store,
+            stream_work=stream,
+            settle=settle,
+            authorization_used=authorization_used,
+        )
         created = await seed_execution_job(
             service,
             store,
             status="queued",
         )
 
-        service._spawn(created.job_id)
-        await service.wait_for_idle()
+        with patch(
+            "x402_job_service.validate_payment_proof",
+            side_effect=AssertionError("execution must not validate payment"),
+        ) as validate:
+            await service._run_job(created.job_id)
+
+        record = store.jobs[created.job_id].record
+        self.assertEqual(record["status"], "succeeded")
+        self.assertEqual(record["attempt"], 1)
+        self.assertEqual(calls, 3)
+        self.assertEqual(
+            sessions,
+            [
+                f"{created.job_id}-attempt-1-llm-1",
+                f"{created.job_id}-attempt-1-llm-2",
+                f"{created.job_id}-attempt-1-llm-3",
+            ],
+        )
+        self.assertEqual(len(set(sessions)), 3)
+        validate.assert_not_called()
+        settle.assert_not_awaited()
+        authorization_used.assert_not_awaited()
+        self.assertFalse(service.is_busy())
+
+    async def test_three_empty_calls_are_resumable_without_resettlement(
+        self,
+    ) -> None:
+        store = MemoryJobStore()
+        settle = AsyncMock()
+        authorization_used = AsyncMock()
+        sessions: list[str] = []
+
+        async def empty_stream(
+            _prompt: str,
+            session_id: str,
+            _symbols: list[str],
+        ) -> Any:
+            sessions.append(session_id)
+            yield "done", {}
+
+        service = make_service(
+            store=store,
+            stream_work=empty_stream,
+            settle=settle,
+            authorization_used=authorization_used,
+        )
+        created = await seed_execution_job(
+            service,
+            store,
+            status="queued",
+        )
+        settled_fields = {
+            key: store.jobs[created.job_id].record[key]
+            for key in (
+                "paymentStatus",
+                "paymentMode",
+                "asset",
+                "settlementReference",
+                "settledAt",
+            )
+        }
+
+        with patch(
+            "x402_job_service.validate_payment_proof",
+            side_effect=AssertionError("resume must not validate payment"),
+        ) as validate:
+            await service._run_job(created.job_id)
+            failed = store.jobs[created.job_id].record
+            self.assertEqual(failed["errorCode"], "analysis_empty_response")
+            self.assertIs(failed["retryable"], True)
+            self.assertEqual(failed["attempt"], 1)
+            self.assertEqual(len(sessions), 3)
+
+            await service.resume_job(created.job_id, created.job_token)
+            await service.wait_for_idle()
+
+        resumed = store.jobs[created.job_id].record
+        self.assertEqual(resumed["errorCode"], "analysis_empty_response")
+        self.assertIs(resumed["retryable"], True)
+        self.assertEqual(resumed["attempt"], 2)
+        self.assertEqual(
+            {key: resumed[key] for key in settled_fields},
+            settled_fields,
+        )
+        self.assertEqual(len(sessions), 6)
+        self.assertEqual(len(set(sessions)), 6)
+        validate.assert_not_called()
+        settle.assert_not_awaited()
+        authorization_used.assert_not_awaited()
+
+    async def test_three_outer_attempts_exhaust_at_nine_inner_calls(
+        self,
+    ) -> None:
+        store = MemoryJobStore()
+        settle = AsyncMock()
+        authorization_used = AsyncMock()
+        sessions: list[str] = []
+
+        async def empty_stream(
+            _prompt: str,
+            session_id: str,
+            _symbols: list[str],
+        ) -> Any:
+            sessions.append(session_id)
+            yield "done", {}
+
+        service = make_service(
+            store=store,
+            stream_work=empty_stream,
+            settle=settle,
+            authorization_used=authorization_used,
+        )
+        created = await seed_execution_job(
+            service,
+            store,
+            status="queued",
+        )
+
+        with patch(
+            "x402_job_service.validate_payment_proof",
+            side_effect=AssertionError("retry must not validate payment"),
+        ) as validate:
+            await service._run_job(created.job_id)
+            for _ in range(2):
+                await service.resume_job(created.job_id, created.job_token)
+                await service.wait_for_idle()
+            with self.assertRaises(X402JobError) as raised:
+                await service.resume_job(created.job_id, created.job_token)
 
         failed = store.jobs[created.job_id].record
+        self.assertEqual(raised.exception.code, "attempts_exhausted")
         self.assertEqual(failed["status"], "failed")
-        self.assertEqual(failed["errorCode"], "analysis_failed")
-        self.assertFalse(failed["retryable"])
-        self.assertFalse(service.is_busy())
+        self.assertEqual(failed["errorCode"], "analysis_empty_response")
+        self.assertIs(failed["retryable"], True)
+        self.assertEqual(failed["attempt"], 3)
+        self.assertEqual(len(sessions), 9)
+        self.assertEqual(len(set(sessions)), 9)
+        self.assertEqual(
+            sessions,
+            [
+                f"{created.job_id}-attempt-{outer}-llm-{inner}"
+                for outer in range(1, 4)
+                for inner in range(1, 4)
+            ],
+        )
+        validate.assert_not_called()
+        settle.assert_not_awaited()
+        authorization_used.assert_not_awaited()
+
+    async def test_settlement_happens_once_across_empty_retries_and_resumes(
+        self,
+    ) -> None:
+        store = MemoryJobStore()
+        settle = AsyncMock(return_value=(True, "0xsettled-once"))
+        authorization_used = AsyncMock()
+        calls = 0
+
+        async def empty_stream(
+            _prompt: str,
+            _session_id: str,
+            _symbols: list[str],
+        ) -> Any:
+            nonlocal calls
+            calls += 1
+            yield "done", {}
+
+        service = make_service(
+            store=store,
+            stream_work=empty_stream,
+            settle=settle,
+            authorization_used=authorization_used,
+        )
+
+        with patch(
+            "x402_job_service.validate_payment_proof",
+            return_value=(verified_payment(), ""),
+        ) as validate:
+            created = await service.create_job(PROOF, REQUEST)
+            await service.wait_for_idle()
+            for _ in range(2):
+                await service.resume_job(created.job_id, created.job_token)
+                await service.wait_for_idle()
+
+        durable = store.jobs[created.job_id].record
+        self.assertEqual(durable["paymentStatus"], "settled")
+        self.assertEqual(durable["settlementReference"], "0xsettled-once")
+        self.assertEqual(durable["status"], "failed")
+        self.assertEqual(durable["errorCode"], "analysis_empty_response")
+        self.assertEqual(durable["attempt"], 3)
+        self.assertEqual(calls, 9)
+        self.assertEqual(validate.call_count, 1)
+        settle.assert_awaited_once_with(PROOF)
+        authorization_used.assert_not_awaited()
+
+    async def test_non_json_report_succeeds_without_retry(self) -> None:
+        store = MemoryJobStore()
+        sessions: list[str] = []
+
+        async def raw_stream(
+            _prompt: str,
+            session_id: str,
+            _symbols: list[str],
+        ) -> Any:
+            sessions.append(session_id)
+            yield "report", {
+                "content": "plain text, not JSON",
+                "format": "text",
+            }
+            yield "done", {}
+
+        service = make_service(store=store, stream_work=raw_stream)
+        created = await seed_execution_job(
+            service,
+            store,
+            status="queued",
+        )
+
+        await service._run_job(created.job_id)
+
+        succeeded = store.jobs[created.job_id].record
+        self.assertEqual(succeeded["status"], "succeeded")
+        self.assertEqual(
+            store.report_for_record(succeeded),
+            "plain text, not JSON",
+        )
+        self.assertEqual(
+            sessions,
+            [f"{created.job_id}-attempt-1-llm-1"],
+        )
 
     async def test_generator_exception_is_retryable_without_detail(self) -> None:
         store = MemoryJobStore()
@@ -1856,6 +2576,81 @@ class X402JobExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(failed["errorCode"], "analysis_timeout")
         self.assertTrue(failed["retryable"])
         self.assertFalse(service.is_busy())
+
+    async def test_each_empty_retry_receives_a_fresh_timeout_budget(
+        self,
+    ) -> None:
+        store = MemoryJobStore()
+        calls = 0
+
+        async def slow_then_successful_stream(
+            _prompt: str,
+            _session_id: str,
+            _symbols: list[str],
+        ) -> Any:
+            nonlocal calls
+            calls += 1
+            await asyncio.sleep(0.06)
+            if calls == 2:
+                yield "report", {
+                    "content": "slow but usable",
+                    "format": "text",
+                }
+            yield "done", {}
+
+        service = make_service(
+            store=store,
+            stream_work=slow_then_successful_stream,
+            analysis_timeout_seconds=0.1,
+        )
+        created = await seed_execution_job(
+            service,
+            store,
+            status="queued",
+        )
+
+        await service._run_job(created.job_id)
+
+        succeeded = store.jobs[created.job_id].record
+        self.assertEqual(succeeded["status"], "succeeded")
+        self.assertEqual(calls, 2)
+        self.assertEqual(store.report_for_record(succeeded), "slow but usable")
+
+    async def test_timed_out_inner_call_does_not_continue_empty_retries(
+        self,
+    ) -> None:
+        store = MemoryJobStore()
+        calls = 0
+
+        async def blocked_stream(
+            _prompt: str,
+            _session_id: str,
+            _symbols: list[str],
+        ) -> Any:
+            nonlocal calls
+            calls += 1
+            await asyncio.Event().wait()
+            if False:
+                yield "done", {}
+
+        service = make_service(
+            store=store,
+            stream_work=blocked_stream,
+            analysis_timeout_seconds=0.01,
+        )
+        created = await seed_execution_job(
+            service,
+            store,
+            status="queued",
+        )
+
+        await service._run_job(created.job_id)
+
+        failed = store.jobs[created.job_id].record
+        self.assertEqual(failed["status"], "failed")
+        self.assertEqual(failed["errorCode"], "analysis_timeout")
+        self.assertIs(failed["retryable"], True)
+        self.assertEqual(calls, 1)
 
     async def test_cancelled_worker_leaves_recoverable_running_state(
         self,

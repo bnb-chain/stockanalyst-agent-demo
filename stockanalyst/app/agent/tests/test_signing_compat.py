@@ -114,5 +114,28 @@ class QuoteSignatureCompatibilityTests(unittest.TestCase):
         self.assertIsNone(signing.recover_quote_signer_compat("not-json"))
 
 
+class MainnetPriceConfigurationTests(unittest.TestCase):
+    def test_erc8183_list_price_and_floor_are_exactly_point_21_u(self) -> None:
+        configured = {
+            "payments": {
+                "erc8183": {
+                    "price": "210000000000000000",
+                    "min_price": "210000000000000000",
+                    "max_price": "5000000000000000000",
+                }
+            }
+        }
+        with patch.object(signing.config, "load_studio_toml", return_value=configured):
+            self.assertEqual(signing.list_price(), 210000000000000000)
+            self.assertEqual(
+                signing.price_bounds(),
+                (210000000000000000, 5000000000000000000),
+            )
+            self.assertEqual(
+                signing.clamp_price(signing.list_price()),
+                210000000000000000,
+            )
+
+
 if __name__ == "__main__":
     unittest.main()

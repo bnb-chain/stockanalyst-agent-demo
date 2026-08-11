@@ -15,7 +15,7 @@ runtime = "agentcore"
 protocol = "A2A"
 
 [network]
-default = "bsc-testnet"
+default = "bsc-mainnet"
 
 [deploy]
 # Deploy destination (orthogonal to [stack].runtime). 'platform' deploys
@@ -26,12 +26,14 @@ default = "bsc-testnet"
 destination = "self"
 # Artifact channel: 'codezip' for self-hosted AgentCore (managed runtime, no
 # Docker), 'zip' for platform uploads, or 'container' when Node is required.
-platform_artifact = "zip"
+platform_artifact = "codezip"
 packaging = "codezip"
 iam_notice_accepted_at = "2026-07-29T08:12:28Z"
 iam_notice_version = 1
-last_deploy_at = "2026-08-04T05:02:18Z"
-runtime_arn = "arn:aws:bedrock-agentcore:us-east-1:201243086760:runtime/stockanalyst_stockanalyst-hrXlh1BUtQ"
+last_deploy_at = "2026-08-11T02:39:55Z"
+runtime_arn = "arn:aws:bedrock-agentcore:us-east-1:201243086760:runtime/stockanalystmainnet_stockanalystmainnet-GVFwe5Etrj"
+# Public mainnet x402 gateway base; clients append /x402/* routes.
+#   X402_GATEWAY_PUBLIC_BASE_URL=https://stock-agent.bnbchain.org
 
 [wallet]
 # Local keystore signer. The Agent is the SOLE key-holder/signer.
@@ -42,7 +44,6 @@ signer = "local"
 keystore_dir = "../../.studio/wallets"
 # address = "0x..."   # filled by `bag wallet new`
 address = "0xd10BdDC20E4DC42A1a19a9653e994991e25b8153"
-platform_exposed_addresses = ["0xd10BdDC20E4DC42A1a19a9653e994991e25b8153"]
 
 [llm]
 provider = "openrouter"
@@ -75,9 +76,9 @@ check_interval_seconds = 60
 # Read by the Agent: it quotes the FIXED `price`, CLAMPS it to [min,max],
 # freezes a short-TTL offer, and EIP-191 signs it — pricing is rule-based, the
 # LLM never prices.
-currency = "0xc70B8741B8B07A6d61E54fd4B20f22Fa648E5565"   # $U token address — prefilled from [network].default
-price = "1000000000000000000"                  # wei — 1.0 U per analysis
-min_price = "500000000000000000"               # wei — 0.5 U floor
+currency = "0xcE24439F2D9C6a2289F741120FE202248B666666"   # $U token address — BSC mainnet
+price = "210000000000000000"                   # wei — 0.21 U per analysis
+min_price = "210000000000000000"               # wei — 0.21 U floor
 max_price = "5000000000000000000"              # wei — 5.0 U ceiling
 quote_ttl_seconds = 900                        # seconds a signed quote stays valid; SDK caps at 900 (~15min work window)
 default_estimated_completion_seconds = 600
@@ -88,7 +89,7 @@ auto_settle = false                            # opt-in: detect dispute-window-e
 # Local development fallback. Deployed S3 deliverable storage is installed
 # at runtime from DELIVERABLE_S3_BUCKET, DELIVERABLE_PUBLIC_BASE, and optional
 # DELIVERABLE_S3_PREFIX environment variables after runtime secrets load.
-kind = "local"
+kind = "s3"
 
 
 [payments.x402]
@@ -106,11 +107,11 @@ allowed_hosts = ["llm.pieverse.io"]
 # authorization and poll with a private job token.
 # Payment verification is FIXED CODE in x402_verify.py — never LLM-callable.
 enabled = true
-price_wei = "1000000000000000000"      # 1.0 U (same as [payments.erc8183].price)
-min_price_wei = "500000000000000000"   # 0.5 U floor (same as [payments.erc8183].min_price)
+price_wei = "210000000000000000"       # exact 0.21 U or USD1 (18 decimals)
+min_price_wei = "210000000000000000"   # 0.21-token floor
 endpoint = "/x402/analyze/async"
 # Price info:  GET /x402/price
-# Create:      POST /x402/analyze/async  (X-Payment: <base64 proof>) → 202
+# Create:      POST /x402/analyze/async  (Payment-Signature: <base64 proof>) → 202
 # Poll:        GET /x402/jobs/{jobId}    (X-Job-Token: <private token>)
 
 # ── Dual-port deployment (platform-side) ──────────────────────────────────────
@@ -119,7 +120,7 @@ endpoint = "/x402/analyze/async"
 #      uvicorn listener on this port serving ONLY x402 routes (no A2A, no Cognito)
 #   2. Exposes that port as a separate public endpoint (no AgentCore auth gateway)
 #   3. Returns x402_url in `bag deploy info` output
-# This lets the x402 channel (X-Payment auth) coexist with the A2A channel
+# This lets the x402 channel (Payment-Signature auth) coexist with the A2A channel
 # (Cognito Bearer auth) without routing conflicts inside AgentCore.
 port = 9001
 public = true
@@ -133,6 +134,8 @@ public = true
 #   bag env set B402_ACCESS_TOKEN  <your-accessToken>
 #   bag env set B402_BASE_URL      <your-Binance-sandbox-base-URL>
 #   bag env set B402_PRIVATE_KEY   <your-Base64-PKCS8-private-key>
+# Dedicated B402 payment recipient; independent from the Studio signing wallet.
+#   bag env set B402_PAY_TO_ADDRESS 0x15958aad30b758dAbfbB9788Da69dfcd56e89078
 #
 # ── Generic x402 facilitator (fallback, unauthenticated) ───────────────────
 #   bag env set X402_FACILITATOR_URL https://x402.org/facilitate
@@ -142,9 +145,34 @@ public = true
 # NEVER set X402_DEMO_MODE in production — signatures are verified but no
 # tokens are transferred, so any wallet can receive paid analysis without paying.
 #
-# ── U token EIP-712 domain (default "U" / "1") ─────────────────────────────
-#   bag env set U_TOKEN_DOMAIN_NAME    U
+# ── Fixed x402 token registry (BSC mainnet, chain ID 56) ─────────────────
+# U:    0xcE24439F2D9C6a2289F741120FE202248B666666
+#       domain "United Stables", version "1", 18 decimals, exact amount 0.21 U
+# USD1: 0x8d0D000Ee44948FC98c9B98A4FA4921476f08B0d
+#       domain "World Liberty Financial USD", version "1", 18 decimals,
+#       exact amount 0.21 USD1
+# Paid requirements use a valid signerAddress and B402 settlement.
+# Promotional access is proofless: paymentRequired=false, accepts=[],
+# and no payment proof is required; it never invokes B402 verify/settle.
+# USDC and USDT are deferred because their supported flow requires Permit2.
+#
+# ── Promotional asynchronous access (manual production control) ───────────
+# Disabled by default. Enable or disable explicitly, then redeploy:
+#   bag env set X402_PROMO_FREE_MODE 1
+#   bag env set X402_PROMO_FREE_MODE 0
+# Promotional access is IP-only at 30 accepted creates per rolling 24 hours.
+# The limiter is process-local: a restart clears it and multiple replicas do
+# not share it. The trusted IP comes from API Gateway requestContext, never
+# from a caller-controlled header. The public /x402/free route remains retired.
+#
+# ── Legacy U token compatibility settings ─────────────────────────────────
+#   bag env set U_TOKEN_DOMAIN_NAME    United Stables
 #   bag env set U_TOKEN_DOMAIN_VERSION 1
+#
+# These legacy variables support older local integrations only. They cannot
+# add, replace, or override entries in the fixed U/USD1 registry above.
+#   bag env set X402_CHAIN_ID      56
+#   bag env set X402_TOKEN_ADDRESS 0xcE24439F2D9C6a2289F741120FE202248B666666
 #
 # ── Competition successful-call accounting (optional) ──────────────────────
 # Set both variables to enable reporting; leave both unset to disable it.
@@ -174,14 +202,3 @@ public = true
 # access, and token secret through the latest job's expiresAt plus 30 minutes.
 #   bag env set X402_ASYNC_ACCEPT_NEW_JOBS 0
 #   bag deploy agent --force-deploy-broken-storage
-
-[deploy.platform]
-terms_accepted_at = "2026-07-16T15:01:53Z"
-slug = "stockanalyst"
-deployment_id = "01KXRHBEHZM8P69VT350TN274P"
-agent_id = "01KXNQ7T88G307WMG5C1DVSR00"
-invoke_url = "https://bnbagent-api.bnbchain.world/v1/rt/01KXNQ7T88G307WMG5C1DVSR00/.well-known/agent-card.json"
-last_deploy_at = "2026-07-17T17:19:15Z"
-
-[identity]
-endpoint = "https://bnbagent-api.bnbchain.world/v1/rt/01KXNQ7T88G307WMG5C1DVSR00/.well-known/agent-card.json"

@@ -17,6 +17,8 @@ from typing import Any
 
 from prompt_builder import _build_stock_analysis_prompt
 from x402_job_store import JobConflict, StoredJob, X402JobStore
+from x402_promo import PromoRateLimitExceeded, PromoRateLimiter
+from x402_tokens import U_TOKEN, token_by_asset
 from x402_verify import CHAIN_ID, VerifiedPayment, validate_payment_proof
 
 logger = logging.getLogger("seller-agent.x402.jobs")
@@ -31,13 +33,25 @@ _MAX_EXECUTION_ATTEMPTS = 3
 _CLAIM_DRIVE_ATTEMPTS = 3
 _DEFAULT_ACCOUNTING_RETRY_ATTEMPTS = 3
 _MAX_ACCOUNTING_BACKOFF_SECONDS = 30.0
+_MAX_PROMOTIONAL_IDENTITY_ATTEMPTS = 3
 
 
 class X402JobError(RuntimeError):
-    def __init__(self, code: str, *, retryable: bool = False) -> None:
+    def __init__(
+        self,
+        code: str,
+        *,
+        retryable: bool = False,
+        retry_after_seconds: int | None = None,
+        payment_response: Mapping[str, Any] | None = None,
+    ) -> None:
         super().__init__(code)
         self.code = code
         self.retryable = retryable
+        self.retry_after_seconds = retry_after_seconds
+        self.payment_response = (
+            dict(payment_response) if payment_response is not None else None
+        )
 
 
 class JobIdentityCollision(X402JobError):
@@ -63,6 +77,7 @@ class CreateJobResult:
     job_token: str
     status: str
     expires_at: int
+    payment_response: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -78,6 +93,27 @@ class JobView:
 
 class _MissingReport(RuntimeError):
     pass
+
+
+class _EmptyAnalysisResponse(RuntimeError):
+    pass
+
+
+_MAX_SETTLEMENT_REFERENCE_CHARACTERS = 4_096
+
+
+def is_valid_settlement_reference(
+    value: object,
+    *,
+    allow_unavailable: bool = False,
+) -> bool:
+    if value is None:
+        return allow_unavailable
+    return (
+        type(value) is str
+        and 1 <= len(value) <= _MAX_SETTLEMENT_REFERENCE_CHARACTERS
+        and all("!" <= character <= "~" for character in value)
+    )
 
 
 def load_job_token_secret(env: Mapping[str, str] = os.environ) -> bytes:
@@ -105,6 +141,8 @@ class X402JobService:
         heartbeat_sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         accounting_sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         accounting_retry_attempts: int = _DEFAULT_ACCOUNTING_RETRY_ATTEMPTS,
+        promo_free: bool = False,
+        promo_limiter: PromoRateLimiter | None = None,
     ) -> None:
         self._store = store
         self._token_secret = token_secret
@@ -118,6 +156,8 @@ class X402JobService:
         self._analysis_timeout_seconds = analysis_timeout_seconds
         self._heartbeat_sleep = heartbeat_sleep
         self._accounting_sleep = accounting_sleep
+        self._promo_free = promo_free
+        self._promo_limiter = promo_limiter or PromoRateLimiter()
         if not 1 <= accounting_retry_attempts <= 10:
             raise X402JobError("invalid_accounting_retry_attempts")
         self._accounting_retry_attempts = accounting_retry_attempts
@@ -129,6 +169,10 @@ class X402JobService:
     @property
     def accept_new_jobs(self) -> bool:
         return self._accept_new_jobs
+
+    @property
+    def promo_free(self) -> bool:
+        return self._promo_free
 
     @staticmethod
     def _token_matches(record: dict[str, Any], token: str) -> bool:
@@ -307,7 +351,7 @@ class X402JobService:
     @staticmethod
     def _canonical_payment_parts(
         payment: VerifiedPayment,
-    ) -> tuple[str, str]:
+    ) -> tuple[str, str, str]:
         address_text = payment.from_address.strip()
         if address_text[:2].lower() == "0x":
             address_text = address_text[2:]
@@ -322,20 +366,55 @@ class X402JobService:
             or len(nonce_bytes) != 32
         ):
             raise X402JobError("invalid_payment_identity")
-        return "0x" + address_bytes.hex(), "0x" + nonce_bytes.hex()
+        token = token_by_asset(payment.asset)
+        if token is None:
+            raise X402JobError("invalid_payment_identity")
+        return (
+            "0x" + address_bytes.hex(),
+            "0x" + nonce_bytes.hex(),
+            token.address.lower(),
+        )
 
     def derive_identity(self, payment: VerifiedPayment) -> JobIdentity:
-        canonical_address, canonical_nonce = self._canonical_payment_parts(
-            payment
-        )
-        material = (
-            str(CHAIN_ID).encode()
-            + b":"
-            + canonical_address.encode()
-            + b":"
-            + canonical_nonce.encode()
-        )
+        (
+            canonical_address,
+            canonical_nonce,
+            canonical_asset,
+        ) = self._canonical_payment_parts(payment)
+        if payment.promotional:
+            material = (
+                b"promo:"
+                + canonical_asset.encode()
+                + b":"
+                + str(CHAIN_ID).encode()
+                + b":"
+                + canonical_address.encode()
+                + b":"
+                + canonical_nonce.encode()
+            )
+        elif payment.token_symbol == "U":
+            material = (
+                str(CHAIN_ID).encode()
+                + b":"
+                + canonical_address.encode()
+                + b":"
+                + canonical_nonce.encode()
+            )
+        else:
+            material = (
+                b"asset:"
+                + canonical_asset.encode()
+                + b":"
+                + str(CHAIN_ID).encode()
+                + b":"
+                + canonical_address.encode()
+                + b":"
+                + canonical_nonce.encode()
+            )
         payment_key = hashlib.sha256(material).hexdigest()
+        return self._identity_from_payment_key(payment_key)
+
+    def _identity_from_payment_key(self, payment_key: str) -> JobIdentity:
         token_bytes = hmac.new(
             self._token_secret,
             b"x402-job-token:" + payment_key.encode(),
@@ -348,6 +427,9 @@ class X402JobService:
             job_token=job_token,
             job_token_hash=hashlib.sha256(job_token.encode()).hexdigest(),
         )
+
+    def _new_promotional_identity(self) -> JobIdentity:
+        return self._identity_from_payment_key(secrets.token_bytes(32).hex())
 
     def _normalize_request(self, request: dict[str, Any]) -> dict[str, Any]:
         raw_symbols = request.get("symbols")
@@ -398,9 +480,17 @@ class X402JobService:
         self,
         proof_header: str,
         request: dict[str, Any],
+        *,
+        source_ip: str | None = None,
     ) -> CreateJobResult:
+        if self._promo_free:
+            raise X402JobError("payment_not_required")
         now = int(self._clock())
-        payment, _reason = validate_payment_proof(proof_header, now=now // 1000)
+        payment, _reason = validate_payment_proof(
+            proof_header,
+            now=now // 1000,
+            promotional=False,
+        )
         expired_recovery = False
         if payment is None:
             if _reason != "authorization expired":
@@ -409,6 +499,7 @@ class X402JobService:
                 proof_header,
                 now=now // 1000,
                 allow_expired=True,
+                promotional=False,
             )
             if payment is None:
                 raise X402JobError("payment_rejected")
@@ -437,6 +528,8 @@ class X402JobService:
             "jobId": identity.job_id,
             "paymentKey": identity.payment_key,
             "paymentStatus": "settling",
+            "paymentMode": "paid",
+            "asset": payment.asset.lower(),
             "settlementReference": None,
             "reportId": None,
             "address": payment.from_address,
@@ -466,7 +559,7 @@ class X402JobService:
             ok, settlement_reference = await self._settle_payment(proof_header)
             if not ok:
                 await self._fail_settlement(stored)
-                raise X402JobError("payment_rejected")
+                raise self._payment_rejected_error(payment)
             stored = await self._mark_settled(
                 stored,
                 payment,
@@ -474,6 +567,68 @@ class X402JobService:
             )
         stored = await self._retry_accounting(stored, payment)
         return self._create_result_and_spawn(identity, stored)
+
+    async def create_promotional_job(
+        self,
+        request: dict[str, Any],
+        *,
+        source_ip: str | None,
+    ) -> CreateJobResult:
+        if not self._promo_free:
+            raise X402JobError("payment_required")
+        if not self._accept_new_jobs:
+            raise X402JobError("async_jobs_paused", retryable=True)
+        normalized_request = self._normalize_request(request)
+        if source_ip is None:
+            raise X402JobError("promo_source_ip_required")
+        try:
+            reservation = self._promo_limiter.reserve(source_ip)
+        except PromoRateLimitExceeded as exc:
+            raise X402JobError(
+                "promo_rate_limited",
+                retryable=True,
+                retry_after_seconds=exc.retry_after_seconds,
+            ) from None
+        except ValueError:
+            raise X402JobError("promo_source_ip_required") from None
+
+        now = int(self._clock())
+        try:
+            for _attempt in range(_MAX_PROMOTIONAL_IDENTITY_ATTEMPTS):
+                identity = self._new_promotional_identity()
+                record = {
+                    "version": 1,
+                    "jobId": identity.job_id,
+                    "paymentKey": identity.payment_key,
+                    "paymentStatus": "promotional",
+                    "paymentMode": "promotional",
+                    "asset": None,
+                    "settlementReference": None,
+                    "reportId": None,
+                    "address": None,
+                    "status": "queued",
+                    "request": normalized_request,
+                    "jobTokenHash": identity.job_token_hash,
+                    "competitionEventId": None,
+                    "settledAt": None,
+                    "attempt": 0,
+                    "leaseOwner": None,
+                    "leaseExpiresAt": None,
+                    "createdAt": now,
+                    "updatedAt": now,
+                    "expiresAt": now + 7 * 24 * 60 * 60 * 1000,
+                    "errorCode": None,
+                    "retryable": None,
+                }
+                stored = await self._store.create(record)
+                if stored is not None:
+                    reservation.commit()
+                    return self._create_result_and_spawn(identity, stored)
+        except BaseException:
+            reservation.rollback()
+            raise
+        reservation.rollback()
+        raise X402JobError("promo_identity_unavailable", retryable=True)
 
     def _create_result_and_spawn(
         self,
@@ -490,11 +645,39 @@ class X402JobService:
         identity: JobIdentity,
         stored: StoredJob,
     ) -> CreateJobResult:
+        payment_response = None
+        if stored.record.get("paymentStatus") == "settled":
+            settlement_reference = stored.record.get("settlementReference")
+            if not is_valid_settlement_reference(
+                settlement_reference,
+                allow_unavailable=True,
+            ):
+                raise X402JobError("job_state_unavailable", retryable=True)
+            payment_response = {
+                "success": True,
+                "transaction": settlement_reference or "",
+                "network": "eip155:56",
+                "payer": str(stored.record.get("address") or ""),
+            }
         return CreateJobResult(
             job_id=identity.job_id,
             job_token=identity.job_token,
             status=str(stored.record["status"]),
             expires_at=int(stored.record["expiresAt"]),
+            payment_response=payment_response,
+        )
+
+    @staticmethod
+    def _payment_rejected_error(payment: VerifiedPayment) -> X402JobError:
+        return X402JobError(
+            "payment_rejected",
+            payment_response={
+                "success": False,
+                "transaction": "",
+                "network": "eip155:56",
+                "payer": payment.from_address,
+                "errorReason": "payment_rejected",
+            },
         )
 
     async def _require_existing_identity(
@@ -538,7 +721,12 @@ class X402JobService:
             return await self._require_existing_identity(identity)
 
         if await self._authorization_used(payment):
-            return await self._mark_settled(stored, payment, None)
+            return await self._mark_settled(
+                stored,
+                payment,
+                None,
+                allow_unavailable=True,
+            )
 
         if now // 1000 >= payment.valid_before:
             await self._fail_settlement(stored)
@@ -547,7 +735,7 @@ class X402JobService:
         ok, settlement_reference = await self._settle_payment(proof_header)
         if not ok:
             await self._fail_settlement(stored)
-            raise X402JobError("payment_rejected")
+            raise self._payment_rejected_error(payment)
         return await self._mark_settled(
             stored,
             payment,
@@ -559,7 +747,14 @@ class X402JobService:
         stored: StoredJob,
         payment: VerifiedPayment,
         settlement_reference: str | None,
+        *,
+        allow_unavailable: bool = False,
     ) -> StoredJob:
+        if not is_valid_settlement_reference(
+            settlement_reference,
+            allow_unavailable=allow_unavailable,
+        ):
+            raise SettlementIndeterminate()
         existing_settled_at = stored.record.get("settledAt")
         settled_at = (
             existing_settled_at
@@ -611,17 +806,26 @@ class X402JobService:
         if (
             not isinstance(result, tuple)
             or len(result) != 2
-            or not isinstance(result[0], bool)
-            or not isinstance(result[1], str)
+            or type(result[0]) is not bool
+            or type(result[1]) is not str
         ):
+            raise SettlementIndeterminate()
+        if result[0] and not is_valid_settlement_reference(result[1]):
             raise SettlementIndeterminate()
         return result
 
     def _competition_event_id(self, payment: VerifiedPayment) -> str:
-        canonical_address, canonical_nonce = self._canonical_payment_parts(
-            payment
-        )
-        return f"b402:{CHAIN_ID}:{canonical_address}:{canonical_nonce}"
+        (
+            canonical_address,
+            canonical_nonce,
+            canonical_asset,
+        ) = self._canonical_payment_parts(payment)
+        legacy = f"b402:{CHAIN_ID}:{canonical_address}:{canonical_nonce}"
+        # Competition deduplication follows the same U-compatible transition
+        # as job identity: U remains byte-for-byte stable; non-U is asset scoped.
+        if canonical_asset == U_TOKEN.address.lower():
+            return legacy
+        return f"{legacy}:{canonical_asset}"
 
     async def _retry_accounting(
         self,
@@ -804,10 +1008,7 @@ class X402JobService:
             )
             try:
                 try:
-                    markdown = await asyncio.wait_for(
-                        self._consume_report(running.record),
-                        timeout=self._analysis_timeout_seconds,
-                    )
+                    markdown = await self._consume_report(running.record)
                 except TimeoutError:
                     await self._stop_heartbeat(heartbeat)
                     await self._fail_execution(
@@ -815,6 +1016,16 @@ class X402JobService:
                         lease_owner,
                         lease_lost,
                         error_code="analysis_timeout",
+                        retryable=True,
+                    )
+                    return
+                except _EmptyAnalysisResponse:
+                    await self._stop_heartbeat(heartbeat)
+                    await self._fail_execution(
+                        holder[0],
+                        lease_owner,
+                        lease_lost,
+                        error_code="analysis_empty_response",
                         retryable=True,
                     )
                     return
@@ -998,14 +1209,47 @@ class X402JobService:
             portfolio=request.get("portfolio") or [],
             risk_profile=request.get("riskProfile") or {},
         )
+        selected_symbols = effective_symbols or symbols
+        for inner_call in range(1, 4):
+            try:
+                return await asyncio.wait_for(
+                    self._consume_report_once(
+                        record,
+                        prompt=prompt,
+                        symbols=selected_symbols,
+                        inner_call=inner_call,
+                    ),
+                    timeout=self._analysis_timeout_seconds,
+                )
+            except _EmptyAnalysisResponse:
+                logger.warning(
+                    "x402 empty analysis response job=%s attempt=%s "
+                    "llm_call=%s",
+                    record["jobId"],
+                    record.get("attempt"),
+                    inner_call,
+                )
+                if inner_call == 3:
+                    raise
+        raise AssertionError("unreachable")
+
+    async def _consume_report_once(
+        self,
+        record: dict[str, Any],
+        *,
+        prompt: str,
+        symbols: list[str],
+        inner_call: int,
+    ) -> str:
         session_id = (
             f"{record['jobId']}-attempt-{int(record.get('attempt') or 0)}"
+            f"-llm-{inner_call}"
         )
         final_report = None
         async for event_name, data in self._stream_work(
             prompt,
             session_id,
-            effective_symbols or symbols,
+            symbols,
         ):
             if event_name != "report" or not isinstance(data, dict):
                 continue
@@ -1013,7 +1257,7 @@ class X402JobService:
             if isinstance(content, str) and content:
                 final_report = content
         if final_report is None:
-            raise _MissingReport
+            raise _EmptyAnalysisResponse
         return final_report
 
     async def _heartbeat(
@@ -1106,8 +1350,11 @@ class X402JobService:
             return
         can_retry = (
             retryable
-            and int(record.get("attempt") or 0)
-            < _MAX_EXECUTION_ATTEMPTS
+            and (
+                error_code == "analysis_empty_response"
+                or int(record.get("attempt") or 0)
+                < _MAX_EXECUTION_ATTEMPTS
+            )
         )
         failed = {
             **record,
