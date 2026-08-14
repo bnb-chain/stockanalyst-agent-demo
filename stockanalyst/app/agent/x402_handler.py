@@ -102,7 +102,7 @@ def _encode_payment_header(value: Mapping[str, Any]) -> bytes:
     return base64.b64encode(body)
 
 
-# ── Settlement configuration (priority: B402 > generic facilitator > demo) ─────
+# ── Settlement configuration (priority: B402 > generic facilitator) ───────────
 
 # Binance B402 V2 authenticated facilitator (preferred).
 try:
@@ -118,26 +118,16 @@ _B402_CLIENT = B402Client(_B402_CONFIG) if _B402_CONFIG is not None else None
 # Generic x402 facilitator (fallback — no HMAC auth).
 FACILITATOR_URL = os.environ.get("X402_FACILITATOR_URL", "").rstrip("/")
 
-# Demo / local-dev mode — explicit opt-in required.
-# NEVER set this in production — signatures verified but NO token transferred.
-X402_DEMO_MODE = os.environ.get("X402_DEMO_MODE", "").strip().lower() in ("1", "true", "yes")
-
 if _B402_CLIENT is not None:
     logger.info("x402: Binance B402 V2 RSA facilitator active")
 elif FACILITATOR_URL:
     logger.info("x402: generic facilitator active")
-elif X402_DEMO_MODE:
-    logger.warning(
-        "x402: DEMO MODE active (X402_DEMO_MODE=1) — EIP-712 signatures are verified "
-        "but NO on-chain token transfer is executed. Never use this in production."
-    )
 else:
     logger.warning(
         "x402: SECURITY — no settlement backend configured. "
         "The paid /x402/analyze/async endpoint will REJECT all requests until one is set. "
         "For production: configure B402_CLIENT_ID, B402_ACCESS_TOKEN, "
-        "B402_BASE_URL, and B402_PRIVATE_KEY. "
-        "For local testing: export X402_DEMO_MODE=1."
+        "B402_BASE_URL, and B402_PRIVATE_KEY."
     )
 
 
@@ -147,7 +137,7 @@ async def _settle_via_facilitator(
 ) -> SettlementOutcome:
     """Execute on-chain settlement via configured backend.
 
-    Priority: B402 V2 (RSA-SHA256) → generic facilitator → demo mode → fail closed.
+    Priority: B402 V2 (RSA-SHA256) → generic facilitator → fail closed.
 
     Returns a typed settlement outcome; unknown remote outcomes stay retryable.
     """
@@ -216,20 +206,12 @@ async def _settle_via_facilitator(
             return SettlementOutcome("settled", transaction=detail)
         return SettlementOutcome("rejected", reason=detail)
 
-    # ── 3. Demo mode (local testing only) ──────────────────────────────────────
-    if X402_DEMO_MODE:
-        logger.warning(
-            "x402: demo mode — EIP-712 sig OK but no on-chain transfer (X402_DEMO_MODE=1)"
-        )
-        return SettlementOutcome("settled", transaction="demo")
-
-    # ── 4. Fail closed ─────────────────────────────────────────────────────────
+    # ── 3. Fail closed ─────────────────────────────────────────────────────────
     return SettlementOutcome(
         "rejected",
         reason=(
             "payment not settled: no settlement backend configured. "
-            "Configure all four B402 V2 settings for production, or "
-            "X402_DEMO_MODE=1 for local testing."
+            "Configure all four B402 V2 settings for production."
         ),
     )
 
@@ -409,7 +391,7 @@ class X402Handler:
             "facilitator": (
                 "binance-b402-v2"
                 if self._b402_client is not None
-                else FACILITATOR_URL or "(demo mode — no on-chain settlement)"
+                else FACILITATOR_URL or "(unavailable)"
             ),
         })
 

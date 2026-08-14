@@ -1,13 +1,13 @@
 import ast
 import hashlib
 import json
-from pathlib import Path
 import re
-from tempfile import TemporaryDirectory
-import tomllib
 import unittest
-import yaml
+from pathlib import Path
+from tempfile import TemporaryDirectory
 
+import tomllib
+import yaml
 
 ROOT = Path(__file__).resolve().parents[2]
 ROOT_README = ROOT / "README.md"
@@ -31,6 +31,10 @@ RUNTIME_X402_HANDLER = RUNTIME_X402_SOURCE_ROOT / "x402_handler.py"
 GATEWAY_X402_ENVELOPE = GATEWAY_X402_SOURCE_ROOT / "envelope.py"
 GATEWAY_X402_CLIENT = GATEWAY_X402_SOURCE_ROOT / "agentcore_client.py"
 BUYER_X402_ASYNC_CLIENT = BUYER_X402_SOURCE_ROOT / "x402-async-client.ts"
+B402_CLIENT_TESTS = RUNTIME_X402_SOURCE_ROOT / "tests" / "test_b402_client.py"
+COMPETITION_REPORTING_TESTS = (
+    RUNTIME_X402_SOURCE_ROOT / "tests" / "test_x402_competition_reporting.py"
+)
 PUBLIC_FOUR_TOKEN_DOCUMENTS = (
     ROOT_README,
     STOCKANALYST_README,
@@ -254,7 +258,7 @@ CloudFormationLoader.add_multi_constructor("!", _construct_cloudformation_tag)
 def load_cloudformation(path: Path) -> dict[str, object]:
     document = yaml.load(path.read_text(encoding="utf-8"), Loader=CloudFormationLoader)
     if not isinstance(document, dict):
-        raise AssertionError(f"CloudFormation document is not a mapping: {path}")
+        raise TypeError(f"CloudFormation document is not a mapping: {path}")
     return document
 
 
@@ -285,6 +289,98 @@ def affirmative_payment_guidance_violations(documentation: str) -> list[str]:
 
 
 class MainnetInfrastructureContractTests(unittest.TestCase):
+    def test_paid_runtime_has_no_zero_settlement_demo_bypass(self) -> None:
+        handler = RUNTIME_X402_HANDLER.read_text(encoding="utf-8")
+        studio = STUDIO.read_text(encoding="utf-8")
+
+        for source in (handler, studio):
+            self.assertNotIn("X402_DEMO_MODE", source)
+        self.assertNotIn('transaction="demo"', handler)
+        self.assertNotIn("no on-chain transfer", handler.lower())
+
+    def test_affirmative_x402_fixtures_use_the_exact_point_1_price(self) -> None:
+        b402_tests = B402_CLIENT_TESTS.read_text(encoding="utf-8")
+        competition_tests = COMPETITION_REPORTING_TESTS.read_text(encoding="utf-8")
+
+        permit2_requirement = re.search(
+            r"(?s)PERMIT2_PAYMENT_REQUIREMENT\s*=\s*\{.*?\n\}",
+            b402_tests,
+        )
+        self.assertIsNotNone(permit2_requirement)
+        assert permit2_requirement is not None
+        self.assertIn('"amount": "100000000000000000"', permit2_requirement.group())
+        self.assertNotIn("210000000000000000", permit2_requirement.group())
+
+        affirmative_proof = re.search(
+            r"(?s)^def _payment_header\(\) -> str:.*?^\s*return ",
+            competition_tests,
+            re.MULTILINE,
+        )
+        self.assertIsNotNone(affirmative_proof)
+        assert affirmative_proof is not None
+        self.assertIn('"amount": "100000000000000000"', affirmative_proof.group())
+        self.assertNotIn("210000000000000000", affirmative_proof.group())
+
+    def test_large_guides_preserve_unrelated_pre_task5_material(self) -> None:
+        preservation_contracts = {
+            ROOT_README: (
+                240,
+                (
+                    "## Architecture",
+                    "## Payment channel comparison",
+                    "## Quick start",
+                    "## ERC-8183 E2E test flow",
+                    "## Authenticated delivery notification",
+                    "## Repository Structure",
+                    "## BSC Testnet Contracts (chain 97)",
+                ),
+            ),
+            BUYER_README: (
+                500,
+                (
+                    "## Architecture",
+                    "## Prerequisites",
+                    "## Authenticated `notify_funded`",
+                    "## Authenticated payload delivery",
+                    "## Setup",
+                    "## Quick start — x402 paid async",
+                    "## ERC-8183 flow (cloud seller, on-chain escrow)",
+                    "## Source files",
+                    "## Payment channels explained",
+                    "## Building your own buyer client",
+                    "## ERC-8183-only BSC Testnet contract addresses",
+                    "## UOMP — user-owned portfolio context",
+                    "## Resources",
+                ),
+            ),
+            STOCKANALYST_README: (
+                1000,
+                (
+                    "## Why a Blockchain-Settled Stock Analyst?",
+                    "## 1. Analysis Engine",
+                    "## 2. Protocol Architecture",
+                    "## 3. System Architecture",
+                    "## 4. E2E Testing",
+                    "## Pricing",
+                    "# 中文",
+                    "## 为什么要用区块链结算的股票分析 Agent？",
+                    "## 1. 分析引擎",
+                    "## 2. 协议架构",
+                    "## 3. 系统架构",
+                    "## 4. 端到端测试",
+                    "## 定价",
+                    "## CI 自动测试",
+                ),
+            ),
+        }
+
+        for path, (minimum_lines, anchors) in preservation_contracts.items():
+            with self.subTest(path=path.relative_to(ROOT)):
+                documentation = path.read_text(encoding="utf-8")
+                self.assertGreaterEqual(len(documentation.splitlines()), minimum_lines)
+                for anchor in anchors:
+                    self.assertIn(anchor, documentation)
+
     def test_public_docs_describe_the_paid_wallet_limited_four_token_contract(self) -> None:
         for path in PUBLIC_FOUR_TOKEN_DOCUMENTS:
             with self.subTest(path=path.relative_to(ROOT)):
@@ -355,6 +451,34 @@ class MainnetInfrastructureContractTests(unittest.TestCase):
         self.assertIn(
             "The legacy `signingScheme` describes the highest-priority active "
             "accept.",
+            normalized,
+        )
+        self.assertIn(
+            "U and USD1 use EIP-712 `TransferWithAuthorization` typed data; "
+            "never use `eth_sign` or `personal_sign`.",
+            normalized,
+        )
+        self.assertIn(
+            "The EIP-3009 domain is copied from the selected requirement: "
+            "`name` and `version` from `accepted.extra`, chain ID 56, and "
+            "`verifyingContract` equal to `accepted.asset`.",
+            normalized,
+        )
+        self.assertIn(
+            "The authorization binds `from`, `to`, exact `value` "
+            "100000000000000000, `validAfter`, `validBefore`, and a fresh "
+            "32-byte `nonce`.",
+            normalized,
+        )
+        self.assertIn(
+            "Copy the selected `accepted` requirement unchanged into the V2 "
+            "proof and send its base64-encoded JSON only in `Payment-Signature`.",
+            normalized,
+        )
+        self.assertIn(
+            "The client must recover the signer locally, require the configured "
+            "payer and pay-to addresses, reject expired windows or reused "
+            "nonces, and never log the signature or private key.",
             normalized,
         )
         self.assertIn(

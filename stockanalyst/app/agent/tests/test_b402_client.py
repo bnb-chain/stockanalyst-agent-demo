@@ -416,7 +416,7 @@ class B402SupportedKindTests(unittest.IsolatedAsyncioTestCase):
 PERMIT2_PAYMENT_REQUIREMENT = {
     "scheme": "exact",
     "network": "eip155:56",
-    "amount": "210000000000000000",
+    "amount": "100000000000000000",
     "asset": USDC_TOKEN.address,
     "payTo": "0xd10bddc20e4dc42a1a19a9653e994991e25b8153",
     "maxTimeoutSeconds": 600,

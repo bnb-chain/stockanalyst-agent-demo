@@ -322,28 +322,37 @@ class X402AsyncHandlerTests(unittest.IsolatedAsyncioTestCase):
         generic = AsyncMock(
             side_effect=AssertionError("generic must not receive Permit2")
         )
-        for facilitator_url, demo_mode in (
-            ("https://facilitator.example.test", False),
-            ("", True),
+        with (
+            patch.object(handler_module, "_B402_CLIENT", None),
+            patch.object(
+                handler_module,
+                "FACILITATOR_URL",
+                "https://facilitator.example.test",
+            ),
+            patch.object(handler_module, "_settle_generic", generic),
         ):
-            with (
-                self.subTest(
-                    facilitator_url=facilitator_url,
-                    demo_mode=demo_mode,
-                ),
-                patch.object(handler_module, "_B402_CLIENT", None),
-                patch.object(handler_module, "FACILITATOR_URL", facilitator_url),
-                patch.object(handler_module, "X402_DEMO_MODE", demo_mode),
-                patch.object(handler_module, "_settle_generic", generic),
-            ):
-                outcome = await handler_module._settle_via_facilitator(
-                    settlement_proof(USDT_TOKEN),
-                    "verify-and-settle",
-                )
+            outcome = await handler_module._settle_via_facilitator(
+                settlement_proof(USDT_TOKEN),
+                "verify-and-settle",
+            )
 
-            self.assertEqual(outcome.status, "rejected")
-            self.assertIsNone(outcome.transaction)
+        self.assertEqual(outcome.status, "rejected")
+        self.assertIsNone(outcome.transaction)
         generic.assert_not_awaited()
+
+    async def test_missing_settlement_backend_fails_closed(self) -> None:
+        with (
+            patch.object(handler_module, "_B402_CLIENT", None),
+            patch.object(handler_module, "FACILITATOR_URL", ""),
+        ):
+            outcome = await handler_module._settle_via_facilitator(
+                settlement_proof(),
+                "verify-and-settle",
+            )
+
+        self.assertEqual(outcome.status, "rejected")
+        self.assertIsNone(outcome.transaction)
+        self.assertIn("no settlement backend configured", outcome.reason or "")
 
     async def test_price_exposes_dedicated_b402_pay_to(self) -> None:
         pay_to = "0x15958aad30b758dAbfbB9788Da69dfcd56e89078"
@@ -410,7 +419,6 @@ class X402AsyncHandlerTests(unittest.IsolatedAsyncioTestCase):
                 "payment backend unavailable",
             ),
             patch.object(handler_module, "FACILITATOR_URL", "https://example.test"),
-            patch.object(handler_module, "X402_DEMO_MODE", False),
             patch.dict(handler_module.os.environ, {}, clear=True),
         ):
             await handler._paid_requirements()

@@ -15,6 +15,39 @@ Every accepted analysis costs exactly `100000000000000000` atomic units (0.1 of 
 
 B402 capabilities may be partial. `signingSchemes` is additive and lists the deduplicated active methods in `accepts` order. The legacy `signingScheme` describes the highest-priority active accept. U/USD1 use EIP-3009 and USDC/USDT use `permit2-exact`. `extra.signerAddress` is facilitator EOA metadata; it is not the Permit2 spender and is not part of `permit2-exact` typed data. `extra.spenderAddress` is the live B402 proxy and the `permit2-exact` typed-data spender; the ERC-20 approval target remains canonical Permit2 `0x000000000022D473030F116dDEE9F6B43aC78BA3`.
 
+## EIP-3009 signature contract for U and USD1
+
+U and USD1 use EIP-712 `TransferWithAuthorization` typed data; never use `eth_sign` or `personal_sign`. The EIP-3009 domain is copied from the selected requirement: `name` and `version` from `accepted.extra`, chain ID 56, and `verifyingContract` equal to `accepted.asset`.
+
+```text
+TransferWithAuthorization(
+  address from,
+  address to,
+  uint256 value,
+  uint256 validAfter,
+  uint256 validBefore,
+  bytes32 nonce
+)
+```
+
+The authorization binds `from`, `to`, exact `value` 100000000000000000, `validAfter`, `validBefore`, and a fresh 32-byte `nonce`. `to` must equal `accepted.payTo`; the validity window must fit the advertised 600-second timeout. All uint256 values are encoded as canonical decimal strings in the JSON payload.
+
+```json
+{
+  "signature": "0x<65-byte EIP-712 signature>",
+  "authorization": {
+    "from": "<payer wallet>",
+    "to": "<accepted.payTo>",
+    "value": "100000000000000000",
+    "validAfter": "<unix seconds decimal string>",
+    "validBefore": "<unix seconds decimal string>",
+    "nonce": "0x<32 fresh bytes>"
+  }
+}
+```
+
+Copy the selected `accepted` requirement unchanged into the V2 proof and send its base64-encoded JSON only in `Payment-Signature`. The client must recover the signer locally, require the configured payer and pay-to addresses, reject expired windows or reused nonces, and never log the signature or private key.
+
 ## Permit2 exact signature contract
 
 ```json

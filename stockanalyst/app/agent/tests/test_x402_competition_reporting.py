@@ -23,7 +23,7 @@ def _payment_header() -> str:
         "accepted": {
             "scheme": "exact",
             "network": "eip155:56",
-            "amount": "210000000000000000",
+            "amount": "100000000000000000",
             "asset": "0xc70B8741B8B07A6d61E54fd4B20f22Fa648E5565",
             "payTo": "0xd10bddc20e4dc42a1a19a9653e994991e25b8153",
             "maxTimeoutSeconds": 600,
