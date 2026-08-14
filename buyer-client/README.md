@@ -4,6 +4,8 @@ Run `npm run x402:async` for the paid asynchronous x402 flow. The endpoint is `h
 
 ## Paid x402 contract
 
+x402 payments use **BSC Mainnet (chain ID 56)**. The EIP-3009 domain names are United Stables for U and World Liberty Financial USD for USD1.
+
 Every accepted analysis costs exactly `100000000000000000` atomic units (0.1 of the selected 18-decimal token).
 
 | Token | BSC address | Method | Price |

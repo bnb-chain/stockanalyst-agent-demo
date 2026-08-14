@@ -325,22 +325,6 @@ class X402JobRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(service._rate_limiter._store, service._store)
         self.assertEqual(service._rate_limiter._token_secret, b"x" * 32)
 
-    def test_legacy_promo_environment_variable_is_ignored(self) -> None:
-        build = _load_runtime_functions()["build_x402_job_service"]
-
-        service = build(
-            {
-                "X402_JOB_S3_BUCKET": "private-jobs",
-                "X402_JOB_TOKEN_SECRET": "x" * 32,
-                "X402_PROMO_FREE_MODE": "1",
-            },
-            stream_work=AsyncMock(),
-            s3_client=FakeS3(),
-        )
-
-        assert service is not None
-        self.assertIsInstance(service, X402JobService)
-
     async def test_stale_recovery_queries_the_payment_token_contract(self) -> None:
         for selected_token in (U_TOKEN, USD1_TOKEN):
             with self.subTest(token=selected_token.symbol):

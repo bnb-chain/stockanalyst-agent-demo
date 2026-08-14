@@ -5,7 +5,6 @@ from unittest.mock import Mock, patch
 
 from envelope import GatewayRequestError, build_envelope
 
-
 PUBLIC_BASE = "https://gateway.example.test/stages/testnet"
 JOB_ID = "x402_" + "a" * 32
 
@@ -108,25 +107,6 @@ class EnvelopeTests(unittest.TestCase):
 
         self.assertEqual(ipv4_envelope["requestId"], ipv6_envelope["requestId"])
 
-    def test_free_get_and_post_routes_build_envelopes(self):
-        challenge = build_envelope(
-            api_event(path="/x402/free", query={"symbol": "AAPL"}),
-            public_base_url=PUBLIC_BASE,
-        )
-        quote = build_envelope(
-            api_event(
-                method="POST",
-                path="/x402/free",
-                headers={"PAYMENT-SIGNATURE": "proof"},
-                body=b'{"symbol":"AAPL"}',
-            ),
-            public_base_url=PUBLIC_BASE,
-        )
-
-        self.assertEqual(challenge["queryString"], "symbol=AAPL")
-        self.assertEqual(quote["queryString"], "")
-        self.assertEqual(quote["path"], "/x402/free")
-
     def test_request_id_is_stable_for_exact_retry(self):
         event = api_event(headers={"PAYMENT-SIGNATURE": "proof"})
         first = build_envelope(event, public_base_url=PUBLIC_BASE)
@@ -163,32 +143,6 @@ class EnvelopeTests(unittest.TestCase):
             build_envelope(event, public_base_url=PUBLIC_BASE)["path"],
             f"/x402/jobs/{JOB_ID}",
         )
-
-    def test_free_get_rejects_unknown_duplicate_and_invalid_query_values(self):
-        for query, multi in (
-            ({"unexpected": "AAPL"}, None),
-            ({"symbol": "AAPL"}, {"symbol": ["AAPL", "NVDA"]}),
-            ({"symbol": "AAPL/USD"}, None),
-            ({"symbol": "A" * 33}, None),
-        ):
-            event = api_event(path="/x402/free", query=query)
-            if multi is not None:
-                event["multiValueQueryStringParameters"] = multi
-            with self.subTest(query=query, multi=multi), self.assertRaisesRegex(
-                GatewayRequestError, "query_not_allowed"
-            ):
-                build_envelope(event, public_base_url=PUBLIC_BASE)
-
-    def test_free_query_is_bound_into_request_id(self):
-        aapl = build_envelope(
-            api_event(path="/x402/free", query={"symbol": "AAPL"}),
-            public_base_url=PUBLIC_BASE,
-        )
-        nvda = build_envelope(
-            api_event(path="/x402/free", query={"symbol": "NVDA"}),
-            public_base_url=PUBLIC_BASE,
-        )
-        self.assertNotEqual(aapl["requestId"], nvda["requestId"])
 
     def test_rejects_invalid_base64_and_oversized_body(self):
         invalid = api_event(body=b"ignored", base64_encoded=True)
@@ -263,11 +217,9 @@ class EnvelopeTests(unittest.TestCase):
             )
         digest.assert_not_called()
 
-    def test_all_six_published_route_pairs_and_inverse_rejections(self):
+    def test_all_four_published_route_pairs_and_inverse_rejections(self):
         routes = (
             ("GET", "/x402/price", b""),
-            ("GET", "/x402/free", b""),
-            ("POST", "/x402/free", b'{"symbol":"AAPL"}'),
             ("POST", "/x402/analyze/async", b'{"symbols":["AAPL"]}'),
             ("GET", f"/x402/jobs/{JOB_ID}", b""),
             ("POST", f"/x402/jobs/{JOB_ID}/resume", b'{"retry":true}'),
@@ -280,7 +232,8 @@ class EnvelopeTests(unittest.TestCase):
                 )
         for method, path in (
             ("POST", "/x402/price"),
-            ("PUT", "/x402/free"),
+            ("GET", "/x402/free"),
+            ("POST", "/x402/free"),
             ("GET", "/x402/analyze/async"),
             ("POST", f"/x402/jobs/{JOB_ID}"),
             ("GET", f"/x402/jobs/{JOB_ID}/resume"),

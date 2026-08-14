@@ -12,7 +12,6 @@ from stockanalyst.app.agent.tests.test_x402_verify import (
     NOW as SIGNED_NOW,
 )
 from stockanalyst.app.agent.tests.test_x402_verify import (
-    signed_free_proof,
     signed_proof,
 )
 from stockanalyst.app.agent.x402_handler import X402Handler
@@ -215,12 +214,6 @@ def make_handler(service=None, *, b402_client=None) -> X402Handler:
     )
 
 
-async def free_report_work(symbol: str):
-    yield "progress", {"stage": "collecting"}
-    yield "report", {"content": f"# {symbol} report", "format": "markdown"}
-    yield "done", {}
-
-
 class X402AsyncHandlerTests(unittest.IsolatedAsyncioTestCase):
     async def test_paid_wallet_limit_maps_to_fixed_429_before_other_work(
         self,
@@ -388,25 +381,6 @@ class X402AsyncHandlerTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("min_price_u", response.json)
         self.assertNotIn("min_price_wei", response.json)
 
-    async def test_price_is_always_paid_even_if_service_exposes_legacy_flag(
-        self,
-    ) -> None:
-        service = AsyncMock()
-        service.promo_free = True
-
-        response = await call_handler(
-            make_handler(service), method="GET", path="/x402/price"
-        )
-
-        self.assertEqual(response.status, 200)
-        self.assertTrue(response.json["paymentRequired"])
-        self.assertNotIn("promoFree", response.json)
-        self.assertEqual(response.json["price_wei"], str(PAID_PRICE_WEI))
-        self.assertEqual(
-            [item["amount"] for item in response.json["accepts"]],
-            [str(PAID_PRICE_WEI)] * len(TOKENS),
-        )
-
     async def test_paid_requirements_request_registry_tokens_from_b402(self) -> None:
         client = AsyncMock()
         client.payment_extras.return_value = SUPPORTED_EXTRAS
@@ -492,11 +466,8 @@ class X402AsyncHandlerTests(unittest.IsolatedAsyncioTestCase):
             {"symbols": ["AAPL"]},
         )
 
-    async def test_async_never_accepts_a_proofless_legacy_promo_service(
-        self,
-    ) -> None:
+    async def test_async_requires_a_payment_signature(self) -> None:
         service = AsyncMock()
-        service.promo_free = True
 
         response = await call_handler(
             make_handler(service),
@@ -507,7 +478,6 @@ class X402AsyncHandlerTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(response.status, 402)
         service.create_job.assert_not_awaited()
-        service.create_promotional_job.assert_not_awaited()
 
     async def test_async_rejects_wallet_signature_as_payment_authorization(
         self,
@@ -576,7 +546,6 @@ class X402AsyncHandlerTests(unittest.IsolatedAsyncioTestCase):
         self,
     ) -> None:
         service = AsyncMock()
-        service.promo_free = False
         service.create_job.return_value = CreateJobResult(
             job_id=JOB_ID,
             job_token="job-token",
@@ -604,7 +573,6 @@ class X402AsyncHandlerTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_async_create_rejects_legacy_x_payment_as_unpaid(self) -> None:
         service = AsyncMock()
-        service.promo_free = False
         response = await call_handler(
             make_handler(service),
             method="POST",
@@ -794,14 +762,10 @@ class X402AsyncHandlerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.json["errorCode"], "payment_rejected")
         service.create_job.assert_not_awaited()
 
-    @unittest.skip("free routes were removed")
-    async def test_paid_and_free_handlers_reject_malformed_nested_proofs(
+    async def test_paid_handler_rejects_malformed_nested_proofs(
         self,
     ) -> None:
         paid_base = json.loads(base64.b64decode(signed_proof()))
-        free_base = json.loads(
-            base64.b64decode(signed_free_proof(x402_verify.B402_PAY_TO_ADDRESS))
-        )
 
         def encode(value: object) -> str:
             return base64.b64encode(
@@ -809,7 +773,6 @@ class X402AsyncHandlerTests(unittest.IsolatedAsyncioTestCase):
             ).decode()
 
         malformed_paid: list[tuple[str, str]] = []
-        malformed_free: list[tuple[str, str]] = []
         for name, value in (
             ("list", []),
             ("scalar", 1),
@@ -822,21 +785,9 @@ class X402AsyncHandlerTests(unittest.IsolatedAsyncioTestCase):
                     "authorization": value,
                 },
             }
-            free_payload = {**free_base, "payload": value}
-            free_authorization = {
-                **free_base,
-                "payload": {
-                    **free_base["payload"],
-                    "authorization": value,
-                },
-            }
             malformed_paid.extend((
                 (f"payload {name}", encode(paid_payload)),
                 (f"authorization {name}", encode(paid_authorization)),
-            ))
-            malformed_free.extend((
-                (f"payload {name}", encode(free_payload)),
-                (f"authorization {name}", encode(free_authorization)),
             ))
 
         depth = 2_000
@@ -848,11 +799,9 @@ class X402AsyncHandlerTests(unittest.IsolatedAsyncioTestCase):
             + b"}"
         ).decode()
         malformed_paid.append(("recursive", recursive))
-        malformed_free.append(("recursive", recursive))
 
         for name, proof in malformed_paid:
             service = AsyncMock()
-            service.promo_free = False
 
             async def validate_create(
                 payment_header: str,
@@ -883,104 +832,6 @@ class X402AsyncHandlerTests(unittest.IsolatedAsyncioTestCase):
                 {"errorCode": "payment_rejected"},
                 name,
             )
-
-        for name, proof in malformed_free:
-            try:
-                response = await call_handler(
-                    X402Handler(
-                        AsyncMock(),
-                        free_work=free_report_work,
-                        b402_client=AsyncMock(),
-                    ),
-                    method="POST",
-                    path="/x402/free",
-                    headers={"payment-signature": proof},
-                    json_body={"symbol": "AAPL"},
-                )
-            except Exception as exc:
-                self.fail(f"free {name} raised {type(exc).__name__}")
-            self.assertEqual(response.status, 402, name)
-            self.assertEqual(
-                response.json,
-                {
-                    "error": "Free tier access denied",
-                    "detail": "Payment-Signature is not valid base64 JSON",
-                },
-                name,
-            )
-
-    @unittest.skip("free routes were removed")
-    async def test_free_handler_rejects_malformed_numeric_proof(self) -> None:
-        proof = json.loads(
-            base64.b64decode(
-                signed_free_proof(x402_verify.B402_PAY_TO_ADDRESS)
-            )
-        )
-        proof["payload"]["authorization"]["validAfter"] = []
-        encoded = base64.b64encode(
-            json.dumps(proof, separators=(",", ":")).encode()
-        ).decode()
-
-        try:
-            response = await call_handler(
-                X402Handler(
-                    AsyncMock(),
-                    free_work=free_report_work,
-                    b402_client=AsyncMock(),
-                ),
-                method="POST",
-                path="/x402/free",
-                headers={"payment-signature": encoded},
-                json_body={"symbol": "AAPL"},
-            )
-        except Exception as exc:
-            self.fail(f"free numeric field raised {type(exc).__name__}")
-        self.assertEqual(response.status, 402)
-        self.assertEqual(
-            response.json,
-            {
-                "error": "Free tier access denied",
-                "detail": "Payment-Signature is not valid base64 JSON",
-            },
-        )
-
-    @unittest.skip("free routes were removed")
-    async def test_free_handler_rejects_a_thousand_digit_value(self) -> None:
-        proof = json.loads(
-            base64.b64decode(
-                signed_free_proof(x402_verify.B402_PAY_TO_ADDRESS)
-            )
-        )
-        proof["payload"]["authorization"]["value"] = "9" * 1_000
-        encoded = base64.b64encode(
-            json.dumps(proof, separators=(",", ":")).encode()
-        ).decode()
-
-        try:
-            response = await call_handler(
-                X402Handler(
-                    AsyncMock(),
-                    free_work=free_report_work,
-                    b402_client=AsyncMock(),
-                ),
-                method="POST",
-                path="/x402/free",
-                headers={"payment-signature": encoded},
-                json_body={"symbol": "AAPL"},
-            )
-        except Exception as exc:
-            self.fail(f"thousand-digit free value raised {type(exc).__name__}")
-        self.assertEqual(response.status, 402)
-        self.assertEqual(
-            response.json,
-            {
-                "error": "Free tier access denied",
-                "detail": (
-                    "free tier requires value=0; "
-                    "use /x402/analyze/async for paid analysis"
-                ),
-            },
-        )
 
     async def test_async_create_stops_when_body_exceeds_256_kib(self) -> None:
         service = AsyncMock()
@@ -1445,121 +1296,6 @@ class X402AsyncHandlerTests(unittest.IsolatedAsyncioTestCase):
                     "POST /x402/analyze",
                     response.json["x402_routes"],
                 )
-
-    @unittest.skip("free routes were removed")
-    async def test_free_post_still_uses_original_handler(self) -> None:
-        handler = make_handler(AsyncMock())
-        with patch.object(
-            handler,
-            "_handle_free",
-            new=AsyncMock(),
-        ) as free:
-            await handler(
-                {
-                    "type": "http",
-                    "method": "POST",
-                    "path": "/x402/free",
-                    "headers": [],
-                },
-                AsyncMock(),
-                AsyncMock(),
-            )
-
-        free.assert_awaited_once()
-
-    @unittest.skip("free routes were removed")
-    async def test_free_challenge_uses_trusted_public_resource_url(self) -> None:
-        response = await call_handler(
-            make_handler(AsyncMock()),
-            method="GET",
-            path="/x402/free",
-            scope_overrides={
-                "query_string": b"symbol=AAPL",
-                "x402_public_base_url": "https://gateway.example/testnet",
-            },
-        )
-
-        self.assertEqual(response.status, 402)
-        self.assertEqual(
-            response.json["paymentRequired"]["resource"],
-            "https://gateway.example/testnet/x402/free",
-        )
-
-    @unittest.skip("free routes were removed")
-    async def test_free_post_returns_buffered_json_report(self) -> None:
-        handler = X402Handler(
-            AsyncMock(),
-            free_work=free_report_work,
-            b402_client=AsyncMock(),
-        )
-        with (
-            patch(
-                "stockanalyst.app.agent.x402_handler.verify_free_payment_proof",
-                return_value=(True, "9 uses remaining today", "0x" + "1" * 40),
-            ),
-            patch(
-                "stockanalyst.app.agent.x402_handler._payment_identity",
-                return_value=("0x" + "1" * 40, "0x" + "2" * 64),
-            ),
-            patch(
-                "stockanalyst.app.agent.x402_handler.report_competition_call",
-                new=AsyncMock(),
-            ),
-        ):
-            response = await call_handler(
-                handler,
-                method="POST",
-                path="/x402/free",
-                headers={"payment-signature": "proof"},
-                json_body={"symbol": "AAPL"},
-            )
-
-        self.assertEqual(response.status, 200)
-        self.assertEqual(response.headers["content-type"], "application/json")
-        self.assertEqual(response.json, {
-            "content": "# AAPL report",
-            "format": "markdown",
-        })
-
-    @unittest.skip("free routes were removed")
-    async def test_free_post_returns_safe_error_when_quote_generation_fails(self) -> None:
-        async def failed_work(symbol: str):
-            yield "error", {"message": "private upstream failure"}
-
-        handler = X402Handler(
-            AsyncMock(),
-            free_work=failed_work,
-            b402_client=AsyncMock(),
-        )
-        with (
-            patch(
-                "stockanalyst.app.agent.x402_handler.verify_free_payment_proof",
-                return_value=(True, "9 uses remaining today", "0x" + "1" * 40),
-            ),
-            patch(
-                "stockanalyst.app.agent.x402_handler._payment_identity",
-                return_value=("0x" + "1" * 40, "0x" + "2" * 64),
-            ),
-            patch(
-                "stockanalyst.app.agent.x402_handler.report_competition_call",
-                new=AsyncMock(),
-            ),
-        ):
-            response = await call_handler(
-                handler,
-                method="POST",
-                path="/x402/free",
-                headers={"payment-signature": "proof"},
-                json_body={"symbol": "AAPL"},
-            )
-
-        self.assertEqual(response.status, 503)
-        self.assertEqual(response.json, {
-            "errorCode": "free_quote_unavailable",
-            "retryable": True,
-        })
-        self.assertNotIn(b"private upstream failure", response.body)
-
 
 if __name__ == "__main__":
     unittest.main()
