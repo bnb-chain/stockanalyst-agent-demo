@@ -20,10 +20,16 @@ from x402_job_store import JobConflict, StoredJob, X402JobStore
 from x402_settlement import SettlementOutcome
 from x402_tokens import U_TOKEN, token_by_asset
 from x402_verify import CHAIN_ID, VerifiedPayment, validate_payment_proof
+from x402_wallet_rate_limit import (
+    WalletRateLimiter,
+    WalletRateLimitUnavailable,
+    WalletRateReservation,
+)
 
 logger = logging.getLogger("seller-agent.x402.jobs")
 
 _JOB_ID_RE = re.compile(r"x402_[0-9a-f]{32}\Z")
+_WALLET_DIGEST_RE = re.compile(r"[0-9a-f]{64}\Z")
 _HEARTBEAT_SECONDS = 30
 _LEASE_MILLISECONDS = 120_000
 _STALE_MILLISECONDS = 120_000
@@ -132,6 +138,7 @@ class X402JobService:
         *,
         store: X402JobStore,
         token_secret: bytes,
+        rate_limiter: WalletRateLimiter | None = None,
         settle: Callable[
             [str, SettlementMode],
             Awaitable[SettlementOutcome],
@@ -149,6 +156,11 @@ class X402JobService:
     ) -> None:
         self._store = store
         self._token_secret = token_secret
+        self._rate_limiter = rate_limiter or WalletRateLimiter(
+            store=store,
+            token_secret=token_secret,
+            clock=clock,
+        )
         self._settle = settle
         self._authorization_used = authorization_used
         self._report = report
@@ -502,6 +514,7 @@ class X402JobService:
                 proof_header,
                 proof_digest,
             )
+            stored = await self._reconcile_rate_limit(stored)
             stored = await self._retry_accounting(stored, payment)
             return self._create_result_and_spawn(identity, stored)
         if expired_recovery:
@@ -511,6 +524,12 @@ class X402JobService:
 
         normalized_request = self._normalize_request(request)
         competition_event_id = self._competition_event_id(payment)
+        reservation = None
+        if self._rate_limiter is not None:
+            reservation = await self._rate_limiter.reserve(
+                payment.from_address,
+                identity.job_id,
+            )
         record = {
             "version": 1,
             "jobId": identity.job_id,
@@ -537,7 +556,32 @@ class X402JobService:
             "errorCode": None,
             "retryable": None,
         }
-        stored = await self._store.create(record)
+        if reservation is not None:
+            record.update(
+                {
+                    "rateLimitWalletDigest": reservation.wallet_digest,
+                    "rateLimitReservationId": reservation.reservation_id,
+                    "rateLimitReservedAt": reservation.reserved_at,
+                    "rateLimitState": reservation.state,
+                }
+            )
+        try:
+            stored = await self._store.create(record)
+        except asyncio.CancelledError:
+            if reservation is not None:
+                release = asyncio.create_task(
+                    self._rate_limiter.release(reservation),
+                    name=f"x402-rate-release:{identity.job_id}",
+                )
+                try:
+                    await asyncio.shield(release)
+                except asyncio.CancelledError:
+                    await asyncio.gather(release, return_exceptions=True)
+            raise
+        except Exception:
+            if reservation is not None:
+                await self._rate_limiter.release(reservation)
+            raise
         if stored is None:
             stored = await self._require_existing_identity(identity)
             stored = await self._reconcile_settling(
@@ -546,6 +590,7 @@ class X402JobService:
                 proof_header,
                 proof_digest,
             )
+            stored = await self._reconcile_rate_limit(stored)
         else:
             stored = await self._settle_and_transition(
                 stored,
@@ -673,7 +718,8 @@ class X402JobService:
                     allow_unavailable=True,
                 )
             if now // 1000 >= payment.valid_before:
-                await self._fail_settlement(stored)
+                failed = await self._fail_settlement(stored)
+                await self._release_after_rejection(failed)
                 raise X402JobError("payment_rejected")
             mode: SettlementMode = "verify-and-settle"
         elif payment.transfer_method == "permit2-exact":
@@ -700,13 +746,160 @@ class X402JobService:
             await self._mark_settlement_pending(stored, outcome.transaction)
             raise SettlementIndeterminate()
         if outcome.status == "rejected":
-            await self._fail_settlement(stored)
+            failed = await self._fail_settlement(stored)
+            await self._release_after_rejection(failed)
             raise self._payment_rejected_error(payment)
         return await self._mark_settled(
             stored,
             payment,
             outcome.transaction,
         )
+
+    @staticmethod
+    def _rate_reservation_from_record(
+        record: dict[str, Any],
+    ) -> WalletRateReservation | None:
+        fields = (
+            "rateLimitWalletDigest",
+            "rateLimitReservationId",
+            "rateLimitReservedAt",
+            "rateLimitState",
+        )
+        present = tuple(field in record for field in fields)
+        if not any(present):
+            return None
+        if not all(present):
+            raise X402JobError("job_state_unavailable", retryable=True)
+        wallet_digest = record["rateLimitWalletDigest"]
+        reservation_id = record["rateLimitReservationId"]
+        reserved_at = record["rateLimitReservedAt"]
+        state = record["rateLimitState"]
+        if (
+            type(wallet_digest) is not str
+            or not _WALLET_DIGEST_RE.fullmatch(wallet_digest)
+            or type(reservation_id) is not str
+            or not _JOB_ID_RE.fullmatch(reservation_id)
+            or reservation_id != record.get("jobId")
+            or type(reserved_at) is not int
+            or not 1 <= reserved_at <= 9_999_999_999_999
+            or state not in {"reserved", "committed", "released"}
+        ):
+            raise X402JobError("job_state_unavailable", retryable=True)
+        return WalletRateReservation(
+            wallet_digest=wallet_digest,
+            reservation_id=reservation_id,
+            reserved_at=reserved_at,
+            state="committed" if state == "committed" else "reserved",
+        )
+
+    async def _reconcile_rate_limit(self, stored: StoredJob) -> StoredJob:
+        reservation = self._rate_reservation_from_record(stored.record)
+        if reservation is None or self._rate_limiter is None:
+            return stored
+        state = stored.record.get("rateLimitState")
+        payment_status = stored.record.get("paymentStatus")
+        if payment_status == "settled":
+            if state not in {"reserved", "committed"}:
+                raise X402JobError("job_state_unavailable", retryable=True)
+            if state == "reserved":
+                await self._rate_limiter.commit(reservation)
+            if state != "committed" or stored.record.get("status") == "settling":
+                return await self._finalize_rate_commit(stored)
+        elif payment_status == "failed" and state == "reserved":
+            try:
+                await self._rate_limiter.release(reservation)
+                return await self._mark_rate_released(stored)
+            except WalletRateLimitUnavailable:
+                # A terminal rejection remains a rejection even when cleanup
+                # must be retried by a later exact request.
+                return stored
+        elif (
+            payment_status == "failed" and state != "released"
+        ) or (
+            payment_status == "settling" and state != "reserved"
+        ):
+            raise X402JobError("job_state_unavailable", retryable=True)
+        return stored
+
+    async def _commit_rate_limit(self, stored: StoredJob) -> StoredJob:
+        reservation = self._rate_reservation_from_record(stored.record)
+        if reservation is None or self._rate_limiter is None:
+            return await self._finalize_rate_commit(stored)
+        await self._rate_limiter.commit(reservation)
+        return await self._finalize_rate_commit(stored)
+
+    async def _finalize_rate_commit(self, stored: StoredJob) -> StoredJob:
+        queued = {
+            **stored.record,
+            "status": "queued",
+            "leaseOwner": None,
+            "leaseExpiresAt": None,
+            "updatedAt": int(self._clock()),
+        }
+        if "rateLimitState" in queued:
+            queued["rateLimitState"] = "committed"
+        try:
+            return await self._store.replace(stored, queued)
+        except asyncio.CancelledError:
+            raise
+        except JobConflict:
+            job_id = str(stored.record.get("jobId") or "")
+            latest = await self._store.read(job_id)
+            if (
+                latest is not None
+                and latest.record.get("paymentKey")
+                == stored.record.get("paymentKey")
+                and latest.record.get("paymentStatus") == "settled"
+                and latest.record.get("status") == "queued"
+                and latest.record.get("rateLimitState", "committed")
+                == "committed"
+            ):
+                return latest
+            raise WalletRateLimitUnavailable(
+                "wallet rate limit unavailable"
+            ) from None
+        except Exception as exc:
+            raise WalletRateLimitUnavailable(
+                "wallet rate limit unavailable"
+            ) from exc
+
+    async def _release_rate_limit(self, stored: StoredJob) -> StoredJob:
+        reservation = self._rate_reservation_from_record(stored.record)
+        if reservation is None or self._rate_limiter is None:
+            return stored
+        await self._rate_limiter.release(reservation)
+        return await self._mark_rate_released(stored)
+
+    async def _release_after_rejection(self, stored: StoredJob) -> None:
+        try:
+            await self._release_rate_limit(stored)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.warning("x402 wallet reservation release deferred")
+
+    async def _mark_rate_released(self, stored: StoredJob) -> StoredJob:
+        if "rateLimitState" not in stored.record:
+            return stored
+        released = {
+            **stored.record,
+            "rateLimitState": "released",
+            "updatedAt": int(self._clock()),
+        }
+        try:
+            return await self._store.replace(stored, released)
+        except JobConflict:
+            latest = await self._store.read(str(stored.record.get("jobId") or ""))
+            if (
+                latest is not None
+                and latest.record.get("paymentKey")
+                == stored.record.get("paymentKey")
+                and latest.record.get("rateLimitState") == "released"
+            ):
+                return latest
+            raise WalletRateLimitUnavailable(
+                "wallet rate limit unavailable"
+            ) from None
 
     async def _mark_settlement_pending(
         self,
@@ -798,21 +991,31 @@ class X402JobService:
             and existing_settled_at > 0
             else int(self._clock())
         )
+        has_rate_reservation = self._rate_reservation_from_record(
+            stored.record
+        ) is not None
         settled = {
             **stored.record,
             "paymentStatus": "settled",
             "pendingSettlementReference": None,
             "settlementReference": settlement_reference,
-            "status": "queued",
+            "status": "settling" if has_rate_reservation else "queued",
             "competitionEventId": self._competition_event_id(payment),
             "settledAt": settled_at,
-            "leaseOwner": None,
-            "leaseExpiresAt": None,
+            "leaseOwner": self._owner if has_rate_reservation else None,
+            "leaseExpiresAt": (
+                int(self._clock()) + _LEASE_MILLISECONDS
+                if has_rate_reservation
+                else None
+            ),
             "updatedAt": int(self._clock()),
         }
         settled.pop("competitionReported", None)
         settled.pop("competitionReportedAt", None)
-        return await self._store.replace(stored, settled)
+        persisted = await self._store.replace(stored, settled)
+        if not has_rate_reservation:
+            return persisted
+        return await self._commit_rate_limit(persisted)
 
     async def _fail_settlement(self, stored: StoredJob) -> StoredJob:
         failed = {
@@ -881,6 +1084,7 @@ class X402JobService:
         settled_at = record.get("settledAt")
         return (
             record.get("paymentStatus") == "settled"
+            and record.get("status") != "settling"
             and isinstance(event_id, str)
             and bool(event_id)
             and not isinstance(settled_at, bool)

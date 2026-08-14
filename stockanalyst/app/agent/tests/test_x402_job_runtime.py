@@ -34,6 +34,7 @@ from x402_job_service import (
 from x402_job_store import X402JobStore
 from x402_tokens import U_TOKEN, USD1_TOKEN, USDT_TOKEN, token_by_asset
 from x402_verify import U_TOKEN_ADDRESS, VerifiedPayment
+from x402_wallet_rate_limit import WalletRateLimiter
 
 MAIN_PATH = Path(__file__).parents[1] / "main.py"
 STUDIO_PATH = Path(__file__).parents[1] / "studio.toml"
@@ -69,6 +70,7 @@ def _load_runtime_functions(
         "U_TOKEN_ADDRESS": U_TOKEN_ADDRESS,
         "token_by_asset": token_by_asset,
         "load_job_token_secret": load_job_token_secret,
+        "WalletRateLimiter": WalletRateLimiter,
         "_settle_via_facilitator": settle or AsyncMock(),
         "report_competition_call": report or AsyncMock(return_value=True),
         "get_8183_client": get_client or (lambda: None),
@@ -319,6 +321,9 @@ class X402JobRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(service._settle, settle)
         self.assertIs(service._report, report)
         self.assertIs(service._stream_work, stream_work)
+        self.assertIsInstance(service._rate_limiter, WalletRateLimiter)
+        self.assertIs(service._rate_limiter._store, service._store)
+        self.assertEqual(service._rate_limiter._token_secret, b"x" * 32)
 
     def test_legacy_promo_environment_variable_is_ignored(self) -> None:
         build = _load_runtime_functions()["build_x402_job_service"]

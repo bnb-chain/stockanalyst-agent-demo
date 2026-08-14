@@ -17,7 +17,7 @@ import json
 import logging
 import os
 import re
-from collections.abc import Callable, Mapping
+from collections.abc import Mapping
 from typing import Any
 
 import httpx
@@ -46,6 +46,10 @@ if __package__:
         build_payment_requirement,
         decode_payment_signature,
     )
+    from .x402_wallet_rate_limit import (
+        WalletRateLimitExceeded,
+        WalletRateLimitUnavailable,
+    )
 else:
     from b402_client import (
         B402Client,
@@ -69,6 +73,10 @@ else:
         build_payment_challenge,
         build_payment_requirement,
         decode_payment_signature,
+    )
+    from x402_wallet_rate_limit import (
+        WalletRateLimitExceeded,
+        WalletRateLimitUnavailable,
     )
 
 logger = logging.getLogger("seller-agent.x402")
@@ -498,6 +506,32 @@ class X402Handler:
                 payment_header,
                 req,
             )
+        except WalletRateLimitExceeded as exc:
+            await _send_json(
+                send,
+                429,
+                {
+                    "errorCode": "wallet_rate_limited",
+                    "retryable": True,
+                },
+                extra_headers=_async_response_headers(
+                    extra_headers=[
+                        (b"retry-after", str(exc.retry_after_seconds).encode())
+                    ]
+                ),
+            )
+            return
+        except WalletRateLimitUnavailable:
+            await _send_json(
+                send,
+                503,
+                {
+                    "errorCode": "wallet_rate_limit_unavailable",
+                    "retryable": True,
+                },
+                extra_headers=_async_response_headers(),
+            )
+            return
         except X402JobError as exc:
             await _send_job_error(send, exc, token_authenticated=False)
             return

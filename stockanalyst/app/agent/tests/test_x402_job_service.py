@@ -22,10 +22,15 @@ from x402_job_service import (
     X402JobService,
     load_job_token_secret,
 )
-from x402_job_store import JobConflict, StoredJob
+from x402_job_store import JobConflict, StoredJob, StoredWalletRateLimit
 from x402_settlement import SettlementOutcome
 from x402_tokens import U_TOKEN, USD1_TOKEN, USDC_TOKEN
 from x402_verify import CHAIN_ID, VerifiedPayment, validate_payment_proof
+from x402_wallet_rate_limit import (
+    WalletRateLimiter,
+    WalletRateLimitExceeded,
+    WalletRateLimitUnavailable,
+)
 
 ADDRESS = "0x1111111111111111111111111111111111111111"
 NONCE = "0x" + "22" * 32
@@ -64,6 +69,7 @@ class MemoryJobStore:
         self.presign_calls = 0
         self.reports: dict[tuple[str, str | None], str] = {}
         self.accounting_markers: dict[str, dict[str, Any]] = {}
+        self.wallet_rate_limits: dict[str, StoredWalletRateLimit] = {}
         self.events: list[str] = []
         self._etag = 0
         self._create_barrier = (
@@ -140,6 +146,55 @@ class MemoryJobStore:
             return False
         self.accounting_markers[job_id] = dict(marker)
         return True
+
+    async def read_wallet_rate_limit(
+        self,
+        wallet_digest: str,
+    ) -> StoredWalletRateLimit | None:
+        return self.wallet_rate_limits.get(wallet_digest)
+
+    async def create_wallet_rate_limit(
+        self,
+        wallet_digest: str,
+        record: dict[str, Any],
+    ) -> StoredWalletRateLimit | None:
+        if wallet_digest in self.wallet_rate_limits:
+            return None
+        stored = StoredWalletRateLimit(
+            record={
+                "version": record["version"],
+                "entries": [dict(entry) for entry in record["entries"]],
+            },
+            etag=self._next_etag(),
+        )
+        self.wallet_rate_limits[wallet_digest] = stored
+        self.events.append("rate:create")
+        return stored
+
+    async def replace_wallet_rate_limit(
+        self,
+        wallet_digest: str,
+        stored: StoredWalletRateLimit,
+        record: dict[str, Any],
+    ) -> StoredWalletRateLimit:
+        current = self.wallet_rate_limits.get(wallet_digest)
+        if current is None or current.etag != stored.etag:
+            raise JobConflict("wallet rate limit changed concurrently")
+        updated = StoredWalletRateLimit(
+            record={
+                "version": record["version"],
+                "entries": [dict(entry) for entry in record["entries"]],
+            },
+            etag=self._next_etag(),
+        )
+        self.wallet_rate_limits[wallet_digest] = updated
+        state = (
+            updated.record["entries"][0]["state"]
+            if updated.record["entries"]
+            else "released"
+        )
+        self.events.append(f"rate:{state}")
+        return updated
 
     def report_for_record(self, record: dict[str, Any]) -> str:
         return self.reports[
@@ -363,6 +418,7 @@ def make_service(
     accounting_sleep: Any = None,
     accounting_retry_attempts: int = 3,
     accept_new_jobs: bool = True,
+    rate_limiter: Any = None,
 ) -> X402JobService:
     async def idle_stream(
         _prompt: str,
@@ -376,9 +432,16 @@ def make_service(
     async def immediate_accounting_sleep(_delay: float) -> None:
         await asyncio.sleep(0)
 
+    selected_store = store or MemoryJobStore()
     return X402JobService(
-        store=store or MemoryJobStore(),
+        store=selected_store,
         token_secret=TOKEN_SECRET,
+        rate_limiter=rate_limiter
+        or WalletRateLimiter(
+            store=selected_store,
+            token_secret=TOKEN_SECRET,
+            clock=clock or (lambda: NOW),
+        ),
         settle=settle
         or AsyncMock(
             return_value=SettlementOutcome("settled", transaction="0xtx")
@@ -4101,6 +4164,314 @@ class X402JobValidationTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(raised.exception.code, "payment_rejected")
         self.assertEqual(store.read_calls, 0)
+
+
+class X402WalletAdmissionLifecycleTests(unittest.IsolatedAsyncioTestCase):
+    async def test_thirty_first_job_stops_before_all_paid_side_effects(self) -> None:
+        store = MemoryJobStore()
+        limiter = WalletRateLimiter(
+            store=store,
+            token_secret=TOKEN_SECRET,
+            clock=lambda: NOW,
+        )
+        for number in range(30):
+            await limiter.reserve(ADDRESS, f"x402_{number:032x}")
+        settle = AsyncMock()
+        report = AsyncMock()
+        service = make_service(
+            store=store,
+            settle=settle,
+            report=report,
+            rate_limiter=limiter,
+        )
+
+        with (
+            patch(
+                "x402_job_service.validate_payment_proof",
+                return_value=(verified_payment(), ""),
+            ),
+            patch.object(service, "_spawn") as spawn,
+            self.assertRaises(WalletRateLimitExceeded),
+        ):
+            await service.create_job(PROOF, REQUEST)
+
+        self.assertEqual(store.create_calls, 0)
+        settle.assert_not_awaited()
+        report.assert_not_awaited()
+        spawn.assert_not_called()
+
+    async def test_rate_store_uncertainty_stops_before_job_and_settlement(self) -> None:
+        store = MemoryJobStore()
+        limiter = AsyncMock(spec=WalletRateLimiter)
+        limiter.reserve.side_effect = WalletRateLimitUnavailable("s3 down")
+        settle = AsyncMock()
+        service = make_service(
+            store=store,
+            settle=settle,
+            rate_limiter=limiter,
+        )
+
+        with (
+            patch(
+                "x402_job_service.validate_payment_proof",
+                return_value=(verified_payment(), ""),
+            ),
+            self.assertRaises(WalletRateLimitUnavailable),
+        ):
+            await service.create_job(PROOF, REQUEST)
+
+        self.assertEqual(store.create_calls, 0)
+        settle.assert_not_awaited()
+
+    async def test_new_job_reserves_persists_settles_commits_then_queues(
+        self,
+    ) -> None:
+        store = MemoryJobStore()
+
+        async def settle(
+            _proof: str,
+            _mode: str,
+        ) -> SettlementOutcome:
+            store.events.append("settle")
+            return SettlementOutcome("settled", transaction="0xtx")
+
+        report = AsyncMock(return_value=True)
+        service = make_service(
+            store=store,
+            settle=AsyncMock(side_effect=settle),
+            report=report,
+        )
+        with (
+            patch(
+                "x402_job_service.validate_payment_proof",
+                return_value=(verified_payment(), ""),
+            ),
+            patch.object(service, "_spawn"),
+        ):
+            result = await service.create_job(PROOF, REQUEST)
+            await wait_for_accounting(service)
+            retried = await service.create_job(PROOF, REQUEST)
+            await wait_for_accounting(service)
+
+        record = store.jobs[result.job_id].record
+        self.assertEqual(
+            record["rateLimitReservationId"],
+            result.job_id,
+        )
+        self.assertRegex(record["rateLimitWalletDigest"], r"^[0-9a-f]{64}$")
+        self.assertEqual(record["rateLimitReservedAt"], NOW)
+        self.assertEqual(record["rateLimitState"], "committed")
+        self.assertEqual(record["status"], "queued")
+        self.assertEqual(record["settledAt"], NOW)
+        self.assertEqual(retried.job_id, result.job_id)
+        report.assert_awaited_once_with(
+            event_id=f"b402:{CHAIN_ID}:{ADDRESS}:{NONCE}",
+            address=ADDRESS,
+            called_at=NOW,
+        )
+        self.assertEqual(
+            store.events,
+            [
+                "rate:create",
+                "settle",
+                "replace:settling",
+                "rate:committed",
+                "replace:queued",
+            ],
+        )
+
+    async def test_explicit_rejection_releases_durable_reservation(self) -> None:
+        store = MemoryJobStore()
+        service = make_service(
+            store=store,
+            settle=AsyncMock(
+                return_value=SettlementOutcome(
+                    "rejected",
+                    reason="authorization rejected",
+                )
+            ),
+        )
+
+        with (
+            patch(
+                "x402_job_service.validate_payment_proof",
+                return_value=(verified_payment(), ""),
+            ),
+            self.assertRaises(X402JobError) as raised,
+        ):
+            await service.create_job(PROOF, REQUEST)
+
+        identity = service.derive_identity(verified_payment())
+        record = store.jobs[identity.job_id].record
+        self.assertEqual(raised.exception.code, "payment_rejected")
+        self.assertEqual(record["paymentStatus"], "failed")
+        self.assertEqual(record["rateLimitState"], "released")
+        rate_record = next(iter(store.wallet_rate_limits.values())).record
+        self.assertEqual(rate_record["entries"], [])
+
+    async def test_indeterminate_settlement_keeps_reserved_metadata(self) -> None:
+        store = MemoryJobStore()
+        service = make_service(
+            store=store,
+            settle=AsyncMock(side_effect=ConnectionError("response lost")),
+        )
+
+        with (
+            patch(
+                "x402_job_service.validate_payment_proof",
+                return_value=(verified_payment(), ""),
+            ),
+            self.assertRaises(SettlementIndeterminate),
+        ):
+            await service.create_job(PROOF, REQUEST)
+
+        record = next(iter(store.jobs.values())).record
+        self.assertEqual(record["status"], "settling")
+        self.assertEqual(record["paymentStatus"], "settling")
+        self.assertEqual(record["rateLimitState"], "reserved")
+        rate_record = next(iter(store.wallet_rate_limits.values())).record
+        self.assertEqual(rate_record["entries"][0]["state"], "reserved")
+
+    async def test_job_create_failure_releases_reservation(self) -> None:
+        class FailingCreateStore(MemoryJobStore):
+            async def create(self, record: dict[str, Any]) -> StoredJob | None:
+                raise RuntimeError("job persistence unavailable")
+
+        store = FailingCreateStore()
+        service = make_service(store=store)
+
+        with (
+            patch(
+                "x402_job_service.validate_payment_proof",
+                return_value=(verified_payment(), ""),
+            ),
+            self.assertRaisesRegex(RuntimeError, "job persistence unavailable"),
+        ):
+            await service.create_job(PROOF, REQUEST)
+
+        rate_record = next(iter(store.wallet_rate_limits.values())).record
+        self.assertEqual(rate_record["entries"], [])
+
+    async def test_exact_retry_of_every_durable_status_does_not_reserve(self) -> None:
+        for status in ("queued", "running", "succeeded", "failed", "settling"):
+            with self.subTest(status=status):
+                store = MemoryJobStore()
+                limiter = AsyncMock(spec=WalletRateLimiter)
+                service = make_service(store=store, rate_limiter=limiter)
+                if status == "settling":
+                    await seed_settling_job(
+                        service,
+                        store,
+                        lease_expires_at=NOW + 1,
+                        proof_header=PROOF,
+                    )
+                else:
+                    await seed_execution_job(
+                        service,
+                        store,
+                        status=status,
+                        retryable=False,
+                    )
+                with (
+                    patch(
+                        "x402_job_service.validate_payment_proof",
+                        return_value=(verified_payment(), ""),
+                    ),
+                    patch.object(service, "_spawn"),
+                ):
+                    await service.create_job(PROOF, REQUEST)
+                limiter.reserve.assert_not_awaited()
+
+    async def test_commit_failure_recovers_without_second_settlement(self) -> None:
+        store = MemoryJobStore()
+        durable = WalletRateLimiter(
+            store=store,
+            token_secret=TOKEN_SECRET,
+            clock=lambda: NOW,
+        )
+        first_commit = True
+
+        class CommitFailsOnce:
+            async def reserve(self, wallet: str, reservation_id: str):
+                return await durable.reserve(wallet, reservation_id)
+
+            async def commit(self, reservation) -> None:
+                nonlocal first_commit
+                if first_commit:
+                    first_commit = False
+                    raise WalletRateLimitUnavailable("temporary")
+                await durable.commit(reservation)
+
+            async def release(self, reservation) -> None:
+                await durable.release(reservation)
+
+        settle = AsyncMock(
+            return_value=SettlementOutcome("settled", transaction="0xtx")
+        )
+        first = make_service(
+            store=store,
+            settle=settle,
+            rate_limiter=CommitFailsOnce(),
+        )
+        with (
+            patch(
+                "x402_job_service.validate_payment_proof",
+                return_value=(verified_payment(), ""),
+            ),
+            self.assertRaises(WalletRateLimitUnavailable),
+        ):
+            await first.create_job(PROOF, REQUEST)
+
+        pending = next(iter(store.jobs.values())).record
+        settled_at = pending["settledAt"]
+        event_id = pending["competitionEventId"]
+        self.assertEqual(pending["paymentStatus"], "settled")
+        self.assertEqual(pending["status"], "settling")
+        self.assertEqual(pending["rateLimitState"], "reserved")
+
+        restarted = make_service(
+            store=store,
+            settle=settle,
+            rate_limiter=durable,
+        )
+        with (
+            patch(
+                "x402_job_service.validate_payment_proof",
+                return_value=(verified_payment(), ""),
+            ),
+            patch.object(restarted, "_spawn"),
+        ):
+            recovered = await restarted.create_job(PROOF, REQUEST)
+
+        final = store.jobs[recovered.job_id].record
+        self.assertEqual(final["rateLimitState"], "committed")
+        self.assertEqual(final["status"], "queued")
+        self.assertEqual(final["settledAt"], settled_at)
+        self.assertEqual(final["competitionEventId"], event_id)
+        settle.assert_awaited_once()
+
+    async def test_same_job_create_race_reserves_and_settles_once(self) -> None:
+        store = MemoryJobStore(synchronize_creates=True)
+        settle = AsyncMock(
+            return_value=SettlementOutcome("settled", transaction="0xtx")
+        )
+        service = make_service(store=store, settle=settle)
+        with (
+            patch(
+                "x402_job_service.validate_payment_proof",
+                return_value=(verified_payment(), ""),
+            ),
+            patch.object(service, "_spawn"),
+        ):
+            await asyncio.gather(
+                service.create_job(PROOF, REQUEST),
+                service.create_job(PROOF, REQUEST),
+            )
+
+        rate_record = next(iter(store.wallet_rate_limits.values())).record
+        self.assertEqual(len(rate_record["entries"]), 1)
+        self.assertEqual(rate_record["entries"][0]["state"], "committed")
+        settle.assert_awaited_once()
 
 
 if __name__ == "__main__":

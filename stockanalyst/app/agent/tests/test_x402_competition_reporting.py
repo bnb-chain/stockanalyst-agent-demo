@@ -3,7 +3,7 @@ from __future__ import annotations
 import base64
 import json
 import unittest
-from unittest.mock import ANY, AsyncMock, Mock, patch
+from unittest.mock import AsyncMock, patch
 
 from stockanalyst.app.agent import x402_handler as handler_module
 from stockanalyst.app.agent.x402_handler import X402Handler
@@ -299,6 +299,7 @@ class X402CompetitionReportingTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_async_create_delegates_accounting_to_job_service(self) -> None:
         job_service = AsyncMock()
+        b402_client = AsyncMock()
         job_service.create_job.return_value = CreateJobResult(
             job_id="x402_" + "a" * 32,
             job_token="token",
@@ -308,6 +309,7 @@ class X402CompetitionReportingTests(unittest.IsolatedAsyncioTestCase):
         handler = X402Handler(
             None,
             job_service=job_service,
+            b402_client=b402_client,
         )
         sent: list[dict] = []
 
@@ -331,6 +333,7 @@ class X402CompetitionReportingTests(unittest.IsolatedAsyncioTestCase):
             "proof",
             {"symbols": ["AAPL"]},
         )
+        b402_client.assert_not_called()
 
 
 if __name__ == "__main__":

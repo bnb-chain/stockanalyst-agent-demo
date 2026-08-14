@@ -146,6 +146,7 @@ from x402_job_service import (
 from x402_job_store import X402JobStore
 from x402_tokens import token_by_asset
 from x402_verify import VerifiedPayment
+from x402_wallet_rate_limit import WalletRateLimiter
 
 
 def build_x402_job_service(
@@ -204,9 +205,14 @@ def build_x402_job_service(
             )
         )
 
+    token_secret = load_job_token_secret(env)
     return X402JobService(
         store=store,
-        token_secret=load_job_token_secret(env),
+        token_secret=token_secret,
+        rate_limiter=WalletRateLimiter(
+            store=store,
+            token_secret=token_secret,
+        ),
         settle=_settle_via_facilitator,
         authorization_used=authorization_used,
         report=report_competition_call,

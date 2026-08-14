@@ -4,7 +4,7 @@ import base64
 import json
 import unittest
 from dataclasses import dataclass
-from unittest.mock import AsyncMock, Mock, patch
+from unittest.mock import AsyncMock, patch
 
 from stockanalyst.app.agent import x402_handler as handler_module
 from stockanalyst.app.agent import x402_verify
@@ -29,6 +29,10 @@ from stockanalyst.app.agent.x402_tokens import (
     USD1_TOKEN,
     USDC_TOKEN,
     USDT_TOKEN,
+)
+from stockanalyst.app.agent.x402_wallet_rate_limit import (
+    WalletRateLimitExceeded,
+    WalletRateLimitUnavailable,
 )
 
 JOB_ID = "x402_" + "a" * 32
@@ -218,6 +222,52 @@ async def free_report_work(symbol: str):
 
 
 class X402AsyncHandlerTests(unittest.IsolatedAsyncioTestCase):
+    async def test_paid_wallet_limit_maps_to_fixed_429_before_other_work(
+        self,
+    ) -> None:
+        service = AsyncMock()
+        service.create_job.side_effect = WalletRateLimitExceeded(123)
+
+        response = await call_handler(
+            make_handler(service),
+            method="POST",
+            path="/x402/analyze/async",
+            headers={"payment-signature": "proof"},
+            json_body={"symbols": ["AAPL"]},
+        )
+
+        self.assertEqual(response.status, 429)
+        self.assertEqual(response.headers["retry-after"], "123")
+        self.assertEqual(
+            response.json,
+            {"errorCode": "wallet_rate_limited", "retryable": True},
+        )
+
+    async def test_wallet_limit_uncertainty_maps_to_stable_retryable_503(
+        self,
+    ) -> None:
+        service = AsyncMock()
+        service.create_job.side_effect = WalletRateLimitUnavailable(
+            "sensitive s3 detail"
+        )
+
+        response = await call_handler(
+            make_handler(service),
+            method="POST",
+            path="/x402/analyze/async",
+            headers={"payment-signature": "proof"},
+            json_body={"symbols": ["AAPL"]},
+        )
+
+        self.assertEqual(response.status, 503)
+        self.assertEqual(
+            response.json,
+            {
+                "errorCode": "wallet_rate_limit_unavailable",
+                "retryable": True,
+            },
+        )
+        self.assertNotIn(b"sensitive", response.body)
     async def test_b402_settlement_adapter_dispatches_requested_mode(self) -> None:
         client = AsyncMock()
         verified = SettlementOutcome("settled", transaction="0xverified")
