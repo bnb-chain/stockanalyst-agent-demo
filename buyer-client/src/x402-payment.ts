@@ -32,13 +32,8 @@ export const PAYMENT_TOKENS = {
   },
 } as const;
 export const BSC_MAINNET_CHAIN_ID = 56;
-export const PAID_AMOUNT = "210000000000000000";
+export const PAID_AMOUNT = "100000000000000000";
 export const PAYMENT_TIMEOUT_SECONDS = 600;
-
-// Compatibility aliases for the promotional client, which remains U-only.
-export const U_TOKEN_ADDRESS = PAYMENT_TOKENS.U.asset;
-export const U_TOKEN_DOMAIN_NAME = PAYMENT_TOKENS.U.name;
-export const U_TOKEN_DOMAIN_VERSION = PAYMENT_TOKENS.U.version;
 
 export interface B402PaymentExtra {
   name: string;
@@ -69,7 +64,12 @@ export interface PaidPaymentChallenge {
   x402Version: 2;
   resource: B402PaymentResource;
   accepted: B402PaymentRequirement;
-  promotional: boolean;
+}
+
+function assertExactPaidAmount(challenge: PaidPaymentChallenge): void {
+  if (challenge.accepted.amount !== PAID_AMOUNT) {
+    throw new Error("Payment challenge must use the exact paid amount");
+  }
 }
 
 export function resolveX402SellerWallet(
@@ -95,6 +95,7 @@ export async function buildPaymentProof(
   challenge: PaidPaymentChallenge,
   ttlSeconds: number = PAYMENT_TIMEOUT_SECONDS,
 ): Promise<string> {
+  assertExactPaidAmount(challenge);
   if (challenge.accepted.extra.assetTransferMethod === "permit2-exact") {
     const { buildPermit2PaymentProof } = await import("./x402-permit2.js");
     return buildPermit2PaymentProof(wallet, challenge, ttlSeconds);

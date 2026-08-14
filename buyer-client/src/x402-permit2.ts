@@ -10,6 +10,7 @@ import {
 } from "ethers";
 import {
   BSC_MAINNET_CHAIN_ID,
+  PAID_AMOUNT,
   PAYMENT_TIMEOUT_SECONDS,
   PAYMENT_TOKENS,
   PERMIT2_ADDRESS,
@@ -17,7 +18,7 @@ import {
 } from "./x402-payment.js";
 
 export const PERMIT2_ALLOWANCE_TARGET = 50n * 10n ** 18n;
-export const PERMIT2_PAYMENT_MINIMUM = 210000000000000000n;
+export const PERMIT2_PAYMENT_MINIMUM = 100000000000000000n;
 
 export type Permit2TokenSymbol = "USDC" | "USDT";
 
@@ -123,7 +124,7 @@ export function assertPermit2PaymentReady(
   const symbol = requirePermit2Token(token);
   if (allowance < PERMIT2_PAYMENT_MINIMUM) {
     throw new Error(
-      `Permit2 allowance is below 0.21; run npm run x402:approve -- ${symbol}`,
+      `Permit2 allowance is below 0.1; run npm run x402:approve -- ${symbol}`,
     );
   }
   if (allowance > PERMIT2_ALLOWANCE_TARGET) {
@@ -162,6 +163,7 @@ function logAllowanceSummary(
   log(`Canonical Permit2: ${PERMIT2_ADDRESS}`);
   log(`Current allowance: ${currentAllowance}`);
   log(`Target allowance: ${targetAllowance}`);
+  log(`Paid-call guidance: up to 500 exact 0.1 ${token} calls at the 50-token cap`);
   log(`Transaction count: ${transactionCount}`);
 }
 
@@ -230,7 +232,8 @@ export async function buildPermit2PaymentProof(
   const spender = accepted.extra.spenderAddress;
   const now = nowSeconds();
   if (
-    accepted.extra.assetTransferMethod !== "permit2-exact"
+    accepted.amount !== PAID_AMOUNT
+    || accepted.extra.assetTransferMethod !== "permit2-exact"
     || typeof spender !== "string"
     || !/^0x[0-9a-fA-F]{40}$/.test(spender)
     || !Number.isSafeInteger(now)
@@ -366,8 +369,8 @@ const SAFE_CLI_ERROR_MESSAGES = new Set([
   "KEYSTORE_PATH is required for Permit2 allowance operations",
   "WALLET_PASSWORD is required for Permit2 allowance operations",
   "ERC-20 allowance read must return bigint",
-  "Permit2 allowance is below 0.21; run npm run x402:approve -- USDC",
-  "Permit2 allowance is below 0.21; run npm run x402:approve -- USDT",
+  "Permit2 allowance is below 0.1; run npm run x402:approve -- USDC",
+  "Permit2 allowance is below 0.1; run npm run x402:approve -- USDT",
   "Permit2 allowance exceeds 50; reset it to 50 or revoke it",
   'Permit2 approve declined: exact answer "yes" is required',
   'Permit2 revoke declined: exact answer "yes" is required',

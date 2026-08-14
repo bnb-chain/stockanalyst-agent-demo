@@ -137,8 +137,8 @@ const SAFE_ASYNC_CLI_ERROR_MESSAGES = new Set([
   "KEYSTORE_PATH is required to create a paid job",
   "Permit2 preflight failed; verify BSC_RPC_URL, BSC mainnet chain ID 56, and the USDC allowance",
   "Permit2 preflight failed; verify BSC_RPC_URL, BSC mainnet chain ID 56, and the USDT allowance",
-  "Permit2 allowance is below 0.21; run npm run x402:approve -- USDC",
-  "Permit2 allowance is below 0.21; run npm run x402:approve -- USDT",
+  "Permit2 allowance is below 0.1; run npm run x402:approve -- USDC",
+  "Permit2 allowance is below 0.1; run npm run x402:approve -- USDT",
   "Permit2 allowance exceeds 50; reset it to 50 or revoke it",
   "Pending x402 access metadata is invalid",
   "Payment access metadata is invalid",
@@ -179,22 +179,17 @@ export function formatX402AccessSummary(
   access: X402PaymentAccess,
 ): string {
   const canonical = parseX402PaymentAccess(access);
-  if (canonical.promotional) {
-    return `Promotional access: 0 ${canonical.token} (wallet signature only; no settlement)`;
-  }
-  return `Payment: 0.21 ${canonical.token} → ${canonical.payTo}`;
+  return `Payment: 0.1 ${canonical.token} (submitted)`;
 }
 
 export interface X402PaymentAccess {
   token: PaymentTokenSymbol;
-  promotional: boolean;
   payTo: string;
 }
 
 function parseX402PaymentAccess(value: unknown): X402PaymentAccess {
   if (!isRecord(value)) throw new Error("Pending x402 access metadata is invalid");
   const token = value["token"];
-  const promotional = value["promotional"];
   const payTo = value["payTo"];
   if (
     (
@@ -203,27 +198,22 @@ function parseX402PaymentAccess(value: unknown): X402PaymentAccess {
       && token !== "USDC"
       && token !== "USDT"
     )
-    || typeof promotional !== "boolean"
     || typeof payTo !== "string"
     || !/^0x[0-9a-f]{40}$/.test(payTo)
   ) {
     throw new Error("Pending x402 access metadata is invalid");
   }
-  return { token, promotional, payTo };
+  return { token, payTo };
 }
 
 export function paymentAccessFromChallenge(
   challenge: PaidPaymentChallenge,
 ): X402PaymentAccess {
-  return paymentAccessFromAccepted(
-    challenge.accepted,
-    challenge.promotional,
-  );
+  return paymentAccessFromAccepted(challenge.accepted);
 }
 
 function paymentAccessFromAccepted(
   accepted: unknown,
-  expectedPromotional?: boolean,
 ): X402PaymentAccess {
   if (!isRecord(accepted) || !isRecord(accepted["extra"])) {
     throw new Error("Payment access metadata is invalid");
@@ -240,7 +230,6 @@ function paymentAccessFromAccepted(
   )?.[0]) as PaymentTokenSymbol | undefined;
   if (symbol === undefined) throw new Error("Payment access metadata is invalid");
   const token = PAYMENT_TOKENS[symbol];
-  const promotional = amount === "0";
   const signerAddress = extra["signerAddress"];
   const spenderAddress = extra["spenderAddress"];
   const signerPresent = Object.prototype.hasOwnProperty.call(
@@ -253,23 +242,15 @@ function paymentAccessFromAccepted(
   );
   const transferMethod = token.transferMethod;
   if (
-    (expectedPromotional !== undefined && expectedPromotional !== promotional)
-    || (!promotional && amount !== PAID_AMOUNT)
-    || (promotional && transferMethod !== "eip3009")
+    amount !== PAID_AMOUNT
     || typeof payTo !== "string"
     || !/^0x[0-9a-fA-F]{40}$/.test(payTo)
     || extra["name"] !== token.name
     || extra["version"] !== token.version
     || extra["assetTransferMethod"] !== transferMethod
-    || (
-      promotional
-        ? signerPresent
-        : (
-          !signerPresent
-          || typeof signerAddress !== "string"
-          || !/^0x[0-9a-fA-F]{40}$/.test(signerAddress)
-        )
-    )
+    || !signerPresent
+    || typeof signerAddress !== "string"
+    || !/^0x[0-9a-fA-F]{40}$/.test(signerAddress)
     || (
       transferMethod === "permit2-exact"
       && (
@@ -283,7 +264,6 @@ function paymentAccessFromAccepted(
   }
   return {
     token: symbol,
-    promotional,
     payTo: payTo.toLowerCase(),
   };
 }
@@ -815,11 +795,14 @@ function parsePendingCreate(value: unknown): PendingCreateRecord {
   const recoveryExpiresAt = value["recoveryExpiresAt"];
   const jobId = value["jobId"];
   const binding = value["binding"];
+  const legacyPromotional = value["promotional"];
   if (
     value["version"] !== 1
     || typeof paymentProof !== "string"
     || paymentProof.length === 0
     || paymentProof.length > 128 * 1024
+    || (legacyPromotional !== undefined && legacyPromotional !== false)
+    || paymentProofContainsPromotionalAmount(paymentProof)
     || !isRecord(request)
     || !Array.isArray(symbols)
     || symbols.length === 0
@@ -869,6 +852,17 @@ function parsePendingCreate(value: unknown): PendingCreateRecord {
         },
       }),
   };
+}
+
+function paymentProofContainsPromotionalAmount(paymentProof: string): boolean {
+  try {
+    const proof = JSON.parse(Buffer.from(paymentProof, "base64").toString("utf8"));
+    return isRecord(proof)
+      && isRecord(proof["accepted"])
+      && proof["accepted"]["amount"] === "0";
+  } catch {
+    return false;
+  }
 }
 
 function paymentAccessFromProof(paymentProof: string): X402PaymentAccess {
@@ -1352,28 +1346,21 @@ export async function runAsyncStartup(
       dependencies.fetch,
       paymentToken,
     );
-    if (initial.kind === "created") {
-      receipt = initial.receipt;
-      persistAsyncJobReceipt(options.receiptPath, receipt);
-      dependencies.log(`Created asynchronous job ${receipt.jobId}`);
-      dependencies.log("Promotional access: free (no wallet or payment)");
-    } else {
-      wallet ??= await dependencies.loadWallet(env);
-      dependencies.log(
-        initial.challenge.accepted.extra.assetTransferMethod === "permit2-exact"
-          ? "Signing one exact Permit2 payment authorization..."
-          : "Signing one x402 EIP-3009 payment authorization...",
-      );
-      pending = await buildPaidPendingCreate(
-        wallet,
-        initial.challenge,
-        paymentToken,
-        request,
-        dependencies,
-      );
-      // The proof must be durable before any POST that carries it.
-      persistPendingCreate(options.pendingPath, pending);
-    }
+    wallet ??= await dependencies.loadWallet(env);
+    dependencies.log(
+      initial.challenge.accepted.extra.assetTransferMethod === "permit2-exact"
+        ? "Signing one exact Permit2 payment authorization..."
+        : "Signing one x402 EIP-3009 payment authorization...",
+    );
+    pending = await buildPaidPendingCreate(
+      wallet,
+      initial.challenge,
+      paymentToken,
+      request,
+      dependencies,
+    );
+    // The proof must be durable before any POST that carries it.
+    persistPendingCreate(options.pendingPath, pending);
   }
 
   if (pending !== undefined) {

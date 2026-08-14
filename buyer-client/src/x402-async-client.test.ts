@@ -107,7 +107,6 @@ function paymentChallenge(
     x402Version: 2,
     resource,
     accepted,
-    promotional: accepted.amount === "0",
   } as PaidPaymentChallenge;
 }
 
@@ -122,17 +121,6 @@ function paymentRequired(
     accepts: challenges.map((challenge) => challenge.accepted),
     resource: challenges[0]?.resource,
   };
-}
-
-function promotionalPaymentChallenge(
-  token: PaymentTokenSymbol = "U",
-): PaidPaymentChallenge {
-  const challenge = paymentChallenge({
-    token,
-    accepted: { amount: "0" },
-  });
-  delete (challenge.accepted.extra as { signerAddress?: string }).signerAddress;
-  return challenge;
 }
 
 function receipt(overrides: Partial<AsyncJobReceipt> = {}): AsyncJobReceipt {
@@ -389,8 +377,8 @@ test("real CLI startup rejects unsafe Permit2 preflight before every fetch and s
       name: "below minimum",
       token: "USDC",
       rpcUrl: "https://rpc.invalid",
-      read: async () => 210000000000000000n - 1n,
-      expected: /below 0\.21/,
+      read: async () => 100000000000000000n - 1n,
+      expected: /below 0\.1/,
     },
     {
       name: "above target",
@@ -606,7 +594,7 @@ test("real async CLI output preserves exact insufficient-allowance guidance", as
               loadContext: async () => ({ symbols: ["AAPL"] }),
               loadWallet: async () => wallet,
               createPermit2AllowanceReader: () => async () => (
-                210000000000000000n - 1n
+                100000000000000000n - 1n
               ),
               fetch: async () => {
                 throw new Error("unexpected fetch");
@@ -627,7 +615,7 @@ test("real async CLI output preserves exact insufficient-allowance guidance", as
 
       assert.equal(
         stderr[0],
-        "x402 asynchronous flow failed: Permit2 allowance is below 0.21; "
+        "x402 asynchronous flow failed: Permit2 allowance is below 0.1; "
           + `run npm run x402:approve -- ${token}`,
       );
       assert.deepEqual(stderr.slice(1), [
@@ -1124,7 +1112,7 @@ test("unsafe Permit2 allowance produces zero signatures and zero POSTs", async (
   const request = { symbols: ["AAPL"] };
 
   for (const token of ["USDC", "USDT"] as const) {
-    for (const allowance of [210000000000000000n - 1n, 50n * 10n ** 18n + 1n]) {
+    for (const allowance of [100000000000000000n - 1n, 50n * 10n ** 18n + 1n]) {
       let signatures = 0;
       let posts = 0;
       const challenge = paymentChallenge({ token });
@@ -1147,7 +1135,7 @@ test("unsafe Permit2 allowance produces zero signatures and zero POSTs", async (
           posts += 1;
           return pending;
         },
-        allowance < 210000000000000000n ? /below 0\.21/ : /exceeds 50/,
+        allowance < 100000000000000000n ? /below 0\.1/ : /exceeds 50/,
       );
       assert.equal(signatures, 0);
       assert.equal(posts, 0);
@@ -1163,33 +1151,21 @@ test("normal x402 async flow has no Permit2 approval path", () => {
   assert.doesNotMatch(asyncModule, /approvePermit2Allowance|\.approve\s*\(/);
 });
 
-test("formats promotional and paid CLI output without proof or signature data", () => {
-  assert.equal(
-    formatX402AccessSummary(paymentAccessFromChallenge(promotionalPaymentChallenge("U"))),
-    "Promotional access: 0 U (wallet signature only; no settlement)",
-  );
-  assert.equal(
-    formatX402AccessSummary(paymentAccessFromChallenge(paymentChallenge({ token: "USD1" }))),
-    `Payment: 0.21 USD1 → ${SELLER.toLowerCase()}`,
-  );
-  for (const token of ["USDC", "USDT"] as const) {
+test("formats paid CLI output without proof, signature, nonce, or seller address data", () => {
+  for (const token of ["U", "USD1", "USDC", "USDT"] as const) {
     const summary = formatX402AccessSummary(
       paymentAccessFromChallenge(paymentChallenge({ token })),
     );
-    assert.equal(summary, `Payment: 0.21 ${token} → ${SELLER.toLowerCase()}`);
-    assert.doesNotMatch(summary, new RegExp(SPENDER.slice(2), "i"));
+    assert.equal(summary, `Payment: 0.1 ${token} (submitted)`);
+    assert.doesNotMatch(summary, new RegExp(`${SPENDER.slice(2)}|${SELLER.slice(2)}|signature|nonce`, "i"));
   }
 });
 
-test("pending-create recovery retains the correct paid and promotional access summary", async () => {
+test("pending-create recovery retains the paid-only access summary", async () => {
   const cases = [
     {
-      challenge: promotionalPaymentChallenge("U"),
-      summary: "Promotional access: 0 U (wallet signature only; no settlement)",
-    },
-    {
       challenge: paymentChallenge({ token: "USD1" }),
-      summary: `Payment: 0.21 USD1 → ${SELLER.toLowerCase()}`,
+      summary: "Payment: 0.1 USD1 (submitted)",
     },
   ];
 
@@ -1228,6 +1204,55 @@ test("pending-create recovery retains the correct paid and promotional access su
     } finally {
       rmSync(directory, { recursive: true, force: true });
     }
+  }
+});
+
+test("legacy paid pending records normalize false promotional markers and reject promotional state", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "x402-paid-pending-compat-"));
+  const pendingPath = join(directory, "pending.json");
+  const receiptPath = join(directory, "receipt.json");
+  const now = Date.now();
+  const request = { symbols: ["AAPL"] };
+  const paidProof = eip3009Proof(paymentChallenge({ token: "U" }));
+  const pending = createPendingRecord(paidProof, request, now);
+  try {
+    writeFileSync(pendingPath, JSON.stringify({ ...pending, promotional: false }));
+    const recovered = loadPendingCreate(pendingPath);
+    assert.equal((recovered as unknown as Record<string, unknown>)["promotional"], undefined);
+    let submittedProof = "";
+    await createReceiptFromPending(
+      ENDPOINT,
+      recovered,
+      pendingPath,
+      receiptPath,
+      async (_input, init) => {
+        submittedProof = new Headers(init?.headers).get("PAYMENT-SIGNATURE") ?? "";
+        return json(receipt(), { status: 202 });
+      },
+      { now: () => now, maxAttempts: 1 },
+    );
+    assert.equal(submittedProof, paidProof);
+
+    assert.throws(
+      () => persistPendingCreate(pendingPath, {
+        ...pending,
+        promotional: true,
+      } as unknown as Parameters<typeof persistPendingCreate>[1]),
+      /Stored pending x402 request is invalid/,
+    );
+    assert.throws(
+      () => persistPendingCreate(
+        pendingPath,
+        createPendingRecord(
+          eip3009Proof(paymentChallenge({ accepted: { amount: "0" } })),
+          request,
+          now,
+        ),
+      ),
+      /Stored pending x402 request is invalid/,
+    );
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
   }
 });
 
@@ -1323,7 +1348,7 @@ test("Permit2 response loss and restart reuse the exact proof identity and bound
     );
 
     const summary = pendingAccessSummary(bound);
-    assert.equal(summary, `Payment: 0.21 USDT → ${SELLER.toLowerCase()}`);
+    assert.equal(summary, "Payment: 0.1 USDT (submitted)");
     assert.doesNotMatch(summary, /private-permit2-signature/i);
     assert.doesNotMatch(summary, new RegExp(SPENDER.slice(2), "i"));
   } finally {
@@ -1352,12 +1377,12 @@ test("uses the four-token mainnet payment registry", () => {
     Object.values(PAYMENT_TOKENS).map((token) => token.transferMethod),
     ["eip3009", "eip3009", "permit2-exact", "permit2-exact"],
   );
-  assert.equal(PAID_AMOUNT, "210000000000000000");
+  assert.equal(PAID_AMOUNT, "100000000000000000");
   assert.equal(paymentChallenge().accepted.amount, PAID_AMOUNT);
   assert.equal(BSC_MAINNET_CHAIN_ID, 56);
 });
 
-test("buildPaymentProof uses the exact 0.21-token authorization value", async () => {
+test("buildPaymentProof uses the exact 0.1-token authorization value", async () => {
   for (const token of ["U", "USD1"] as const) {
     const proof = JSON.parse(
       Buffer.from(
@@ -1368,7 +1393,7 @@ test("buildPaymentProof uses the exact 0.21-token authorization value", async ()
         "base64",
       ).toString("utf8"),
     ) as { payload: { authorization: { value: string } } };
-    assert.equal(proof.payload.authorization.value, "210000000000000000");
+    assert.equal(proof.payload.authorization.value, "100000000000000000");
   }
 });
 
@@ -1377,27 +1402,17 @@ test("x402 production modules expose only explicit mainnet chain naming", () => 
     new URL("./x402-payment.js", import.meta.url),
     "utf8",
   );
-  const freeModule = readFileSync(
-    new URL("./x402free.js", import.meta.url),
-    "utf8",
-  );
 
   assert.doesNotMatch(paymentModule, /BSC_TESTNET_CHAIN_ID/);
-  assert.doesNotMatch(freeModule, /BSC_TESTNET_CHAIN_ID/);
-  assert.match(freeModule, /BSC_MAINNET_CHAIN_ID/);
 });
 
-test("x402 free tier uses V2-only headers and never echoes server error data", () => {
-  const freeModule = readFileSync(
-    new URL("./x402free.js", import.meta.url),
+test("x402 buyer has no free CLI command or executable source", () => {
+  const packageJson = JSON.parse(readFileSync(
+    new URL("../package.json", import.meta.url),
     "utf8",
-  );
-
-  assert.match(freeModule, /"PAYMENT-SIGNATURE": proof/);
-  assert.doesNotMatch(freeModule, /await resp\.(?:json|text)\(/);
-  assert.doesNotMatch(freeModule, /err\.message/);
-  assert.match(freeModule, /free_quote_payment_rejected/);
-  assert.match(freeModule, /free_quote_http_\$\{resp\.status\}/);
+  )) as { scripts?: Record<string, string> };
+  assert.equal(packageJson.scripts?.["x402:free"], undefined);
+  assert.equal(existsSync(new URL("../src/x402free.ts", import.meta.url)), false);
 });
 
 test("buyer documentation separates mainnet x402 from testnet ERC-8183", () => {
@@ -1432,7 +1447,7 @@ test("buildPaymentProof signs with the selected token contract and domain", asyn
   const wallet = new Wallet(Wallet.createRandom().privateKey);
   const challenge = paymentChallenge({
     token: "USD1",
-    accepted: { amount: "42" },
+    accepted: { amount: PAID_AMOUNT },
   });
   const proof = JSON.parse(
     Buffer.from(await buildPaymentProof(wallet, challenge, 300), "base64").toString("utf8"),
@@ -1460,7 +1475,7 @@ test("buildPaymentProof signs with the selected token contract and domain", asyn
   assert.equal("network" in proof, false);
   assert.equal(proof.payload.authorization.from, wallet.address.toLowerCase());
   assert.equal(proof.payload.authorization.to, SELLER.toLowerCase());
-  assert.equal(proof.payload.authorization.value, "42");
+  assert.equal(proof.payload.authorization.value, PAID_AMOUNT);
   assert.equal(proof.payload.authorization.validAfter, "0");
   assert.match(proof.payload.authorization.nonce, /^0x[0-9a-f]{64}$/);
 
@@ -1492,45 +1507,37 @@ test("buildPaymentProof signs with the selected token contract and domain", asyn
   assert.equal(recovered, wallet.address);
 });
 
-test("accepts zero promotional challenges for each registered EIP-3009 token", async () => {
-  for (const token of ["U", "USD1"] as const) {
-    const expected = promotionalPaymentChallenge(token);
-    const required = paymentRequired([expected]);
-    const actual = await fetchPaymentChallenge(
+test("all token challenges require exactly 0.1 and reject promotional or legacy amounts", async () => {
+  const paidWithoutSigner = paymentChallenge();
+  delete (paidWithoutSigner.accepted.extra as { signerAddress?: string }).signerAddress;
+  const invalid: Array<[string, PaidPaymentChallenge, PaymentTokenSymbol]> = [
+    ["paid without signer", paidWithoutSigner, "U"],
+  ];
+  for (const token of ["U", "USD1", "USDC", "USDT"] as const) {
+    const exact = paymentChallenge({ token });
+    const exactRequired = paymentRequired([exact]);
+    const selected = await fetchPaymentChallenge(
       ENDPOINT,
       { symbols: ["AAPL"] },
       SELLER,
-      async () => json({
-        paymentRequired: required,
-      }, {
-        status: 402,
-        headers: { "PAYMENT-REQUIRED": base64Json(required) },
-      }),
+      async () => json(
+        { paymentRequired: exactRequired },
+        { status: 402, headers: { "PAYMENT-REQUIRED": base64Json(exactRequired) } },
+      ),
       token,
     );
-
-    assert.equal(actual.promotional, true);
-    assert.equal(actual.accepted.amount, "0");
-    assert.equal("signerAddress" in actual.accepted.extra, false);
-    assert.equal(actual.accepted.asset, PAYMENT_TOKENS[token].asset);
-    assert.equal(actual.accepted.extra.name, PAYMENT_TOKENS[token].name);
-    assert.equal(actual.accepted.extra.version, PAYMENT_TOKENS[token].version);
-    assert.equal(actual.accepted.extra.assetTransferMethod, "eip3009");
+    assert.equal(selected.accepted.amount, PAID_AMOUNT);
+    assert.equal("promotional" in selected, false);
+    for (const amount of ["0", "210000000000000000", "100000000000000001"]) {
+      invalid.push([
+        `${token} amount ${amount}`,
+        paymentChallenge({ token, accepted: { amount } }),
+        token,
+      ]);
+    }
   }
-});
 
-test("rejects malformed promotional and paid challenge discriminants", async () => {
-  const paidWithoutSigner = paymentChallenge();
-  delete (paidWithoutSigner.accepted.extra as { signerAddress?: string }).signerAddress;
-  const invalid: Array<[string, PaidPaymentChallenge]> = [
-    ["zero with signer", paymentChallenge({ accepted: { amount: "0" } })],
-    ["paid without signer", paidWithoutSigner],
-    ["negative amount", paymentChallenge({ accepted: { amount: "-1" } })],
-    ["decimal amount", paymentChallenge({ accepted: { amount: "0.0" } })],
-    ["scientific amount", paymentChallenge({ accepted: { amount: "1e18" } })],
-  ];
-
-  for (const [name, challenge] of invalid) {
+  for (const [name, challenge, token] of invalid) {
     const required = paymentRequired([challenge]);
     await assert.rejects(
       fetchPaymentChallenge(
@@ -1543,6 +1550,7 @@ test("rejects malformed promotional and paid challenge discriminants", async () 
           status: 402,
           headers: { "PAYMENT-REQUIRED": base64Json(required) },
         }),
+        token,
       ),
       (error: unknown) => {
         assert.equal(
@@ -1556,55 +1564,16 @@ test("rejects malformed promotional and paid challenge discriminants", async () 
   }
 });
 
-test("buildPaymentProof signs an exact zero-value promotional authorization", async () => {
+test("EIP-3009 signing refuses zero and legacy paid amounts", async () => {
   const wallet = new Wallet(Wallet.createRandom().privateKey);
-  const challenge = promotionalPaymentChallenge("USD1");
-  const proof = JSON.parse(
-    Buffer.from(await buildPaymentProof(wallet, challenge, 300), "base64").toString("utf8"),
-  ) as {
-    accepted: PaidPaymentChallenge["accepted"];
-    payload: {
-      signature: string;
-      authorization: {
-        from: string;
-        to: string;
-        value: string;
-        validAfter: string;
-        validBefore: string;
-        nonce: string;
-      };
-    };
-  };
-
-  assert.equal(proof.payload.authorization.value, "0");
-  assert.equal(proof.accepted.network, "eip155:56");
-  assert.equal(proof.accepted.asset, PAYMENT_TOKENS.USD1.asset);
-  const recovered = verifyTypedData(
-    {
-      name: PAYMENT_TOKENS.USD1.name,
-      version: PAYMENT_TOKENS.USD1.version,
-      chainId: 56,
-      verifyingContract: PAYMENT_TOKENS.USD1.asset,
-    },
-    {
-      TransferWithAuthorization: [
-        { name: "from", type: "address" },
-        { name: "to", type: "address" },
-        { name: "value", type: "uint256" },
-        { name: "validAfter", type: "uint256" },
-        { name: "validBefore", type: "uint256" },
-        { name: "nonce", type: "bytes32" },
-      ],
-    },
-    {
-      ...proof.payload.authorization,
-      value: 0n,
-      validAfter: BigInt(proof.payload.authorization.validAfter),
-      validBefore: BigInt(proof.payload.authorization.validBefore),
-    },
-    proof.payload.signature,
-  );
-  assert.equal(recovered, wallet.address);
+  for (const token of ["U", "USD1"] as const) {
+    for (const amount of ["0", "210000000000000000"]) {
+      await assert.rejects(
+        buildPaymentProof(wallet, paymentChallenge({ token, accepted: { amount } }), 300),
+        /exact paid amount/,
+      );
+    }
+  }
 });
 
 test("fetchPaymentChallenge selects every exact token symbol and defaults to U", async () => {
@@ -1833,8 +1802,8 @@ test("fetchPaymentChallenge rejects Permit2 method, domain, address, promo, and 
       token: "USDT",
       extra: { spenderAddress: "invalid" },
     })],
-    ["USDC promo", promotionalPaymentChallenge("USDC")],
-    ["USDT promo", promotionalPaymentChallenge("USDT")],
+    ["USDC zero", paymentChallenge({ token: "USDC", accepted: { amount: "0" } })],
+    ["USDT zero", paymentChallenge({ token: "USDT", accepted: { amount: "0" } })],
   ];
 
   for (const [name, challenge] of invalid) {
@@ -1914,9 +1883,9 @@ test("fetchPaymentChallenge requires the canonical 600-second payment timeout", 
   }
 });
 
-test("beginAsyncAnalysis accepts a proofless promotional 202 response", async () => {
+test("beginAsyncAnalysis rejects a proofless 202 response", async () => {
   const calls: Array<{ url: string; headers: Headers }> = [];
-  const result = await beginAsyncAnalysis(
+  await assert.rejects(beginAsyncAnalysis(
     ENDPOINT,
     { symbols: ["AAPL"] },
     SELLER,
@@ -1927,9 +1896,9 @@ test("beginAsyncAnalysis accepts a proofless promotional 202 response", async ()
       });
       return json(receipt(), { status: 202 });
     },
-  );
-
-  assert.deepEqual(result, { kind: "created", receipt: receipt() });
+  ), (error: unknown) => (
+    (error as AsyncJobClientError).code === "invalid_response"
+  ));
   assert.equal(calls.length, 1);
   assert.equal(calls[0]?.url, `${ENDPOINT}/x402/analyze/async`);
   assert.equal(calls[0]?.headers.has("PAYMENT-SIGNATURE"), false);
@@ -1986,7 +1955,7 @@ test("beginAsyncAnalysis preserves the safe requested-token availability error",
   );
 });
 
-test("beginAsyncAnalysis rejects malformed promotional receipts", async () => {
+test("beginAsyncAnalysis rejects malformed paymentless receipts", async () => {
   await assert.rejects(
     beginAsyncAnalysis(
       ENDPOINT,
