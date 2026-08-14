@@ -22,6 +22,19 @@ def job_record() -> dict[str, Any]:
     }
 
 
+def wallet_rate_limit_record() -> dict[str, Any]:
+    return {
+        "version": 1,
+        "entries": [
+            {
+                "reservationId": "x402_" + "b" * 32,
+                "reservedAt": 1_700_000_000_000,
+                "state": "reserved",
+            }
+        ],
+    }
+
+
 def s3_error(code: str) -> ClientError:
     return ClientError({"Error": {"Code": code, "Message": code}}, "PutObject")
 
@@ -302,6 +315,164 @@ class X402JobStoreTests(unittest.IsolatedAsyncioTestCase):
         self.s3.put_errors = [s3_error("409"), s3_error("409")]
         with self.assertRaises(JobConflict):
             await self.store.replace(stored, {**stored.record, "status": "failed"})
+
+    async def test_wallet_rate_limit_create_is_private_and_conditional(self) -> None:
+        digest = "a" * 64
+        record = wallet_rate_limit_record()
+
+        stored = await self.store.create_wallet_rate_limit(digest, record)
+
+        self.assertIsNotNone(stored)
+        put = self.s3.put_calls[-1]
+        self.assertEqual(put["Bucket"], "private-jobs")
+        self.assertEqual(
+            put["Key"],
+            f"x402-jobs/rate-limits/v1/{digest}.json",
+        )
+        self.assertEqual(put["IfNoneMatch"], "*")
+        self.assertEqual(put["CacheControl"], "private,no-store")
+        self.assertNotIn("ACL", put)
+
+    async def test_wallet_rate_limit_create_conflict_does_not_overwrite(self) -> None:
+        digest = "a" * 64
+        first = await self.store.create_wallet_rate_limit(
+            digest,
+            wallet_rate_limit_record(),
+        )
+        second_record = {
+            "version": 1,
+            "entries": [
+                {
+                    "reservationId": "x402_" + "c" * 32,
+                    "reservedAt": 1_700_000_000_001,
+                    "state": "reserved",
+                }
+            ],
+        }
+
+        second = await self.store.create_wallet_rate_limit(
+            digest,
+            second_record,
+        )
+        reread = await self.store.read_wallet_rate_limit(digest)
+
+        self.assertIsNotNone(first)
+        self.assertIsNone(second)
+        assert reread is not None
+        self.assertEqual(reread.record, wallet_rate_limit_record())
+
+    async def test_wallet_rate_limit_replace_requires_observed_etag(self) -> None:
+        digest = "a" * 64
+        stored = await self.store.create_wallet_rate_limit(
+            digest,
+            wallet_rate_limit_record(),
+        )
+        assert stored is not None
+        changed = {
+            "version": 1,
+            "entries": [
+                {**stored.record["entries"][0], "state": "committed"},
+            ],
+        }
+
+        updated = await self.store.replace_wallet_rate_limit(
+            digest,
+            stored,
+            changed,
+        )
+
+        self.assertEqual(updated.record, changed)
+        self.assertEqual(self.s3.put_calls[-1]["IfMatch"], stored.etag)
+        self.assertEqual(
+            self.s3.put_calls[-1]["CacheControl"],
+            "private,no-store",
+        )
+        with self.assertRaises(JobConflict):
+            await self.store.replace_wallet_rate_limit(
+                digest,
+                stored,
+                wallet_rate_limit_record(),
+            )
+
+    async def test_wallet_rate_limit_missing_read_returns_none(self) -> None:
+        self.assertIsNone(await self.store.read_wallet_rate_limit("a" * 64))
+
+    async def test_wallet_digest_must_be_exact_lowercase_hex(self) -> None:
+        for digest in (
+            "a" * 63,
+            "a" * 65,
+            "A" * 64,
+            "g" * 64,
+            "../" + "a" * 61,
+        ):
+            with self.subTest(digest=digest), self.assertRaisesRegex(
+                X402JobStoreError,
+                "invalid wallet digest",
+            ):
+                await self.store.read_wallet_rate_limit(digest)
+
+    async def test_wallet_rate_limit_rejects_malformed_schema(self) -> None:
+        valid_entry = wallet_rate_limit_record()["entries"][0]
+        invalid_records: tuple[Any, ...] = (
+            [],
+            {"version": 1, "entries": [], "wallet": "0xsecret"},
+            {"version": 2, "entries": []},
+            {"version": True, "entries": []},
+            {"version": 1, "entries": "not-a-list"},
+            {"version": 1, "entries": [valid_entry] * 31},
+            {
+                "version": 1,
+                "entries": [{**valid_entry, "reservationId": "b" * 32}],
+            },
+            {
+                "version": 1,
+                "entries": [{**valid_entry, "reservationId": "x402_" + "B" * 32}],
+            },
+            {
+                "version": 1,
+                "entries": [{**valid_entry, "reservedAt": True}],
+            },
+            {
+                "version": 1,
+                "entries": [{**valid_entry, "reservedAt": 0}],
+            },
+            {
+                "version": 1,
+                "entries": [{**valid_entry, "reservedAt": 10_000_000_000_000}],
+            },
+            {
+                "version": 1,
+                "entries": [{**valid_entry, "state": "pending"}],
+            },
+            {
+                "version": 1,
+                "entries": [{**valid_entry, "wallet": "0xsecret"}],
+            },
+            {"version": 1, "entries": [valid_entry, dict(valid_entry)]},
+        )
+        for record in invalid_records:
+            with self.subTest(record=record), self.assertRaises(
+                X402JobStoreError,
+            ):
+                await self.store.create_wallet_rate_limit(
+                    "a" * 64,
+                    record,
+                )
+
+    async def test_wallet_rate_limit_read_rejects_corrupt_or_oversized_objects(
+        self,
+    ) -> None:
+        key = f"x402-jobs/rate-limits/v1/{'a' * 64}.json"
+        for body in (
+            b"not-json",
+            b"[]",
+            b'{"version":1,"entries":[],"unknown":true}',
+            b"x" * (16 * 1024 + 1),
+        ):
+            with self.subTest(body=body[:40]):
+                self.s3.objects[key] = (body, '"etag-corrupt"')
+                with self.assertRaises(X402JobStoreError):
+                    await self.store.read_wallet_rate_limit("a" * 64)
 
 
 class X402JobStoreConfigTests(unittest.TestCase):
