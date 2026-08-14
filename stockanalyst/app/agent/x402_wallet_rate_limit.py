@@ -110,8 +110,8 @@ class WalletRateLimiter:
             or not _RESERVATION_ID_RE.fullmatch(reservation_id)
         ):
             raise ValueError("invalid wallet rate-limit reservation")
-        now = self._now()
         for _attempt in range(self._max_attempts):
+            now = self._now()
             try:
                 stored = await self._store.read_wallet_rate_limit(
                     wallet_digest
@@ -189,8 +189,8 @@ class WalletRateLimiter:
         *,
         commit: bool,
     ) -> None:
-        now = self._now()
         for _attempt in range(self._max_attempts):
+            now = self._now()
             try:
                 stored = await self._store.read_wallet_rate_limit(
                     reservation.wallet_digest

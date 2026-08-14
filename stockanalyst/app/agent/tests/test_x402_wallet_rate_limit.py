@@ -7,6 +7,7 @@ import io
 import json
 import threading
 import unittest
+from collections.abc import Callable
 from typing import Any
 
 from botocore.exceptions import ClientError
@@ -37,6 +38,7 @@ class ThreadSafeConditionalS3:
         self.put_calls: list[dict[str, Any]] = []
         self.put_errors: list[ClientError] = []
         self.get_errors: list[ClientError] = []
+        self.put_error_callback: Callable[[dict[str, Any]], None] | None = None
         self._next_etag = 1
         self._lock = threading.Lock()
 
@@ -44,7 +46,10 @@ class ThreadSafeConditionalS3:
         with self._lock:
             self.put_calls.append(kwargs)
             if self.put_errors:
-                raise self.put_errors.pop(0)
+                error = self.put_errors.pop(0)
+                if self.put_error_callback is not None:
+                    self.put_error_callback(kwargs)
+                raise error
             key = kwargs["Key"]
             existing = self.objects.get(key)
             if kwargs.get("IfNoneMatch") == "*" and existing is not None:
@@ -202,6 +207,54 @@ class WalletRateLimiterTests(unittest.IsolatedAsyncioTestCase):
             [reservation_id(2)],
         )
 
+    async def test_reserve_refreshes_time_after_conflict_crosses_boundary(
+        self,
+    ) -> None:
+        await self.limiter.reserve(WALLET, reservation_id(1))
+        self.clock.now = NOW + WINDOW_MILLISECONDS - 1
+        self.s3.put_errors = [s3_error("409"), s3_error("409")]
+        self.s3.put_error_callback = lambda _put: setattr(
+            self.clock,
+            "now",
+            NOW + WINDOW_MILLISECONDS,
+        )
+
+        current = await self.limiter.reserve(WALLET, reservation_id(2))
+
+        self.assertEqual(current.reserved_at, NOW + WINDOW_MILLISECONDS)
+        self.assertEqual(
+            [entry["reservationId"] for entry in only_record(self.s3)["entries"]],
+            [reservation_id(2)],
+        )
+
+    async def test_retry_after_uses_fresh_time_after_create_conflict(self) -> None:
+        full_record = {
+            "version": 1,
+            "entries": [
+                {
+                    "reservationId": reservation_id(number),
+                    "reservedAt": NOW,
+                    "state": "reserved",
+                }
+                for number in range(1, 31)
+            ],
+        }
+
+        def install_concurrent_record(put: dict[str, Any]) -> None:
+            self.clock.now = NOW + 1_500
+            self.s3.objects[put["Key"]] = (
+                json.dumps(full_record).encode(),
+                '"etag-concurrent"',
+            )
+
+        self.s3.put_errors = [s3_error("PreconditionFailed")]
+        self.s3.put_error_callback = install_concurrent_record
+
+        with self.assertRaises(WalletRateLimitExceeded) as raised:
+            await self.limiter.reserve(WALLET, reservation_id(31))
+
+        self.assertEqual(raised.exception.retry_after_seconds, 3_599)
+
     async def test_same_reservation_is_idempotent_without_another_entry(self) -> None:
         first = await self.limiter.reserve(WALLET, reservation_id(1))
         self.clock.now += 10_000
@@ -234,6 +287,21 @@ class WalletRateLimiterTests(unittest.IsolatedAsyncioTestCase):
             [entry["reservationId"] for entry in entries],
             [second.reservation_id],
         )
+
+    async def test_release_refreshes_time_after_conflict_before_pruning(self) -> None:
+        await self.limiter.reserve(WALLET, reservation_id(1))
+        second = await self.limiter.reserve(WALLET, reservation_id(2))
+        self.clock.now = NOW + WINDOW_MILLISECONDS - 1
+        self.s3.put_errors = [s3_error("409"), s3_error("409")]
+        self.s3.put_error_callback = lambda _put: setattr(
+            self.clock,
+            "now",
+            NOW + WINDOW_MILLISECONDS,
+        )
+
+        await self.limiter.release(second)
+
+        self.assertEqual(only_record(self.s3)["entries"], [])
 
     async def test_two_instances_enforce_one_combined_limit(self) -> None:
         store = make_store(self.s3)
