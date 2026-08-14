@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac
 import re
@@ -196,6 +197,13 @@ class WalletRateLimiter:
                     reservation.wallet_digest
                 )
                 if stored is None:
+                    if commit and self._reservation_is_active(
+                        reservation,
+                        now,
+                    ):
+                        raise WalletRateLimitUnavailable(
+                            "wallet rate limit unavailable"
+                        )
                     return
                 entries = self._active_entries(stored, now)
                 matching_index = next(
@@ -207,21 +215,44 @@ class WalletRateLimiter:
                     ),
                     None,
                 )
-                if matching_index is not None:
+                if matching_index is None:
+                    if commit and self._reservation_is_active(
+                        reservation,
+                        now,
+                    ):
+                        raise WalletRateLimitUnavailable(
+                            "wallet rate limit unavailable"
+                        )
                     if commit:
-                        entries[matching_index] = {
-                            **entries[matching_index],
-                            "state": "committed",
-                        }
-                    else:
-                        entries.pop(matching_index)
+                        return
+                elif commit:
+                    entries[matching_index] = {
+                        **entries[matching_index],
+                        "state": "committed",
+                    }
+                else:
+                    entries.pop(matching_index)
                 if entries == stored.record["entries"]:
                     return
-                await self._store.replace_wallet_rate_limit(
-                    reservation.wallet_digest,
-                    stored,
-                    {"version": 1, "entries": entries},
-                )
+                try:
+                    await self._store.replace_wallet_rate_limit(
+                        reservation.wallet_digest,
+                        stored,
+                        {"version": 1, "entries": entries},
+                    )
+                except JobConflict:
+                    continue
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    if not commit:
+                        raise
+                    confirmation = await self._read_commit_state(
+                        reservation
+                    )
+                    if confirmation in {"committed", "expired"}:
+                        return
+                    continue
                 return
             except JobConflict:
                 continue
@@ -232,3 +263,45 @@ class WalletRateLimiter:
                     "wallet rate limit unavailable"
                 ) from exc
         raise WalletRateLimitUnavailable("wallet rate limit unavailable")
+
+    @staticmethod
+    def _reservation_is_active(
+        reservation: WalletRateReservation,
+        now: int,
+    ) -> bool:
+        return reservation.reserved_at > now - _WINDOW_MILLISECONDS
+
+    async def _read_commit_state(
+        self,
+        reservation: WalletRateReservation,
+    ) -> Literal["reserved", "committed", "expired"]:
+        now = self._now()
+        if not self._reservation_is_active(reservation, now):
+            return "expired"
+        try:
+            stored = await self._store.read_wallet_rate_limit(
+                reservation.wallet_digest
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            raise WalletRateLimitUnavailable(
+                "wallet rate limit unavailable"
+            ) from exc
+        if stored is None:
+            raise WalletRateLimitUnavailable("wallet rate limit unavailable")
+        matching = next(
+            (
+                entry
+                for entry in self._active_entries(stored, now)
+                if entry["reservationId"] == reservation.reservation_id
+                and entry["reservedAt"] == reservation.reserved_at
+            ),
+            None,
+        )
+        if matching is None:
+            raise WalletRateLimitUnavailable("wallet rate limit unavailable")
+        state = matching["state"]
+        if state not in {"reserved", "committed"}:
+            raise WalletRateLimitUnavailable("wallet rate limit unavailable")
+        return state

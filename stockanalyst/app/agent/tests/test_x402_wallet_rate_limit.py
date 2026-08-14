@@ -17,6 +17,7 @@ from x402_wallet_rate_limit import (
     WalletRateLimiter,
     WalletRateLimitExceeded,
     WalletRateLimitUnavailable,
+    WalletRateReservation,
 )
 
 NOW = 1_700_000_000_000
@@ -274,6 +275,65 @@ class WalletRateLimiterTests(unittest.IsolatedAsyncioTestCase):
         entries = only_record(self.s3)["entries"]
         self.assertEqual(entries[0]["state"], "committed")
         self.assertEqual(entries[1]["state"], "reserved")
+
+    async def test_commit_active_reservation_requires_rate_object(self) -> None:
+        reservation = WalletRateReservation(
+            wallet_digest="a" * 64,
+            reservation_id=reservation_id(1),
+            reserved_at=NOW,
+            state="reserved",
+        )
+
+        with self.assertRaises(WalletRateLimitUnavailable):
+            await self.limiter.commit(reservation)
+
+    async def test_commit_active_reservation_requires_exact_entry(self) -> None:
+        existing = await self.limiter.reserve(WALLET, reservation_id(1))
+        missing = WalletRateReservation(
+            wallet_digest=existing.wallet_digest,
+            reservation_id=reservation_id(2),
+            reserved_at=NOW,
+            state="reserved",
+        )
+        mismatched = WalletRateReservation(
+            wallet_digest=existing.wallet_digest,
+            reservation_id=existing.reservation_id,
+            reserved_at=NOW + 1,
+            state="reserved",
+        )
+
+        with self.assertRaises(WalletRateLimitUnavailable):
+            await self.limiter.commit(missing)
+        with self.assertRaises(WalletRateLimitUnavailable):
+            await self.limiter.commit(mismatched)
+
+    async def test_commit_expired_reservation_allows_missing_no_op(self) -> None:
+        reservation = WalletRateReservation(
+            wallet_digest="a" * 64,
+            reservation_id=reservation_id(1),
+            reserved_at=NOW - WINDOW_MILLISECONDS,
+            state="reserved",
+        )
+
+        await self.limiter.commit(reservation)
+
+    async def test_commit_response_loss_confirms_committed_readback(self) -> None:
+        reservation = await self.limiter.reserve(WALLET, reservation_id(1))
+
+        def apply_commit_before_error(put: dict[str, Any]) -> None:
+            body = json.loads(put["Body"])
+            self.assertEqual(body["entries"][0]["state"], "committed")
+            self.s3.objects[put["Key"]] = (
+                put["Body"],
+                '"etag-applied-before-response-loss"',
+            )
+
+        self.s3.put_errors = [s3_error("ServiceUnavailable")]
+        self.s3.put_error_callback = apply_commit_before_error
+
+        await self.limiter.commit(reservation)
+
+        self.assertEqual(only_record(self.s3)["entries"][0]["state"], "committed")
 
     async def test_release_removes_only_matching_entry_and_is_idempotent(self) -> None:
         first = await self.limiter.reserve(WALLET, reservation_id(1))
