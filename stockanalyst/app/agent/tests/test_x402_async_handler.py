@@ -19,9 +19,17 @@ from stockanalyst.app.agent.x402_handler import X402Handler
 from stockanalyst.app.agent.x402_job_service import (
     CreateJobResult,
     JobView,
+    SettlementIndeterminate,
     X402JobError,
 )
-from stockanalyst.app.agent.x402_tokens import TOKENS, U_TOKEN, USD1_TOKEN
+from stockanalyst.app.agent.x402_settlement import SettlementOutcome
+from stockanalyst.app.agent.x402_tokens import (
+    TOKENS,
+    U_TOKEN,
+    USD1_TOKEN,
+    USDC_TOKEN,
+    USDT_TOKEN,
+)
 
 JOB_ID = "x402_" + "a" * 32
 EXPIRES_AT = 1_785_945_600_123
@@ -38,13 +46,34 @@ USD1_SUPPORTED_EXTRA = {
     "assetTransferMethod": "eip3009",
     "signerAddress": "0x2222222222222222222222222222222222222222",
 }
+USDC_SUPPORTED_EXTRA = {
+    "name": USDC_TOKEN.domain_name,
+    "version": USDC_TOKEN.domain_version,
+    "assetTransferMethod": "permit2-exact",
+    "signerAddress": "0x3333333333333333333333333333333333333333",
+    "spenderAddress": "0x4444444444444444444444444444444444444444",
+}
+USDT_SUPPORTED_EXTRA = {
+    "name": USDT_TOKEN.domain_name,
+    "version": USDT_TOKEN.domain_version,
+    "assetTransferMethod": "permit2-exact",
+    "signerAddress": "0x5555555555555555555555555555555555555555",
+    "spenderAddress": "0x6666666666666666666666666666666666666666",
+}
 SUPPORTED_EXTRAS = {
-    U_TOKEN.domain: SUPPORTED_EXTRA,
-    USD1_TOKEN.domain: USD1_SUPPORTED_EXTRA,
+    U_TOKEN.symbol: SUPPORTED_EXTRA,
+    USD1_TOKEN.symbol: USD1_SUPPORTED_EXTRA,
+    USDC_TOKEN.symbol: USDC_SUPPORTED_EXTRA,
+    USDT_TOKEN.symbol: USDT_SUPPORTED_EXTRA,
 }
 SUPPORTED_ASSETS = [
-    {"symbol": "U", "asset": U_TOKEN.address, "decimals": 18},
-    {"symbol": "USD1", "asset": USD1_TOKEN.address, "decimals": 18},
+    {
+        "symbol": token.symbol,
+        "asset": token.address,
+        "decimals": token.decimals,
+        "transferMethod": token.transfer_method,
+    }
+    for token in TOKENS
 ]
 
 
@@ -61,6 +90,23 @@ class Response:
 
 def decode_header(response: Response, name: str) -> dict[str, object]:
     return json.loads(base64.b64decode(response.headers[name], validate=True))
+
+
+def settlement_proof(token=U_TOKEN) -> str:
+    proof = {
+        "x402Version": 2,
+        "accepted": {
+            "scheme": "exact",
+            "network": "eip155:56",
+            "amount": str(PAID_PRICE_WEI),
+            "asset": token.address,
+            "payTo": "0x7777777777777777777777777777777777777777",
+            "maxTimeoutSeconds": 600,
+            "extra": SUPPORTED_EXTRAS[token.symbol],
+        },
+        "payload": {"authorization": {}},
+    }
+    return base64.b64encode(json.dumps(proof).encode()).decode()
 
 
 async def call_handler(
@@ -177,6 +223,90 @@ async def free_report_work(symbol: str):
 
 
 class X402AsyncHandlerTests(unittest.IsolatedAsyncioTestCase):
+    async def test_b402_settlement_adapter_dispatches_requested_mode(self) -> None:
+        client = AsyncMock()
+        verified = SettlementOutcome("settled", transaction="0xverified")
+        resumed = SettlementOutcome("settled", transaction="0xresumed")
+        client.verify_and_settle.return_value = verified
+        client.settle_only.return_value = resumed
+
+        with patch.object(handler_module, "_B402_CLIENT", client):
+            self.assertIs(
+                await handler_module._settle_via_facilitator(
+                    settlement_proof(),
+                    "verify-and-settle",
+                ),
+                verified,
+            )
+            self.assertIs(
+                await handler_module._settle_via_facilitator(
+                    settlement_proof(),
+                    "settle-only",
+                ),
+                resumed,
+            )
+
+        client.verify_and_settle.assert_awaited_once()
+        client.settle_only.assert_awaited_once()
+
+    async def test_b402_pending_settlement_remains_typed_pending(self) -> None:
+        pending = SettlementOutcome("pending", transaction="b402-pending-id")
+        client = AsyncMock()
+        client.verify_and_settle.return_value = pending
+
+        with patch.object(handler_module, "_B402_CLIENT", client):
+            outcome = await handler_module._settle_via_facilitator(
+                settlement_proof(USDT_TOKEN),
+                "verify-and-settle",
+            )
+
+        self.assertIs(outcome, pending)
+        self.assertEqual(outcome.status, "pending")
+
+    async def test_b402_indeterminate_settlement_is_not_treated_as_settled(
+        self,
+    ) -> None:
+        client = AsyncMock()
+        client.verify_and_settle.side_effect = handler_module.B402IndeterminateError(
+            "response lost"
+        )
+
+        with (
+            patch.object(handler_module, "_B402_CLIENT", client),
+            self.assertRaises(SettlementIndeterminate),
+        ):
+            await handler_module._settle_via_facilitator(
+                settlement_proof(),
+                "verify-and-settle",
+            )
+
+    async def test_non_b402_backends_reject_permit2(self) -> None:
+        generic = AsyncMock(
+            side_effect=AssertionError("generic must not receive Permit2")
+        )
+        for facilitator_url, demo_mode in (
+            ("https://facilitator.example.test", False),
+            ("", True),
+        ):
+            with (
+                self.subTest(
+                    facilitator_url=facilitator_url,
+                    demo_mode=demo_mode,
+                ),
+                patch.object(handler_module, "_B402_CLIENT", None),
+                patch.object(handler_module, "FACILITATOR_URL", facilitator_url),
+                patch.object(handler_module, "X402_DEMO_MODE", demo_mode),
+                patch.object(handler_module, "_settle_generic", generic),
+            ):
+                outcome = await handler_module._settle_via_facilitator(
+                    settlement_proof(USDT_TOKEN),
+                    "verify-and-settle",
+                )
+
+            self.assertEqual(outcome.status, "rejected")
+            self.assertIsNone(outcome.transaction)
+        generic.assert_not_awaited()
+
     async def test_price_exposes_dedicated_b402_pay_to(self) -> None:
         pay_to = "0x15958aad30b758dAbfbB9788Da69dfcd56e89078"
         with patch.object(x402_verify, "B402_PAY_TO_ADDRESS", pay_to):
@@ -187,13 +317,25 @@ class X402AsyncHandlerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.json["payTo"], pay_to.lower())
         self.assertEqual(
             [item["asset"] for item in response.json["accepts"]],
-            [U_TOKEN.address, USD1_TOKEN.address],
+            [token.address for token in TOKENS],
         )
         self.assertEqual(
             [item["amount"] for item in response.json["accepts"]],
-            [str(PAID_PRICE_WEI), str(PAID_PRICE_WEI)],
+            [str(PAID_PRICE_WEI)] * len(TOKENS),
+        )
+        self.assertEqual(
+            [
+                item["extra"]["assetTransferMethod"]
+                for item in response.json["accepts"]
+            ],
+            ["eip3009", "eip3009", "permit2-exact", "permit2-exact"],
         )
         self.assertEqual(response.json["asset"], U_TOKEN.address)
+        self.assertEqual(response.json["signingScheme"], "eip3009")
+        self.assertEqual(
+            response.json["signingSchemes"],
+            ["eip3009", "permit2-exact"],
+        )
         self.assertEqual(response.json["price_u"], "0.21")
         self.assertEqual(response.json["price_wei"], str(PAID_PRICE_WEI))
         self.assertEqual(response.json["supportedAssets"], SUPPORTED_ASSETS)
@@ -201,7 +343,7 @@ class X402AsyncHandlerTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("min_price_u", response.json)
         self.assertNotIn("min_price_wei", response.json)
 
-    async def test_paid_requirements_request_registry_domains_from_b402(self) -> None:
+    async def test_paid_requirements_request_registry_tokens_from_b402(self) -> None:
         client = AsyncMock()
         client.payment_extras.return_value = SUPPORTED_EXTRAS
         handler = make_handler(AsyncMock(), b402_client=client)
@@ -210,11 +352,11 @@ class X402AsyncHandlerTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(
             [item["asset"] for item in requirements],
-            [U_TOKEN.address, USD1_TOKEN.address],
+            [token.address for token in TOKENS],
         )
         client.payment_extras.assert_awaited_once_with(
             "eip155:56",
-            tuple(token.domain for token in TOKENS),
+            TOKENS,
         )
 
     async def test_paid_requirements_need_b402_backend(self) -> None:
@@ -344,6 +486,7 @@ class X402AsyncHandlerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(response.json["asset"])
         self.assertIsNone(response.json["payTo"])
         self.assertIsNone(response.json["signingScheme"])
+        self.assertEqual(response.json["signingSchemes"], [])
         self.assertIsNone(response.json["facilitator"])
         client.payment_extras.assert_not_awaited()
 
@@ -475,14 +618,14 @@ class X402AsyncHandlerTests(unittest.IsolatedAsyncioTestCase):
                 item["asset"]
                 for item in response.json["paymentRequired"]["accepts"]
             ],
-            [U_TOKEN.address, USD1_TOKEN.address],
+            [token.address for token in TOKENS],
         )
         self.assertEqual(
             [
                 item["amount"]
                 for item in response.json["paymentRequired"]["accepts"]
             ],
-            [str(PAID_PRICE_WEI), str(PAID_PRICE_WEI)],
+            [str(PAID_PRICE_WEI)] * len(TOKENS),
         )
         service.create_job.assert_not_awaited()
 
@@ -532,7 +675,7 @@ class X402AsyncHandlerTests(unittest.IsolatedAsyncioTestCase):
     async def test_usd1_only_backend_keeps_challenge_and_price_available(self) -> None:
         client = AsyncMock()
         client.payment_extras.return_value = {
-            USD1_TOKEN.domain: USD1_SUPPORTED_EXTRA,
+            USD1_TOKEN.symbol: USD1_SUPPORTED_EXTRA,
         }
         handler = make_handler(AsyncMock(), b402_client=client)
 
@@ -555,6 +698,49 @@ class X402AsyncHandlerTests(unittest.IsolatedAsyncioTestCase):
             [USD1_TOKEN.address],
         )
         self.assertEqual(price.json["asset"], USD1_TOKEN.address)
+
+    async def test_usdt_only_backend_drives_legacy_price_fields(self) -> None:
+        client = AsyncMock()
+        client.payment_extras.return_value = {
+            USDT_TOKEN.symbol: USDT_SUPPORTED_EXTRA,
+        }
+        handler = make_handler(AsyncMock(), b402_client=client)
+
+        price = await call_handler(handler, method="GET", path="/x402/price")
+
+        self.assertEqual(price.status, 200)
+        self.assertEqual(
+            [item["asset"] for item in price.json["accepts"]],
+            [USDT_TOKEN.address],
+        )
+        self.assertEqual(price.json["asset"], USDT_TOKEN.address)
+        self.assertEqual(price.json["price_wei"], str(PAID_PRICE_WEI))
+        self.assertEqual(price.json["network"], "eip155:56")
+        self.assertEqual(price.json["signingScheme"], "permit2-exact")
+        self.assertEqual(price.json["signingSchemes"], ["permit2-exact"])
+
+    async def test_missing_usdc_keeps_other_paid_accepts_in_registry_order(
+        self,
+    ) -> None:
+        client = AsyncMock()
+        client.payment_extras.return_value = {
+            symbol: extra
+            for symbol, extra in SUPPORTED_EXTRAS.items()
+            if symbol != USDC_TOKEN.symbol
+        }
+        handler = make_handler(AsyncMock(), b402_client=client)
+
+        price = await call_handler(handler, method="GET", path="/x402/price")
+
+        self.assertEqual(price.status, 200)
+        self.assertEqual(
+            [item["asset"] for item in price.json["accepts"]],
+            [U_TOKEN.address, USD1_TOKEN.address, USDT_TOKEN.address],
+        )
+        self.assertEqual(
+            price.json["signingSchemes"],
+            ["eip3009", "permit2-exact"],
+        )
 
     async def test_empty_capability_intersection_returns_503(self) -> None:
         client = AsyncMock()

@@ -20,6 +20,7 @@ os.environ.setdefault("X402_SELLER_WALLET", "0xd10BdDC20E4DC42A1a19a9653e994991e
 from stockanalyst.app.agent.x402_envelope import dispatch_x402_envelope
 from stockanalyst.app.agent.x402_handler import X402Handler
 from stockanalyst.app.agent.x402_job_service import CreateJobResult
+from stockanalyst.app.agent.x402_tokens import PaymentToken, TOKENS
 
 
 API_DOMAIN = "a1b2c3d4e5.execute-api.us-east-1.amazonaws.com"
@@ -71,16 +72,27 @@ class FakeOAuth:
 
 class FakeB402Client:
     async def payment_extras(
-        self, network: str, domains: tuple[tuple[str, str], ...]
-    ) -> dict[tuple[str, str], dict[str, str]]:
+        self,
+        network: str,
+        tokens: tuple[PaymentToken, ...],
+    ) -> dict[str, dict[str, str]]:
         return {
-            domain: {
-                "name": domain[0],
-                "version": domain[1],
-                "assetTransferMethod": "eip3009",
+            token.symbol: {
+                "name": token.domain_name,
+                "version": token.domain_version,
+                "assetTransferMethod": token.transfer_method,
                 "signerAddress": "0xd10bddc20e4dc42a1a19a9653e994991e25b8153",
+                **(
+                    {
+                        "spenderAddress": (
+                            "0x4444444444444444444444444444444444444444"
+                        )
+                    }
+                    if token.transfer_method == "permit2-exact"
+                    else {}
+                ),
             }
-            for domain in domains
+            for token in tokens
         }
 
 
@@ -233,6 +245,22 @@ class GatewayIntegrationTests(unittest.TestCase):
         self.assertEqual(
             body["paymentRequired"]["resource"]["url"],
             "https://a1b2c3d4e5.execute-api.us-east-1.amazonaws.com/testnet/x402/analyze/async",
+        )
+        accepts = body["paymentRequired"]["accepts"]
+        self.assertEqual(
+            [accept["asset"] for accept in accepts],
+            [token.address for token in TOKENS],
+        )
+        self.assertEqual(
+            [accept["extra"]["assetTransferMethod"] for accept in accepts],
+            ["eip3009", "eip3009", "permit2-exact", "permit2-exact"],
+        )
+        self.assertTrue(
+            all(
+                accept["extra"].get("spenderAddress")
+                == "0x4444444444444444444444444444444444444444"
+                for accept in accepts[2:]
+            )
         )
         self.assertEqual(self.job_service.create_calls, [])
 

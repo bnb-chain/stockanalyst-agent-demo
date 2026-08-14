@@ -13,11 +13,12 @@ import threading
 import time
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 
 from prompt_builder import _build_stock_analysis_prompt
 from x402_job_store import JobConflict, StoredJob, X402JobStore
 from x402_promo import PromoRateLimiter, PromoRateLimitExceeded
+from x402_settlement import SettlementOutcome
 from x402_tokens import U_TOKEN, token_by_asset
 from x402_verify import CHAIN_ID, VerifiedPayment, validate_payment_proof
 
@@ -34,6 +35,9 @@ _CLAIM_DRIVE_ATTEMPTS = 3
 _DEFAULT_ACCOUNTING_RETRY_ATTEMPTS = 3
 _MAX_ACCOUNTING_BACKOFF_SECONDS = 30.0
 _MAX_PROMOTIONAL_IDENTITY_ATTEMPTS = 3
+_PENDING_PERSIST_ATTEMPTS = 3
+
+SettlementMode = Literal["verify-and-settle", "settle-only"]
 
 
 class X402JobError(RuntimeError):
@@ -130,7 +134,10 @@ class X402JobService:
         *,
         store: X402JobStore,
         token_secret: bytes,
-        settle: Callable[[str], Awaitable[tuple[bool, str]]],
+        settle: Callable[
+            [str, SettlementMode],
+            Awaitable[SettlementOutcome],
+        ],
         authorization_used: Callable[[VerifiedPayment], Awaitable[bool]],
         report: Callable[..., Awaitable[bool]],
         stream_work: Callable[..., Any],
@@ -180,6 +187,13 @@ class X402JobService:
         supplied = hashlib.sha256(token_text.encode()).hexdigest()
         expected = str(record.get("jobTokenHash", ""))
         return hmac.compare_digest(supplied, expected)
+
+    @staticmethod
+    def _proof_digest(proof_header: str) -> str:
+        try:
+            return hashlib.sha256(proof_header.encode("ascii")).hexdigest()
+        except UnicodeEncodeError as exc:
+            raise X402JobError("payment_rejected") from exc
 
     async def _authorized_job(
         self,
@@ -504,6 +518,7 @@ class X402JobService:
             if payment is None:
                 raise X402JobError("payment_rejected")
             expired_recovery = True
+        proof_digest = self._proof_digest(proof_header)
         identity = self.derive_identity(payment)
         stored = await self._store.read(identity.job_id)
         if stored is not None:
@@ -513,6 +528,7 @@ class X402JobService:
                 stored,
                 payment,
                 proof_header,
+                proof_digest,
             )
             stored = await self._retry_accounting(stored, payment)
             return self._create_result_and_spawn(identity, stored)
@@ -530,6 +546,8 @@ class X402JobService:
             "paymentStatus": "settling",
             "paymentMode": "paid",
             "asset": payment.asset.lower(),
+            "paymentProofDigest": proof_digest,
+            "pendingSettlementReference": None,
             "settlementReference": None,
             "reportId": None,
             "address": payment.from_address,
@@ -554,16 +572,14 @@ class X402JobService:
                 stored,
                 payment,
                 proof_header,
+                proof_digest,
             )
         else:
-            ok, settlement_reference = await self._settle_payment(proof_header)
-            if not ok:
-                await self._fail_settlement(stored)
-                raise self._payment_rejected_error(payment)
-            stored = await self._mark_settled(
+            stored = await self._settle_and_transition(
                 stored,
                 payment,
-                settlement_reference,
+                proof_header,
+                "verify-and-settle",
             )
         stored = await self._retry_accounting(stored, payment)
         return self._create_result_and_spawn(identity, stored)
@@ -696,7 +712,25 @@ class X402JobService:
         stored: StoredJob,
         payment: VerifiedPayment,
         proof_header: str,
+        proof_digest: str | None = None,
     ) -> StoredJob:
+        if proof_digest is None:
+            proof_digest = self._proof_digest(proof_header)
+        stored_digest = stored.record.get("paymentProofDigest")
+        if stored_digest is None:
+            if payment.transfer_method != "eip3009":
+                raise X402JobError("payment_rejected")
+        elif type(stored_digest) is not str or stored_digest != proof_digest:
+            raise X402JobError("payment_rejected")
+
+        pending_reference = stored.record.get("pendingSettlementReference")
+        if (
+            payment.transfer_method == "permit2-exact"
+            and pending_reference is not None
+            and not is_valid_settlement_reference(pending_reference)
+        ):
+            raise X402JobError("job_state_unavailable", retryable=True)
+
         if (
             stored.record.get("status") != "settling"
             or stored.record.get("paymentStatus") != "settling"
@@ -720,27 +754,119 @@ class X402JobService:
             identity = self.derive_identity(payment)
             return await self._require_existing_identity(identity)
 
-        if await self._authorization_used(payment):
-            return await self._mark_settled(
-                stored,
-                payment,
-                None,
-                allow_unavailable=True,
-            )
-
-        if now // 1000 >= payment.valid_before:
-            await self._fail_settlement(stored)
+        if payment.transfer_method == "eip3009":
+            if await self._authorization_used(payment):
+                return await self._mark_settled(
+                    stored,
+                    payment,
+                    None,
+                    allow_unavailable=True,
+                )
+            if now // 1000 >= payment.valid_before:
+                await self._fail_settlement(stored)
+                raise X402JobError("payment_rejected")
+            mode: SettlementMode = "verify-and-settle"
+        elif payment.transfer_method == "permit2-exact":
+            mode = "settle-only"
+        else:
             raise X402JobError("payment_rejected")
 
-        ok, settlement_reference = await self._settle_payment(proof_header)
-        if not ok:
+        return await self._settle_and_transition(
+            stored,
+            payment,
+            proof_header,
+            mode,
+        )
+
+    async def _settle_and_transition(
+        self,
+        stored: StoredJob,
+        payment: VerifiedPayment,
+        proof_header: str,
+        mode: SettlementMode,
+    ) -> StoredJob:
+        outcome = await self._settle_payment(proof_header, mode)
+        if outcome.status == "pending":
+            await self._mark_settlement_pending(stored, outcome.transaction)
+            raise SettlementIndeterminate()
+        if outcome.status == "rejected":
             await self._fail_settlement(stored)
             raise self._payment_rejected_error(payment)
         return await self._mark_settled(
             stored,
             payment,
-            settlement_reference,
+            outcome.transaction,
         )
+
+    async def _mark_settlement_pending(
+        self,
+        stored: StoredJob,
+        settlement_reference: str | None,
+    ) -> StoredJob:
+        if not is_valid_settlement_reference(settlement_reference):
+            raise SettlementIndeterminate()
+        job_id = stored.record.get("jobId")
+        payment_key = stored.record.get("paymentKey")
+        proof_digest = stored.record.get("paymentProofDigest")
+        if type(job_id) is not str or type(payment_key) is not str:
+            raise X402JobError("job_state_unavailable", retryable=True)
+
+        candidate = stored
+        for attempt in range(_PENDING_PERSIST_ATTEMPTS):
+            pending = {
+                **candidate.record,
+                "paymentStatus": "settling",
+                "pendingSettlementReference": settlement_reference,
+                "settlementReference": None,
+                "status": "settling",
+                "updatedAt": int(self._clock()),
+            }
+            try:
+                return await self._store.replace(candidate, pending)
+            except asyncio.CancelledError:
+                raise
+            except JobConflict:
+                pass
+            except Exception:  # noqa: S110
+                # Retry below from the canonical stored state without logging
+                # potentially sensitive persistence details.
+                pass
+
+            try:
+                latest = await self._store.read(job_id)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                if attempt + 1 == _PENDING_PERSIST_ATTEMPTS:
+                    raise SettlementIndeterminate() from None
+                continue
+
+            if latest is None:
+                raise X402JobError("job_state_unavailable", retryable=True)
+            record = latest.record
+            if (
+                record.get("jobId") != job_id
+                or record.get("paymentKey") != payment_key
+                or record.get("paymentProofDigest") != proof_digest
+                or record.get("status") != "settling"
+                or record.get("paymentStatus") != "settling"
+                or record.get("settlementReference") is not None
+            ):
+                raise X402JobError("job_state_unavailable", retryable=True)
+
+            latest_reference = record.get("pendingSettlementReference")
+            if latest_reference is not None:
+                if not is_valid_settlement_reference(latest_reference):
+                    raise X402JobError(
+                        "job_state_unavailable",
+                        retryable=True,
+                    )
+                if latest_reference == settlement_reference:
+                    return latest
+                raise X402JobError("job_state_unavailable", retryable=True)
+            candidate = latest
+
+        raise SettlementIndeterminate()
 
     async def _mark_settled(
         self,
@@ -765,6 +891,7 @@ class X402JobService:
         settled = {
             **stored.record,
             "paymentStatus": "settled",
+            "pendingSettlementReference": None,
             "settlementReference": settlement_reference,
             "status": "queued",
             "competitionEventId": self._competition_event_id(payment),
@@ -781,6 +908,7 @@ class X402JobService:
         failed = {
             **stored.record,
             "paymentStatus": "failed",
+            "pendingSettlementReference": None,
             "status": "failed",
             "leaseOwner": None,
             "leaseExpiresAt": None,
@@ -793,24 +921,26 @@ class X402JobService:
     async def _settle_payment(
         self,
         proof_header: str,
-    ) -> tuple[bool, str]:
+        mode: SettlementMode,
+    ) -> SettlementOutcome:
         try:
             result = await asyncio.wait_for(
-                self._settle(proof_header),
+                self._settle(proof_header, mode),
                 timeout=60,
             )
         except asyncio.CancelledError:
             raise
         except Exception as exc:
             raise SettlementIndeterminate() from exc
-        if (
-            not isinstance(result, tuple)
-            or len(result) != 2
-            or type(result[0]) is not bool
-            or type(result[1]) is not str
+        if not isinstance(result, SettlementOutcome):
+            raise SettlementIndeterminate()
+        if result.status not in {"settled", "pending", "rejected"}:
+            raise SettlementIndeterminate()
+        if result.status in {"settled", "pending"} and not (
+            is_valid_settlement_reference(result.transaction)
         ):
             raise SettlementIndeterminate()
-        if result[0] and not is_valid_settlement_reference(result[1]):
+        if result.status == "rejected" and result.transaction is not None:
             raise SettlementIndeterminate()
         return result
 

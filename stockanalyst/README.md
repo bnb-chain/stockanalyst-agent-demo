@@ -9,6 +9,52 @@
 
 ---
 
+## BSC Mainnet x402 payment contract
+
+The public paid asynchronous API charges exactly 0.21 of the selected
+18-decimal token:
+
+| Token | BSC address | Method | Price |
+| --- | --- | --- | --- |
+| U | `0xcE24439F2D9C6a2289F741120FE202248B666666` | `eip3009` | 0.21 U |
+| USD1 | `0x8d0D000Ee44948FC98c9B98A4FA4921476f08B0d` | `eip3009` | 0.21 USD1 |
+| USDC | `0x8AC76a51cc950d9822D68b83fE1Ad97B32Cd580d` | `permit2-exact` | 0.21 USDC |
+| USDT | `0x55d398326f99059fF775485246999027B3197955` | `permit2-exact` | 0.21 USDT |
+
+B402 capabilities may be partial, so a paid challenge contains only the live
+supported subset. `extra.signerAddress` is facilitator EOA metadata; it is not
+the Permit2 spender and is not part of `permit2-exact` typed data.
+`extra.spenderAddress` is the live B402 proxy and the `permit2-exact`
+typed-data spender; the ERC-20 approval target remains canonical Permit2
+`0x000000000022D473030F116dDEE9F6B43aC78BA3`.
+
+The explicit buyer commands are `npm run x402:allowance`,
+`npm run x402:approve`, and `npm run x402:revoke`, with `-- USDC` or
+`-- USDT`. Both approve and revoke require confirmation; `--yes` is an explicit
+noninteractive bypass. Approval sets an exact 50-token cap and revoke sets
+zero. A 50-token allowance covers 238 complete 0.21 payments and leaves 0.02
+token.
+`BSC_RPC_URL` is used only for USDC/USDT allowance reads, approval/revoke, and
+paid preflight; U/USD1 and local signing do not use it.
+`npm run x402:async` never approves or revokes; it checks the existing
+allowance before starting a new Permit2 payment.
+
+In promotional mode, `paymentRequired=false` and the active `accepts=[]`;
+`supportedAssets` may still list all four tokens as registry metadata and is
+not an active payment requirement. There is no USDC/USDT promotional proof,
+B402 verify/settle, or automatic approval. On a genuinely new CLI run with
+`X402_PAYMENT_TOKEN=USDC` or `USDT`, the zero-POST safety policy may perform a
+read-only Permit2 preflight before discovering the proofless promotional
+response; it still performs no approval. Only a freshly created Permit2
+reservation in the same request uses verify-and-settle. Every pre-existing
+stale Permit2 reservation is recovered settle-only with the identical
+persisted proof, regardless of `pendingSettlementReference` or deadline;
+recovery does not call `/verify`. Recovery creates no new signature, nonce, or
+approval. The complete buyer
+and HTTP runbook is in [`docs/x402-api-usage.md`](../docs/x402-api-usage.md).
+
+---
+
 ## Why a Blockchain-Settled Stock Analyst?
 
 Traditional financial research has a structural problem: the analyst gets paid regardless of whether the work is useful. This agent flips that model — payment is locked in a smart contract and only released after the agent submits a verifiable deliverable on-chain. The buyer can dispute within 24 hours. The incentive for quality is built into the settlement mechanism.
@@ -229,7 +275,7 @@ rather than the raw AgentCore invocation URL:
 ```dotenv
 X402_ENDPOINT=https://stock-agent.bnbchain.org
 X402_SELLER_WALLET=0xd10BdDC20E4DC42A1a19a9653e994991e25b8153
-X402_PAYMENT_TOKEN=U  # strict U (default) or USD1
+X402_PAYMENT_TOKEN=U  # strict U (default), USD1, USDC, or USDT
 ```
 
 Append `/x402/price`, `/x402/analyze/async`, or private job paths to that base;
@@ -243,22 +289,24 @@ not expose the AgentCore invocation URL. See
 [`docs/x402-lambda-gateway.md`](../docs/x402-lambda-gateway.md) for operation
 and rollback procedures.
 
-The fixed BSC Mainnet (chain ID 56) EIP-3009 registry is:
+The fixed BSC Mainnet (chain ID 56) paid registry is:
 
-| Symbol | Domain name | Version | Decimals | Exact paid amount | Contract |
-|--------|-------------|---------|----------|-------------------|----------|
-| U | United Stables | 1 | 18 | `210000000000000000` (`0.21 × 10^18`) | `0xcE24439F2D9C6a2289F741120FE202248B666666` |
-| USD1 | World Liberty Financial USD | 1 | 18 | `210000000000000000` (`0.21 × 10^18`) | `0x8d0D000Ee44948FC98c9B98A4FA4921476f08B0d` |
+| Symbol | Method | Domain name/version | Decimals | Exact paid amount | Contract |
+|--------|--------|---------------------|----------|-------------------|----------|
+| U | `eip3009` | United Stables / 1 | 18 | `210000000000000000` (`0.21 × 10^18`) | `0xcE24439F2D9C6a2289F741120FE202248B666666` |
+| USD1 | `eip3009` | World Liberty Financial USD / 1 | 18 | `210000000000000000` (`0.21 × 10^18`) | `0x8d0D000Ee44948FC98c9B98A4FA4921476f08B0d` |
+| USDC | `permit2-exact` | USD Coin / 2 | 18 | `210000000000000000` (`0.21 × 10^18`) | `0x8AC76a51cc950d9822D68b83fE1Ad97B32Cd580d` |
+| USDT | `permit2-exact` | Tether USD / 1 | 18 | `210000000000000000` (`0.21 × 10^18`) | `0x55d398326f99059fF775485246999027B3197955` |
 
 `X402_TOKEN_ADDRESS`, `U_TOKEN_DOMAIN_NAME`, and
 `U_TOKEN_DOMAIN_VERSION` are legacy compatibility settings; they cannot add,
-replace, or override this registry. USDC and USDT are deferred because their
-supported flow requires Permit2.
+replace, or override this registry.
 
-`GET /x402/price` always exposes the ordered U/USD1 registry in
-`supportedAssets`. This field is capability metadata only. In promotional
-mode, `paymentRequired` remains `false` and `accepts` remains empty, so clients
-must not interpret `supportedAssets` as a payment request or try to sign it.
+`GET /x402/price` exposes the ordered four-token registry in `supportedAssets`.
+This field is capability metadata only. Paid `accepts` entries are the partial
+live B402-supported subset. In promotional mode, `paymentRequired` remains
+`false` and `accepts` remains empty for every token, so clients must not
+interpret `supportedAssets` as a payment request or try to sign it.
 
 Promotional mode uses the same async route but sits outside the payment
 protocol. When `X402_PROMO_FREE_MODE=1`, callers POST directly without a wallet
@@ -277,8 +325,9 @@ limiter is process-local, so restarts clear counters and multiple replicas do
 not share state. Only API Gateway `requestContext` is trusted for the source
 IP; forwarding headers supplied by callers are ignored. This is an explicitly
 limited promotional control, not a durable distributed quota. Setting
-`X402_PROMO_FREE_MODE=0` restores the paid U/USD1 HTTP 402 flow. That paid flow costs
-0.21 U or 0.21 USD1.
+`X402_PROMO_FREE_MODE=0` restores the four-token paid HTTP 402 flow. Its
+EIP-3009 options cost 0.21 U or 0.21 USD1, and its Permit2 options cost 0.21
+USDC or 0.21 USDT when the live B402 capability is available.
 
 The paid V2 exchange is `402 PAYMENT-REQUIRED: base64(PaymentRequired)`, then
 a retry with `PAYMENT-SIGNATURE: base64(PaymentPayload)`, followed by
@@ -853,17 +902,22 @@ bag deploy agent --force-deploy-broken-storage
 ### 主网 x402 促销模式
 
 公网 API Gateway 只发布 price、async create、私有 job status 和 resume 四个
-路由；`/x402/free` 仍已退役。买家可以用 `X402_PAYMENT_TOKEN=U`（默认）
-或 `X402_PAYMENT_TOKEN=USD1` 严格选择 token。U 的主网合约为
+路由；`/x402/free` 仍已退役。买家可以用 `X402_PAYMENT_TOKEN=U`（默认）、
+`X402_PAYMENT_TOKEN=USD1`、`X402_PAYMENT_TOKEN=USDC` 或
+`X402_PAYMENT_TOKEN=USDT` 严格选择 token。U 的主网合约为
 `0xcE24439F2D9C6a2289F741120FE202248B666666`，EIP-712 domain 名为
 `United Stables`；USD1 为 `0x8d0D000Ee44948FC98c9B98A4FA4921476f08B0d`，
 domain 名为 `World Liberty Financial USD`。两者 version 均为 `1`、均为 18 位
-小数，付费数量必须精确为 `210000000000000000` (`0.21 × 10^18`)。USDC/USDT
-因需要 Permit2 而暂缓。旧的 `X402_TOKEN_ADDRESS` 和 U domain 环境变量只用于
-兼容，不能覆盖固定 registry。
+小数，付费数量必须精确为 `210000000000000000` (`0.21 × 10^18`)。USDC 为
+`0x8AC76a51cc950d9822D68b83fE1Ad97B32Cd580d`，USDT 为
+`0x55d398326f99059fF775485246999027B3197955`；两者使用
+`permit2-exact`。`spenderAddress` 来自实时 B402 能力，而 ERC-20 allowance
+始终授权 canonical Permit2 `0x000000000022D473030F116dDEE9F6B43aC78BA3`。
+旧的 `X402_TOKEN_ADDRESS` 和 U domain 环境变量只用于兼容，不能覆盖固定 registry。
 
-`GET /x402/price` 始终通过 `supportedAssets` 按 U、USD1 顺序公布能力元数据。
-该字段只表示服务支持哪些资产，不是付款要求。促销模式下
+`GET /x402/price` 始终通过 `supportedAssets` 按 U、USD1、USDC、USDT 顺序公布
+能力元数据。该字段只表示服务支持哪些资产，不是付款要求；实时 B402
+`accepts` 可以只包含其中一部分。促销模式不发布任何 active accepts，
 `paymentRequired=false` 且 `accepts=[]` 保持不变，客户端不得把
 `supportedAssets` 当作支付结构或尝试签名。
 
@@ -879,8 +933,9 @@ bag env set X402_PROMO_FREE_MODE 0
 每次成功 POST 都创建新任务并消耗一次额度，相同请求的重试也不去重。限额是
 单 IP 滚动 24 小时内 30 次，且只保存在当前进程：重启会清空，多副本不共享。
 可信 IP 只来自 API Gateway `requestContext`，不接受请求头伪造的来源地址。
-设回 `X402_PROMO_FREE_MODE=0` 后恢复 U/USD1 的 HTTP 402 付费流程；恢复后的价格为
-0.21 U 或 0.21 USD1。
+促销模式对所有 token 都不发布付款要求或证明；`supportedAssets` 仍列出四 token，
+但只作为 registry 能力元数据。设回 `X402_PROMO_FREE_MODE=0` 后恢复四 token 的
+HTTP 402 付费流程；每次价格严格为所选 token 的 0.21。
 
 ### 为异步 x402 任务配置私有存储
 

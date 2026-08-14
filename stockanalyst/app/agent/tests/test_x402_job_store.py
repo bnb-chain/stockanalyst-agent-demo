@@ -90,6 +90,40 @@ class X402JobStoreTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(JobConflict):
             await self.store.replace(stored, {**changed, "status": "failed"})
 
+    async def test_settlement_recovery_fields_share_the_conditional_job_record(
+        self,
+    ) -> None:
+        record = {
+            **job_record(),
+            "status": "settling",
+            "paymentStatus": "settling",
+            "paymentProofDigest": "ab" * 32,
+            "pendingSettlementReference": None,
+            "settlementReference": None,
+        }
+        stored = await self.store.create(record)
+        assert stored is not None
+        pending = {
+            **stored.record,
+            "pendingSettlementReference": "0xpending",
+        }
+
+        updated = await self.store.replace(stored, pending)
+        reread = await self.store.read(str(record["jobId"]))
+
+        assert reread is not None
+        self.assertEqual(reread.record, updated.record)
+        self.assertEqual(
+            reread.record["pendingSettlementReference"],
+            "0xpending",
+        )
+        self.assertEqual(
+            self.s3.put_calls[-1]["Key"],
+            self.s3.put_calls[-2]["Key"],
+        )
+        self.assertEqual(self.s3.put_calls[-1]["IfMatch"], stored.etag)
+        self.assertNotIn("IfNoneMatch", self.s3.put_calls[-1])
+
     async def test_report_is_private_and_presigned_for_thirty_minutes(self) -> None:
         await self.store.put_report("x402_" + "a" * 32, "# report")
         url = await self.store.presign_report("x402_" + "a" * 32)

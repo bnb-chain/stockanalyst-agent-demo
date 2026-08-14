@@ -35,7 +35,29 @@ USD1_TOKEN = PaymentToken(
     domain_name="World Liberty Financial USD",
     domain_version="1",
 )
-TOKENS: tuple[PaymentToken, ...] = (U_TOKEN, USD1_TOKEN)
+USDC_TOKEN = PaymentToken(
+    symbol="USDC",
+    address="0x8AC76a51cc950d9822D68b83fE1Ad97B32Cd580d",
+    decimals=18,
+    domain_name="USD Coin",
+    domain_version="1",
+    transfer_method="permit2-exact",
+)
+USDT_TOKEN = PaymentToken(
+    symbol="USDT",
+    address="0x55d398326f99059fF775485246999027B3197955",
+    decimals=18,
+    domain_name="Tether USD",
+    domain_version="1",
+    transfer_method="permit2-exact",
+)
+TOKENS: tuple[PaymentToken, ...] = (
+    U_TOKEN,
+    USD1_TOKEN,
+    USDC_TOKEN,
+    USDT_TOKEN,
+)
+PROMOTIONAL_TOKENS: tuple[PaymentToken, ...] = (U_TOKEN, USD1_TOKEN)
 _BY_ASSET = {token.address.lower(): token for token in TOKENS}
 
 
@@ -46,6 +68,7 @@ def supported_assets() -> list[dict[str, str | int]]:
             "symbol": token.symbol,
             "asset": token.address,
             "decimals": token.decimals,
+            "transferMethod": token.transfer_method,
         }
         for token in TOKENS
     ]

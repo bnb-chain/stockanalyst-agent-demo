@@ -7,6 +7,7 @@ import type {
 import {
   BSC_MAINNET_CHAIN_ID,
   PAID_AMOUNT,
+  PAYMENT_TIMEOUT_SECONDS,
   PAYMENT_TOKENS,
   type PaymentTokenSymbol,
 } from "./x402-payment.js";
@@ -87,6 +88,21 @@ export class AsyncJobClientError extends Error {
     this.code = code;
     this.httpStatus = options.httpStatus;
     this.retryable = options.retryable ?? false;
+  }
+}
+
+export class PaymentTokenUnavailableError extends AsyncJobClientError {
+  readonly availableTokens: readonly PaymentTokenSymbol[];
+
+  constructor(availableTokens: Iterable<PaymentTokenSymbol>) {
+    const supplied = new Set(availableTokens);
+    const registryOrdered = (
+      Object.keys(PAYMENT_TOKENS) as PaymentTokenSymbol[]
+    ).filter((symbol) => supplied.has(symbol));
+    super("payment_token_unavailable");
+    this.name = "PaymentTokenUnavailableError";
+    this.availableTokens = Object.freeze(registryOrdered);
+    this.message += `; available tokens: ${registryOrdered.join(", ")}`;
   }
 }
 
@@ -371,22 +387,27 @@ function parsePaymentChallenge(
     const amount = acceptedValue["amount"];
     const promotional = amount === "0";
     const signerAddress = extraValue["signerAddress"];
+    const spenderAddress = extraValue["spenderAddress"];
     const hasSignerAddress = Object.prototype.hasOwnProperty.call(
       extraValue,
       "signerAddress",
     );
+    const hasSpenderAddress = Object.prototype.hasOwnProperty.call(
+      extraValue,
+      "spenderAddress",
+    );
+    const transferMethod = token.transferMethod;
     if (
       acceptedValue["scheme"] !== "exact"
       || acceptedValue["network"] !== BSC_MAINNET_NETWORK
       || (!promotional && amount !== PAID_AMOUNT)
+      || (promotional && transferMethod !== "eip3009")
       || typeof payTo !== "string"
       || payTo.toLowerCase() !== seller
-      || !Number.isSafeInteger(timeout)
-      || (timeout as number) <= 0
-      || (timeout as number) > 3_600
+      || timeout !== PAYMENT_TIMEOUT_SECONDS
       || extraValue["name"] !== token.name
       || extraValue["version"] !== token.version
-      || extraValue["assetTransferMethod"] !== "eip3009"
+      || extraValue["assetTransferMethod"] !== transferMethod
       || (
         promotional
           ? hasSignerAddress
@@ -396,6 +417,14 @@ function parsePaymentChallenge(
             || !EVM_ADDRESS_PATTERN.test(signerAddress)
           )
       )
+      || (
+        transferMethod === "permit2-exact"
+        && (
+          !hasSpenderAddress
+          || typeof spenderAddress !== "string"
+          || !EVM_ADDRESS_PATTERN.test(spenderAddress)
+        )
+      )
     ) {
       invalidPaymentChallenge();
     }
@@ -403,9 +432,12 @@ function parsePaymentChallenge(
       ...extraValue,
       name: token.name,
       version: token.version,
-      assetTransferMethod: "eip3009",
+      assetTransferMethod: transferMethod,
     };
     if (!promotional) extra.signerAddress = signerAddress as string;
+    if (transferMethod === "permit2-exact") {
+      extra.spenderAddress = spenderAddress as string;
+    }
     acceptedBySymbol.set(symbol, {
       promotional,
       accepted: {
@@ -420,7 +452,9 @@ function parsePaymentChallenge(
     });
   }
   const selected = acceptedBySymbol.get(preferredToken);
-  if (selected === undefined) invalidPaymentChallenge();
+  if (selected === undefined) {
+    throw new PaymentTokenUnavailableError(acceptedBySymbol.keys());
+  }
   const resource: B402PaymentResource = {
     url: resourceUrl,
     description,
@@ -822,7 +856,10 @@ export async function fetchPaymentChallenge(
   } catch (error) {
     if (
       error instanceof AsyncJobClientError
-      && error.code === "invalid_payment_challenge"
+      && (
+        error.code === "invalid_payment_challenge"
+        || error.code === "payment_token_unavailable"
+      )
     ) {
       throw error;
     }
@@ -879,7 +916,10 @@ export async function beginAsyncAnalysis(
   } catch (error) {
     if (
       error instanceof AsyncJobClientError
-      && error.code === "invalid_payment_challenge"
+      && (
+        error.code === "invalid_payment_challenge"
+        || error.code === "payment_token_unavailable"
+      )
     ) {
       throw error;
     }

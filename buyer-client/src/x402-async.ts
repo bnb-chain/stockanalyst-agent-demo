@@ -30,7 +30,7 @@ import {
 } from "node:crypto";
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { Wallet } from "ethers";
+import { Contract, JsonRpcProvider, Wallet } from "ethers";
 import { saveReport } from "./pdf-report.js";
 import { GuardUserMemory, buildTaskFromMemory } from "./uomp.js";
 import {
@@ -40,6 +40,7 @@ import {
   downloadAsyncReport,
   pollAsyncAnalysis,
   AsyncJobClientError,
+  PaymentTokenUnavailableError,
   type AsyncAnalysisRequest,
   type AsyncJobReceipt,
   type AsyncJobStatus,
@@ -56,10 +57,14 @@ import {
   type PaidPaymentChallenge,
   type PaymentTokenSymbol,
 } from "./x402-payment.js";
+import {
+  assertPermit2PaymentReady,
+  readPermit2Allowance,
+  type Permit2AllowanceContext,
+  type Permit2TokenSymbol,
+} from "./x402-permit2.js";
 
 const MODULE_DIRECTORY = dirname(fileURLToPath(import.meta.url));
-const KEYSTORE_PATH = process.env["KEYSTORE_PATH"] ?? "";
-const WALLET_PASSWORD = process.env["WALLET_PASSWORD"] ?? "";
 const AGENT_ENDPOINT = process.env["X402_ENDPOINT"] ?? "http://localhost:9000";
 const RECEIPT_PATH = resolve(
   MODULE_DIRECTORY,
@@ -85,13 +90,87 @@ const PENDING_RECOVERY_MILLISECONDS = 7 * 24 * 60 * 60 * 1_000;
 const MAX_CREATE_ATTEMPTS = 3;
 const CREATE_RETRY_MILLISECONDS = 1_000;
 const MAX_CREATE_RETRY_MILLISECONDS = 8_000;
+const ERC20_ALLOWANCE_ABI = [
+  "function allowance(address owner, address spender) view returns (uint256)",
+] as const;
+const SAFE_ASYNC_JOB_CLIENT_ERROR_CODES = new Set([
+  "analysis_empty_response",
+  "analysis_failed",
+  "analysis_timeout",
+  "async_jobs_paused",
+  "attempts_exhausted",
+  "download_network_error",
+  "invalid_endpoint",
+  "invalid_payment_challenge",
+  "invalid_payment_response",
+  "invalid_receipt",
+  "invalid_request",
+  "invalid_response",
+  "invalid_timeout",
+  "job_conflict",
+  "job_expired",
+  "job_not_found",
+  "job_service_unavailable",
+  "job_state_unavailable",
+  "network_error",
+  "payment_backend_unavailable",
+  "payment_failed",
+  "payment_rejected",
+  "payment_unavailable",
+  "pending_binding_invalid",
+  "pending_cleanup_failed",
+  "pending_create_expired",
+  "pending_create_mismatch",
+  "pending_job_mismatch",
+  "poll_timeout",
+  "promo_rate_limited",
+  "report_not_ready",
+  "report_too_large",
+  "request_too_large",
+  "settlement_pending",
+]);
+const SAFE_ASYNC_CLI_ERROR_MESSAGES = new Set([
+  "X402_SELLER_WALLET is required",
+  "X402_SELLER_WALLET must be a valid EVM address",
+  "X402_PAYMENT_TOKEN must be U, USD1, USDC, or USDT",
+  "WALLET_PASSWORD is required to create a paid job",
+  "KEYSTORE_PATH is required to create a paid job",
+  "Permit2 preflight failed; verify BSC_RPC_URL, BSC mainnet chain ID 56, and the USDC allowance",
+  "Permit2 preflight failed; verify BSC_RPC_URL, BSC mainnet chain ID 56, and the USDT allowance",
+  "Permit2 allowance is below 0.21; run npm run x402:approve -- USDC",
+  "Permit2 allowance is below 0.21; run npm run x402:approve -- USDT",
+  "Permit2 allowance exceeds 50; reset it to 50 or revoke it",
+  "Pending x402 access metadata is invalid",
+  "Payment access metadata is invalid",
+  "Pending x402 binding is invalid",
+  "Stored x402 receipt is invalid",
+  "Private x402 state is too large",
+  "Pending x402 payment proof is invalid",
+  "Pending x402 request is invalid",
+  "Pending x402 payment proof is expired",
+  "Payment challenge token does not match X402_PAYMENT_TOKEN",
+  "Stored pending x402 request is invalid",
+  "Invalid pending-create retry configuration",
+  "another x402 asynchronous client is active; if it crashed, verify no client is running before removing the lock file",
+  "X402_POLL_TIMEOUT_MS must be a positive integer",
+]);
+const SAFE_ASYNC_RECOVERY_MESSAGES = new Set([
+  "The private job receipt was retained for a safe retry.",
+  "The pending payment request was retained; rerun to recover without paying again.",
+  "No durable x402 retry state was created.",
+]);
 
 export function resolveX402PaymentToken(
   env: Readonly<Record<string, string | undefined>> = process.env,
 ): PaymentTokenSymbol {
   const value = env["X402_PAYMENT_TOKEN"] ?? "U";
-  if (value !== "U" && value !== "USD1") {
-    throw new Error("X402_PAYMENT_TOKEN must be U or USD1");
+  if (
+    value !== "U"
+    && value !== "USD1"
+    && value !== "USDC"
+    && value !== "USDT"
+  ) {
+    throw new Error("X402_PAYMENT_TOKEN must be U, USD1, USDC, or USDT");
   }
   return value;
 }
@@ -118,7 +197,12 @@ function parseX402PaymentAccess(value: unknown): X402PaymentAccess {
   const promotional = value["promotional"];
   const payTo = value["payTo"];
   if (
-    (token !== "U" && token !== "USD1")
+    (
+      token !== "U"
+      && token !== "USD1"
+      && token !== "USDC"
+      && token !== "USDT"
+    )
     || typeof promotional !== "boolean"
     || typeof payTo !== "string"
     || !/^0x[0-9a-f]{40}$/.test(payTo)
@@ -158,18 +242,25 @@ function paymentAccessFromAccepted(
   const token = PAYMENT_TOKENS[symbol];
   const promotional = amount === "0";
   const signerAddress = extra["signerAddress"];
+  const spenderAddress = extra["spenderAddress"];
   const signerPresent = Object.prototype.hasOwnProperty.call(
     extra,
     "signerAddress",
   );
+  const spenderPresent = Object.prototype.hasOwnProperty.call(
+    extra,
+    "spenderAddress",
+  );
+  const transferMethod = token.transferMethod;
   if (
     (expectedPromotional !== undefined && expectedPromotional !== promotional)
     || (!promotional && amount !== PAID_AMOUNT)
+    || (promotional && transferMethod !== "eip3009")
     || typeof payTo !== "string"
     || !/^0x[0-9a-fA-F]{40}$/.test(payTo)
     || extra["name"] !== token.name
     || extra["version"] !== token.version
-    || extra["assetTransferMethod"] !== "eip3009"
+    || extra["assetTransferMethod"] !== transferMethod
     || (
       promotional
         ? signerPresent
@@ -178,6 +269,14 @@ function paymentAccessFromAccepted(
           || typeof signerAddress !== "string"
           || !/^0x[0-9a-fA-F]{40}$/.test(signerAddress)
         )
+    )
+    || (
+      transferMethod === "permit2-exact"
+      && (
+        !spenderPresent
+        || typeof spenderAddress !== "string"
+        || !/^0x[0-9a-fA-F]{40}$/.test(spenderAddress)
+      )
     )
   ) {
     throw new Error("Payment access metadata is invalid");
@@ -219,6 +318,107 @@ export interface PendingCreateOptions extends CreateRequestOptions {
   now?: () => number;
   expectedJobId?: string;
 }
+
+export interface PaidPendingCreateDependencies {
+  createPermit2AllowanceReader(
+    rpcUrl: string,
+    walletAddress: string,
+    token: Permit2TokenSymbol,
+  ): () => Promise<bigint>;
+  buildPaymentProof(
+    wallet: Wallet,
+    challenge: PaidPaymentChallenge,
+  ): Promise<string>;
+}
+
+export interface AsyncStartupContext {
+  symbols: string[];
+  portfolio?: unknown[];
+  riskProfile?: unknown;
+}
+
+export interface AsyncStartupDependencies extends PaidPendingCreateDependencies {
+  fetch: FetchImpl;
+  loadContext(): Promise<AsyncStartupContext>;
+  loadWallet(
+    env: Readonly<Record<string, string | undefined>>,
+  ): Promise<Wallet>;
+  log(message: string): void;
+}
+
+export interface AsyncStartupOptions {
+  endpoint: string;
+  receiptPath: string;
+  pendingPath: string;
+  env?: Readonly<Record<string, string | undefined>>;
+  dependencies?: Partial<AsyncStartupDependencies>;
+}
+
+export interface AsyncStartupResult {
+  receipt: AsyncJobReceipt;
+  symbols: string[];
+}
+
+export interface AsyncCliProcess {
+  writeError(message: string): void;
+  setExitCode(code: number): void;
+}
+
+function createDefaultPermit2AllowanceReader(
+  rpcUrl: string,
+  walletAddress: string,
+  token: Permit2TokenSymbol,
+): () => Promise<bigint> {
+  const provider = new JsonRpcProvider(rpcUrl);
+  const contract = new Contract(
+    PAYMENT_TOKENS[token].asset,
+    ERC20_ALLOWANCE_ABI,
+    provider,
+  );
+  const allowanceContract = {
+    allowance: (owner: string, spender: string) => (
+      contract.getFunction("allowance").staticCall(owner, spender)
+    ),
+  } as Permit2AllowanceContext["contract"];
+  return () => readPermit2Allowance({
+    token,
+    walletAddress,
+    rpcUrl,
+    provider,
+    contract: allowanceContract,
+  });
+}
+
+const DEFAULT_PAID_PENDING_CREATE_DEPENDENCIES: PaidPendingCreateDependencies = {
+  createPermit2AllowanceReader: createDefaultPermit2AllowanceReader,
+  buildPaymentProof,
+};
+
+async function loadDefaultPaymentWallet(
+  env: Readonly<Record<string, string | undefined>>,
+): Promise<Wallet> {
+  const password = env["WALLET_PASSWORD"] ?? "";
+  if (!password) {
+    throw new Error("WALLET_PASSWORD is required to create a paid job");
+  }
+  const configuredPath = env["KEYSTORE_PATH"] ?? "";
+  if (!configuredPath) {
+    throw new Error("KEYSTORE_PATH is required to create a paid job");
+  }
+  const keystorePath = resolve(MODULE_DIRECTORY, "..", configuredPath);
+  return await Wallet.fromEncryptedJson(
+    readFileSync(keystorePath, "utf8"),
+    password,
+  ) as Wallet;
+}
+
+const DEFAULT_ASYNC_STARTUP_DEPENDENCIES: AsyncStartupDependencies = {
+  ...DEFAULT_PAID_PENDING_CREATE_DEPENDENCIES,
+  fetch: globalThis.fetch,
+  loadContext: () => buildTaskFromMemory(new GuardUserMemory()),
+  loadWallet: loadDefaultPaymentWallet,
+  log: console.log,
+};
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -487,9 +687,17 @@ function paymentProofExpiresAt(paymentProof: string): number {
     if (!isRecord(proof)) throw new Error("invalid proof");
     const payload = proof["payload"];
     if (!isRecord(payload)) throw new Error("invalid proof");
-    const authorization = payload["authorization"];
+    const accepted = proof["accepted"];
+    const acceptedExtra = isRecord(accepted) ? accepted["extra"] : undefined;
+    const permit2 = isRecord(acceptedExtra)
+      && acceptedExtra["assetTransferMethod"] === "permit2-exact";
+    const authorization = permit2
+      ? payload["permit2Authorization"]
+      : payload["authorization"];
     if (!isRecord(authorization)) throw new Error("invalid proof");
-    const validBefore = authorization["validBefore"];
+    const validBefore = permit2
+      ? authorization["deadline"]
+      : authorization["validBefore"];
     if (
       typeof validBefore !== "string"
       || !/^[1-9]\d{0,10}$/.test(validBefore)
@@ -531,6 +739,70 @@ export function createPendingRecord(
     proofExpiresAt,
     recoveryExpiresAt: now + PENDING_RECOVERY_MILLISECONDS,
   };
+}
+
+export async function preparePaidPendingCreate(
+  wallet: Wallet,
+  challenge: PaidPaymentChallenge,
+  paymentToken: PaymentTokenSymbol,
+  request: AsyncAnalysisRequest,
+  env: Readonly<Record<string, string | undefined>> = process.env,
+  dependencies: PaidPendingCreateDependencies = (
+    DEFAULT_PAID_PENDING_CREATE_DEPENDENCIES
+  ),
+): Promise<PendingCreateRecord> {
+  const access = paymentAccessFromChallenge(challenge);
+  if (access.token !== paymentToken) {
+    throw new Error("Payment challenge token does not match X402_PAYMENT_TOKEN");
+  }
+  await preflightPermit2Payment(wallet, paymentToken, env, dependencies);
+  return buildPaidPendingCreate(
+    wallet,
+    challenge,
+    paymentToken,
+    request,
+    dependencies,
+  );
+}
+
+async function preflightPermit2Payment(
+  wallet: Wallet,
+  paymentToken: PaymentTokenSymbol,
+  env: Readonly<Record<string, string | undefined>>,
+  dependencies: PaidPendingCreateDependencies,
+): Promise<void> {
+  if (paymentToken !== "USDC" && paymentToken !== "USDT") return;
+  let allowance: bigint;
+  try {
+    const readAllowance = dependencies.createPermit2AllowanceReader(
+      env["BSC_RPC_URL"] ?? "",
+      wallet.address,
+      paymentToken,
+    );
+    allowance = await readAllowance();
+    if (typeof allowance !== "bigint") throw new Error("invalid allowance");
+  } catch {
+    throw new Error(
+      "Permit2 preflight failed; verify BSC_RPC_URL, BSC mainnet chain ID 56, "
+        + `and the ${paymentToken} allowance`,
+    );
+  }
+  assertPermit2PaymentReady(allowance, paymentToken);
+}
+
+async function buildPaidPendingCreate(
+  wallet: Wallet,
+  challenge: PaidPaymentChallenge,
+  paymentToken: PaymentTokenSymbol,
+  request: AsyncAnalysisRequest,
+  dependencies: PaidPendingCreateDependencies,
+): Promise<PendingCreateRecord> {
+  const access = paymentAccessFromChallenge(challenge);
+  if (access.token !== paymentToken) {
+    throw new Error("Payment challenge token does not match X402_PAYMENT_TOKEN");
+  }
+  const proof = await dependencies.buildPaymentProof(wallet, challenge);
+  return createPendingRecord(proof, request);
 }
 
 function parsePendingCreate(value: unknown): PendingCreateRecord {
@@ -1007,6 +1279,120 @@ function pollingTimeout(): number {
   return value;
 }
 
+export async function runAsyncStartup(
+  options: AsyncStartupOptions,
+): Promise<AsyncStartupResult> {
+  const env = options.env ?? process.env;
+  const dependencies: AsyncStartupDependencies = {
+    ...DEFAULT_ASYNC_STARTUP_DEPENDENCIES,
+    ...options.dependencies,
+  };
+  let receipt: AsyncJobReceipt | undefined;
+  let symbols: string[];
+
+  if (existsSync(options.receiptPath)) {
+    receipt = loadAsyncJobReceipt(options.receiptPath);
+    if (existsSync(options.pendingPath)) {
+      const pending = loadPendingCreate(options.pendingPath);
+      if (pending.jobId !== receipt.jobId) {
+        throw new AsyncJobClientError("pending_job_mismatch");
+      }
+      if (!pendingBindingIsValid(
+        pending,
+        receipt.jobId,
+        receipt.jobToken,
+      )) {
+        throw new AsyncJobClientError("pending_binding_invalid");
+      }
+      symbols = [...pending.request.symbols];
+    } else {
+      dependencies.log("Loading UOMP portfolio context for report metadata...");
+      const context = await dependencies.loadContext();
+      symbols = context.symbols;
+    }
+    dependencies.log(`Continuing asynchronous job ${receipt.jobId}`);
+    return { receipt, symbols };
+  }
+
+  let pending: PendingCreateRecord | undefined;
+  if (existsSync(options.pendingPath)) {
+    pending = loadPendingCreate(options.pendingPath);
+    symbols = [...pending.request.symbols];
+    dependencies.log("Continuing the previously signed pending payment request...");
+  } else {
+    const sellerWallet = resolveX402SellerWallet(env);
+    const paymentToken = resolveX402PaymentToken(env);
+    dependencies.log("Loading UOMP portfolio context...");
+    const context = await dependencies.loadContext();
+    symbols = context.symbols;
+    dependencies.log(`  Symbols: ${symbols.join(", ")}`);
+    const request: AsyncAnalysisRequest = {
+      symbols,
+      analysis_type: "comprehensive",
+      portfolio: context.portfolio,
+      risk_profile: context.riskProfile,
+    };
+    let wallet: Wallet | undefined;
+    if (paymentToken === "USDC" || paymentToken === "USDT") {
+      wallet = await dependencies.loadWallet(env);
+      dependencies.log("Checking Permit2 allowance before requesting analysis access...");
+      await preflightPermit2Payment(
+        wallet,
+        paymentToken,
+        env,
+        dependencies,
+      );
+    }
+
+    dependencies.log("Requesting asynchronous analysis access...");
+    const initial = await beginAsyncAnalysis(
+      options.endpoint,
+      request,
+      sellerWallet,
+      dependencies.fetch,
+      paymentToken,
+    );
+    if (initial.kind === "created") {
+      receipt = initial.receipt;
+      persistAsyncJobReceipt(options.receiptPath, receipt);
+      dependencies.log(`Created asynchronous job ${receipt.jobId}`);
+      dependencies.log("Promotional access: free (no wallet or payment)");
+    } else {
+      wallet ??= await dependencies.loadWallet(env);
+      dependencies.log(
+        initial.challenge.accepted.extra.assetTransferMethod === "permit2-exact"
+          ? "Signing one exact Permit2 payment authorization..."
+          : "Signing one x402 EIP-3009 payment authorization...",
+      );
+      pending = await buildPaidPendingCreate(
+        wallet,
+        initial.challenge,
+        paymentToken,
+        request,
+        dependencies,
+      );
+      // The proof must be durable before any POST that carries it.
+      persistPendingCreate(options.pendingPath, pending);
+    }
+  }
+
+  if (pending !== undefined) {
+    receipt = await createReceiptFromPending(
+      options.endpoint,
+      pending,
+      options.pendingPath,
+      options.receiptPath,
+      dependencies.fetch,
+    );
+    dependencies.log(`Created asynchronous job ${receipt.jobId}`);
+    dependencies.log(pendingAccessSummary(pending));
+  }
+  if (receipt === undefined) {
+    throw new AsyncJobClientError("invalid_response");
+  }
+  return { receipt, symbols };
+}
+
 async function main(): Promise<void> {
   const releaseLock = acquireExclusiveCliLock(CLI_LOCK_PATH);
   const removeSignalHandlers = installGracefulLockCleanup(releaseLock);
@@ -1015,99 +1401,11 @@ async function main(): Promise<void> {
       basename(RECEIPT_PATH),
       basename(PENDING_CREATE_PATH),
     ]);
-    const sellerWallet = resolveX402SellerWallet();
-    const paymentToken = resolveX402PaymentToken();
-    let receipt: AsyncJobReceipt | undefined;
-    let symbols: string[];
-
-    if (existsSync(RECEIPT_PATH)) {
-      receipt = loadAsyncJobReceipt(RECEIPT_PATH);
-      if (existsSync(PENDING_CREATE_PATH)) {
-        const pending = loadPendingCreate(PENDING_CREATE_PATH);
-        if (pending.jobId !== receipt.jobId) {
-          throw new AsyncJobClientError("pending_job_mismatch");
-        }
-        if (!pendingBindingIsValid(
-          pending,
-          receipt.jobId,
-          receipt.jobToken,
-        )) {
-          throw new AsyncJobClientError("pending_binding_invalid");
-        }
-        symbols = [...pending.request.symbols];
-      } else {
-        console.log("Loading UOMP portfolio context for report metadata...");
-        const context = await buildTaskFromMemory(new GuardUserMemory());
-        symbols = context.symbols;
-      }
-      console.log(`Continuing asynchronous job ${receipt.jobId}`);
-    } else {
-      let pending: PendingCreateRecord | undefined;
-      if (existsSync(PENDING_CREATE_PATH)) {
-        pending = loadPendingCreate(PENDING_CREATE_PATH);
-        symbols = [...pending.request.symbols];
-        console.log("Continuing the previously signed pending payment request...");
-      } else {
-        console.log("Loading UOMP portfolio context...");
-        const context = await buildTaskFromMemory(new GuardUserMemory());
-        symbols = context.symbols;
-        console.log(`  Symbols: ${symbols.join(", ")}`);
-        const request: AsyncAnalysisRequest = {
-          symbols,
-          analysis_type: "comprehensive",
-          portfolio: context.portfolio,
-          risk_profile: context.riskProfile,
-        };
-        console.log("Requesting asynchronous analysis access...");
-        const initial = await beginAsyncAnalysis(
-          AGENT_ENDPOINT,
-          request,
-          sellerWallet,
-          globalThis.fetch,
-          paymentToken,
-        );
-        if (initial.kind === "created") {
-          receipt = initial.receipt;
-          persistAsyncJobReceipt(RECEIPT_PATH, receipt);
-          console.log(`Created asynchronous job ${receipt.jobId}`);
-          console.log("Promotional access: free (no wallet or payment)");
-        } else {
-          if (!WALLET_PASSWORD) {
-            throw new Error("WALLET_PASSWORD is required to create a paid job");
-          }
-          if (!KEYSTORE_PATH) {
-            throw new Error("KEYSTORE_PATH is required to create a paid job");
-          }
-          const keystorePath = resolve(MODULE_DIRECTORY, "..", KEYSTORE_PATH);
-          const wallet = await Wallet.fromEncryptedJson(
-            readFileSync(keystorePath, "utf8"),
-            WALLET_PASSWORD,
-          ) as Wallet;
-          console.log("Signing one x402 EIP-3009 payment authorization...");
-          const proof = await buildPaymentProof(wallet, initial.challenge);
-          pending = createPendingRecord(
-            proof,
-            request,
-          );
-          // This durable record must exist before the first payment POST.
-          persistPendingCreate(PENDING_CREATE_PATH, pending);
-        }
-      }
-      if (pending !== undefined) {
-        receipt = await createReceiptFromPending(
-          AGENT_ENDPOINT,
-          pending,
-          PENDING_CREATE_PATH,
-          RECEIPT_PATH,
-        );
-        console.log(`Created asynchronous job ${receipt.jobId}`);
-        console.log(pendingAccessSummary(pending));
-      }
-    }
-
-    if (receipt === undefined) {
-      throw new AsyncJobClientError("invalid_response");
-    }
+    const { receipt, symbols } = await runAsyncStartup({
+      endpoint: AGENT_ENDPOINT,
+      receiptPath: RECEIPT_PATH,
+      pendingPath: PENDING_CREATE_PATH,
+    });
 
     console.log("Waiting for the private report; interrupted runs can be restarted safely...");
     const completed = await pollAsyncAnalysisWithPendingRecovery(
@@ -1138,14 +1436,78 @@ async function main(): Promise<void> {
   }
 }
 
+const DEFAULT_ASYNC_CLI_PROCESS: AsyncCliProcess = {
+  writeError: (message) => console.error(message),
+  setExitCode: (code) => {
+    process.exitCode = code;
+  },
+};
+
+function formatAsyncCliError(error: unknown): string {
+  try {
+    if (error instanceof PaymentTokenUnavailableError) {
+      const supplied = new Set(error.availableTokens);
+      const available = (
+        Object.keys(PAYMENT_TOKENS) as PaymentTokenSymbol[]
+      ).filter((symbol) => supplied.has(symbol));
+      if (available.length > 0) {
+        return "x402 asynchronous job failed: payment_token_unavailable; "
+          + `available tokens: ${available.join(", ")}`;
+      }
+      return "unexpected client failure";
+    }
+    if (error instanceof AsyncJobClientError) {
+      const code = error.code;
+      if (
+        SAFE_ASYNC_JOB_CLIENT_ERROR_CODES.has(code)
+        || /^(?:download_)?http_[1-5][0-9]{2}$/.test(code)
+      ) {
+        return `x402 asynchronous job failed: ${code}`;
+      }
+      return "unexpected client failure";
+    }
+    if (error instanceof Error) {
+      const message = error.message;
+      if (SAFE_ASYNC_CLI_ERROR_MESSAGES.has(message)) return message;
+    }
+  } catch {
+    // A hostile error getter must not alter or inject output.
+  }
+  return "unexpected client failure";
+}
+
+function formatAsyncRecoveryMessage(
+  recoveryMessage: () => string,
+): string {
+  try {
+    const message = recoveryMessage();
+    if (SAFE_ASYNC_RECOVERY_MESSAGES.has(message)) return message;
+  } catch {
+    // Recovery classification is advisory; keep output fixed on failure.
+  }
+  return "Private x402 retry state could not be safely classified.";
+}
+
+export async function runAsyncCliMain(
+  operation: () => Promise<void> = main,
+  cliProcess: AsyncCliProcess = DEFAULT_ASYNC_CLI_PROCESS,
+  recoveryMessage: () => string = () => pendingCreateFailureMessage(
+    RECEIPT_PATH,
+    PENDING_CREATE_PATH,
+  ),
+): Promise<void> {
+  try {
+    await operation();
+  } catch (error: unknown) {
+    cliProcess.writeError(
+      `x402 asynchronous flow failed: ${formatAsyncCliError(error)}`,
+    );
+    cliProcess.writeError(formatAsyncRecoveryMessage(recoveryMessage));
+    cliProcess.setExitCode(1);
+  }
+}
+
 const invokedPath = process.argv[1] ? resolve(process.argv[1]) : "";
 if (invokedPath === fileURLToPath(import.meta.url)) {
-  main().catch((error: unknown) => {
-    const message = error instanceof Error ? error.message : "unknown error";
-    console.error(`x402 asynchronous flow failed: ${message}`);
-    console.error(
-      pendingCreateFailureMessage(RECEIPT_PATH, PENDING_CREATE_PATH),
-    );
-    process.exitCode = 1;
-  });
+  void runAsyncCliMain();
 }

@@ -1,11 +1,10 @@
-"""Fixed-code x402 v2 EIP-3009 proof verification.
+"""Fixed-code x402 v2 EIP-3009 and Permit2 proof verification.
 
-Paid proofs select U or USD1 from the immutable token registry using the
-accepted asset address. The selected token supplies the 18-decimal units,
-EIP-712 domain name/version, and verifying contract; the seller price is
-fixed separately. Promotional
-proofs use the same token-aware signature verification with an exact zero
-amount and no B402 ``signerAddress`` metadata.
+Paid proofs select U, USD1, USDC, or USDT from the immutable token registry
+using the accepted asset address. The selected token supplies the transfer
+method and 18-decimal units; the seller price is fixed separately.
+Promotional proofs remain limited to the EIP-3009 tokens and use an exact zero
+amount with no B402 ``signerAddress`` metadata.
 
 This module is never LLM-callable. It verifies signatures locally; on-chain
 settlement remains the responsibility of the B402 facilitator integration in
@@ -57,6 +56,7 @@ MAX_PAYMENT_PROOF_NESTING = 64
 _PAYMENT_SIGNATURE_REJECTION = (
     "Payment-Signature is not valid base64 JSON"
 )
+_X402_VERSION_REJECTION = "unsupported x402Version (expected 2)"
 _FREE_VALUE_REJECTION = (
     "free tier requires value=0; "
     "use /x402/analyze/async for paid analysis"
@@ -199,6 +199,7 @@ class VerifiedPayment:
     asset: str = U_TOKEN.address.lower()
     token_symbol: str = U_TOKEN.symbol
     promotional: bool = False
+    transfer_method: str = U_TOKEN.transfer_method
 
 # Compatibility aliases for the legacy free-tier verifier.
 _TOKEN_DOMAIN_NAME = U_TOKEN.domain_name
@@ -357,10 +358,7 @@ def validate_payment_proof(
         return None, _PAYMENT_SIGNATURE_REJECTION
 
     if proof.get("x402Version") != 2:
-        return None, (
-            f"unsupported x402Version: {proof.get('x402Version')!r} "
-            "(expected 2)"
-        )
+        return None, _X402_VERSION_REJECTION
 
     resource = proof.get("resource")
     if (
@@ -379,6 +377,20 @@ def validate_payment_proof(
             "payment requirement mismatch"
             if expected_requirement is not None
             else "payment requirement is missing or invalid"
+        )
+    if token.transfer_method == "permit2-exact":
+        if promotional:
+            return None, "payment requirement is missing or invalid"
+        try:
+            from .x402_permit2 import verify_permit2_exact
+        except ImportError:  # Direct imports from stockanalyst/app/agent.
+            from x402_permit2 import verify_permit2_exact
+        return verify_permit2_exact(
+            proof,
+            token=token,
+            expected_requirement=expected_requirement,
+            now=int(time.time()) if now is None else int(now),
+            allow_expired=allow_expired,
         )
     extra = accepted.get("extra")
     if (
@@ -500,6 +512,7 @@ def validate_payment_proof(
             nonce_bytes=nonce_bytes,
             asset=token.address.lower(),
             token_symbol=token.symbol,
+            transfer_method=token.transfer_method,
             promotional=promotional,
         ),
         "",
@@ -571,7 +584,7 @@ def verify_free_payment_proof(proof_header: str) -> tuple[bool, str, str]:
         return False, _PAYMENT_SIGNATURE_REJECTION, ""
 
     if proof.get("x402Version") != 2:
-        return False, f"unsupported x402Version: {proof.get('x402Version')!r} (expected 2)", ""
+        return False, _X402_VERSION_REJECTION, ""
     if proof.get("scheme", "exact") != "exact":
         return False, f"unsupported scheme: {proof.get('scheme')!r}", ""
     network = proof.get("network", f"eip155:{CHAIN_ID}")
