@@ -783,6 +783,32 @@ class X402JobIdentityTests(unittest.IsolatedAsyncioTestCase):
 
 
 class X402PromotionalJobCreationTests(unittest.IsolatedAsyncioTestCase):
+    def test_promotional_event_id_is_compact_deterministic_and_scoped(
+        self,
+    ) -> None:
+        service = make_service(promo_free=True)
+        authorization = promo_authorization()
+        material = f"{ADDRESS.lower()}:{NONCE.lower()}".encode("ascii")
+        expected = (
+            f"promo:{CHAIN_ID}:"
+            f"{hashlib.sha256(material).hexdigest()}"
+        )
+
+        self.assertEqual(service._promotional_event_id(authorization), expected)
+        self.assertLessEqual(len(expected), 128)
+        self.assertNotEqual(
+            service._promotional_event_id(
+                replace(authorization, nonce="0x" + "33" * 32)
+            ),
+            expected,
+        )
+        self.assertNotEqual(
+            service._promotional_event_id(
+                replace(authorization, address="0x" + "44" * 20)
+            ),
+            expected,
+        )
+
     async def test_wallet_bound_promo_reports_without_payment_side_effects(
         self,
     ) -> None:
@@ -807,16 +833,18 @@ class X402PromotionalJobCreationTests(unittest.IsolatedAsyncioTestCase):
         await wait_for_accounting(service)
 
         record = store.jobs[result.job_id].record
-        self.assertEqual(record["address"], ADDRESS)
-        self.assertEqual(
-            record["competitionEventId"],
-            f"promo:{CHAIN_ID}:{ADDRESS}:{NONCE}",
+        event_material = f"{ADDRESS.lower()}:{NONCE.lower()}".encode("ascii")
+        expected_event = (
+            f"promo:{CHAIN_ID}:"
+            f"{hashlib.sha256(event_material).hexdigest()}"
         )
+        self.assertEqual(record["address"], ADDRESS)
+        self.assertEqual(record["competitionEventId"], expected_event)
         self.assertEqual(record["requestDigest"], "1" * 64)
         self.assertNotIn("walletSignature", record)
         self.assertNotIn("sourceIp", record)
         report.assert_awaited_once_with(
-            event_id=f"promo:{CHAIN_ID}:{ADDRESS}:{NONCE}",
+            event_id=expected_event,
             address=ADDRESS,
             called_at=ANY,
         )
@@ -826,7 +854,7 @@ class X402PromotionalJobCreationTests(unittest.IsolatedAsyncioTestCase):
             store.accounting_markers[result.job_id],
             {
                 "version": 1,
-                "eventId": f"promo:{CHAIN_ID}:{ADDRESS}:{NONCE}",
+                "eventId": expected_event,
                 "settledAt": NOW,
             },
         )

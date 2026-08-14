@@ -465,10 +465,11 @@ class X402JobService:
     def _promotional_event_id(
         authorization: PromoWalletAuthorization,
     ) -> str:
-        return (
-            f"promo:{CHAIN_ID}:{authorization.address}:"
-            f"{authorization.nonce}"
-        )
+        material = (
+            f"{authorization.address}:{authorization.nonce}"
+        ).encode("ascii")
+        digest = hashlib.sha256(material).hexdigest()
+        return f"promo:{CHAIN_ID}:{digest}"
 
     def _normalize_request(self, request: dict[str, Any]) -> dict[str, Any]:
         raw_symbols = request.get("symbols")
