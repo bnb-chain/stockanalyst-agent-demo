@@ -42,7 +42,7 @@ class PaymentTokenRegistryTests(unittest.TestCase):
             USD1_TOKEN.domain,
             ("World Liberty Financial USD", "1"),
         )
-        self.assertEqual(USDC_TOKEN.domain, ("USD Coin", "2"))
+        self.assertEqual(USDC_TOKEN.domain, ("USD Coin", "1"))
         self.assertEqual(USDT_TOKEN.domain, ("Tether USD", "1"))
 
     def test_asset_lookup_is_case_insensitive_and_closed(self) -> None:

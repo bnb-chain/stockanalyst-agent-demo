@@ -40,7 +40,7 @@ USDC_TOKEN = PaymentToken(
     address="0x8AC76a51cc950d9822D68b83fE1Ad97B32Cd580d",
     decimals=18,
     domain_name="USD Coin",
-    domain_version="2",
+    domain_version="1",
     transfer_method="permit2-exact",
 )
 USDT_TOKEN = PaymentToken(
