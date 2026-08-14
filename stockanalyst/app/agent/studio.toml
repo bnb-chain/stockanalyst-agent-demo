@@ -62,7 +62,6 @@ runtime_arn = "arn:aws:bedrock-agentcore:us-east-1:201243086760:runtime/stockana
 # runtime-secret-name: X402_JOB_S3_BUCKET
 # runtime-secret-name: X402_JOB_S3_PREFIX
 # runtime-secret-name: X402_JOB_TOKEN_SECRET
-# runtime-secret-name: X402_PROMO_FREE_MODE
 # runtime-secret-name: X402_TOKEN_ADDRESS
 # END RUNTIME SECRET NAME CONTRACT
 
@@ -138,8 +137,8 @@ allowed_hosts = ["llm.pieverse.io"]
 # U/USD1 or Permit2 exact for USDC/USDT and poll with a private job token.
 # Payment verification is FIXED CODE in x402_verify.py — never LLM-callable.
 enabled = true
-price_wei = "210000000000000000"       # exact 0.21 selected token (18 decimals)
-min_price_wei = "210000000000000000"   # 0.21-token floor
+price_wei = "100000000000000000"       # exact 0.1 selected token (18 decimals)
+min_price_wei = "100000000000000000"   # 0.1-token floor
 endpoint = "/x402/analyze/async"
 # Price info:  GET /x402/price
 # Create:      POST /x402/analyze/async  (Payment-Signature: <base64 proof>) → 202
@@ -178,32 +177,24 @@ public = true
 #
 # ── Fixed x402 token registry (BSC mainnet, chain ID 56) ─────────────────
 # U:    0xcE24439F2D9C6a2289F741120FE202248B666666
-#       domain "United Stables", version "1", 18 decimals, exact amount 0.21 U
+#       domain "United Stables", version "1", 18 decimals, exact amount 0.1 U
 # USD1: 0x8d0D000Ee44948FC98c9B98A4FA4921476f08B0d
 #       domain "World Liberty Financial USD", version "1", 18 decimals,
-#       exact amount 0.21 USD1
+#       exact amount 0.1 USD1
 # USDC: 0x8AC76a51cc950d9822D68b83fE1Ad97B32Cd580d
 #       domain "USD Coin", version "2", 18 decimals, permit2-exact,
-#       exact amount 0.21 USDC
+#       exact amount 0.1 USDC
 # USDT: 0x55d398326f99059fF775485246999027B3197955
 #       domain "Tether USD", version "1", 18 decimals, permit2-exact,
-#       exact amount 0.21 USDT
+#       exact amount 0.1 USDT
 # Paid requirements use a valid signerAddress and B402 settlement. The signer
 # is facilitator EOA metadata, while the live spenderAddress is the B402 proxy
 # and Permit2 typed-data spender. ERC-20 approval still targets canonical
 # Permit2 0x000000000022D473030F116dDEE9F6B43aC78BA3.
-# Promotional access is proofless: paymentRequired=false, accepts=[],
-# and no payment proof is required; it never invokes B402 verify/settle or
-# automatic approval. supportedAssets may still list all four registry entries.
-#
-# ── Promotional asynchronous access (manual production control) ───────────
-# Disabled by default. Enable or disable explicitly, then redeploy:
-#   bag env set X402_PROMO_FREE_MODE 1
-#   bag env set X402_PROMO_FREE_MODE 0
-# Promotional access is IP-only at 30 accepted creates per rolling 24 hours.
-# The limiter is process-local: a restart clears it and multiple replicas do
-# not share it. The trusted IP comes from API Gateway requestContext, never
-# from a caller-controlled header. The public /x402/free route remains retired.
+# Every asynchronous create requires a valid payment proof. Wallet admission
+# allows 30 accepted new jobs per rolling hour before B402 verification or
+# settlement; an exact retry reuses its accepted reservation and does not use
+# another slot.
 #
 # ── Legacy U token compatibility settings ─────────────────────────────────
 #   bag env set U_TOKEN_DOMAIN_NAME    United Stables
