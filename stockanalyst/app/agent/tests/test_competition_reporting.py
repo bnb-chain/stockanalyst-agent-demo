@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import importlib
 import json
+import os
 import unittest
+from unittest.mock import AsyncMock, patch
 
 import httpx
+from stockanalyst.app.agent import competition_reporting as reporting_module
 from stockanalyst.app.agent.competition_reporting import (
     CompetitionReporter,
     CompetitionReportingError,
@@ -92,6 +96,41 @@ class CompetitionReporterTests(unittest.IsolatedAsyncioTestCase):
                 "address": "0x1111111111111111111111111111111111111111",
                 "calledAt": 1_785_340_800_123,
             },
+        )
+
+    async def test_runtime_secret_configuration_loaded_after_import_is_used(
+        self,
+    ) -> None:
+        with patch.dict(os.environ, {}, clear=True):
+            module = importlib.reload(reporting_module)
+
+        report = AsyncMock(return_value=True)
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    "COMPETITION_AI_CALLS_URL": (
+                        "https://competition.example.test"
+                        "/internal/competition/ai-calls"
+                    ),
+                    "COMPETITION_INTERNAL_TOKEN": "secret",
+                },
+                clear=True,
+            ),
+            patch.object(module.CompetitionReporter, "report", report),
+        ):
+            reported = await module.report_competition_call(
+                event_id="event-after-secret-load",
+                address="0x2222222222222222222222222222222222222222",
+                called_at=1_785_340_800_123,
+            )
+
+        importlib.reload(module)
+        self.assertIs(reported, True)
+        report.assert_awaited_once_with(
+            event_id="event-after-secret-load",
+            address="0x2222222222222222222222222222222222222222",
+            called_at=1_785_340_800_123,
         )
 
     async def test_retries_a_server_failure_with_the_same_event(self) -> None:

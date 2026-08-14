@@ -143,12 +143,6 @@ def load_competition_reporting_config(
     )
 
 
-_DEFAULT_CONFIG = load_competition_reporting_config(os.environ)
-_DEFAULT_REPORTER = (
-    CompetitionReporter(_DEFAULT_CONFIG) if _DEFAULT_CONFIG is not None else None
-)
-
-
 async def report_competition_call(
     *,
     event_id: str,
@@ -156,9 +150,10 @@ async def report_competition_call(
     called_at: int | None = None,
 ) -> bool:
     """Report through environment configuration, disabled when both vars are absent."""
-    if _DEFAULT_REPORTER is None:
+    config = load_competition_reporting_config(os.environ)
+    if config is None:
         return False
-    return await _DEFAULT_REPORTER.report(
+    return await CompetitionReporter(config).report(
         event_id=event_id,
         address=address,
         called_at=called_at if called_at is not None else int(time.time() * 1000),
