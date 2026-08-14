@@ -951,6 +951,58 @@ test("pending-only startup ignores current payment env and resubmits the identic
   }
 });
 
+test("runAsyncStartup recovers a legacy 0.21 paid pending record with a safe summary", async () => {
+  const runStartup = runAsyncStartup();
+  const directory = mkdtempSync(join(tmpdir(), "x402-startup-legacy-paid-recovery-"));
+  const pendingPath = join(directory, "pending.json");
+  const receiptPath = join(directory, "receipt.json");
+  const request = { symbols: ["AAPL"], analysis_type: "comprehensive" };
+  const legacyProof = eip3009Proof(paymentChallenge({
+    token: "U",
+    accepted: { amount: "210000000000000000" },
+  }));
+  const pending = createPendingRecord(legacyProof, request);
+  writeFileSync(pendingPath, JSON.stringify({ ...pending, promotional: false }));
+  const logs: string[] = [];
+  let submittedProof = "";
+  try {
+    const result = await runStartup({
+      endpoint: ENDPOINT,
+      receiptPath,
+      pendingPath,
+      env: { X402_PAYMENT_TOKEN: "invalid-after-signing" },
+      dependencies: {
+        loadContext: async () => {
+          throw new Error("legacy recovery must not load context");
+        },
+        loadWallet: async () => {
+          throw new Error("legacy recovery must not decrypt");
+        },
+        createPermit2AllowanceReader: () => {
+          throw new Error("legacy recovery must not preflight");
+        },
+        buildPaymentProof: async () => {
+          throw new Error("legacy recovery must not sign");
+        },
+        fetch: async (_input, init) => {
+          submittedProof = new Headers(init?.headers).get("PAYMENT-SIGNATURE") ?? "";
+          return json(receipt(), { status: 202 });
+        },
+        log: (message) => logs.push(message),
+      },
+    });
+    assert.equal(result.receipt.jobId, JOB_ID);
+    assert.equal(submittedProof, legacyProof);
+    assert.ok(logs.includes("Payment: legacy paid request (submitted)"));
+    assert.doesNotMatch(
+      logs.join("\n"),
+      /210000000000000000|private-eip3009-signature|nonce|d10bddc/i,
+    );
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 test("receipt and pending recovery ignores current payment env and reuses proof during settling", async () => {
   const runStartup = runAsyncStartup();
   const directory = mkdtempSync(join(tmpdir(), "x402-startup-receipt-recovery-"));
