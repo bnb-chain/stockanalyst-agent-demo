@@ -381,6 +381,31 @@ class MainnetInfrastructureContractTests(unittest.TestCase):
                 for anchor in anchors:
                     self.assertIn(anchor, documentation)
 
+    def test_task_authored_curl_examples_use_portable_line_continuations(self) -> None:
+        buyer_readme = BUYER_README.read_text(encoding="utf-8")
+        curl_examples = tuple(
+            block
+            for block in re.findall(r"(?s)```bash\n(.*?)\n```", buyer_readme)
+            if re.search(r"(?m)^curl ", block)
+        )
+
+        self.assertTrue(curl_examples)
+        for example in curl_examples:
+            self.assertNotRegex(example, r"(?m)^.*\\\\$")
+
+    def test_agent_runtime_guide_preserves_operational_reference_material(self) -> None:
+        documentation = AGENT_README.read_text(encoding="utf-8")
+
+        for anchor in (
+            "## Key files",
+            "| `main.py` | Entrypoint:",
+            "| `x402_handler.py` | x402 routes:",
+            "## Run locally",
+            "python main.py",
+            "Deployed platform uses `X402_PORT=9001`",
+        ):
+            self.assertIn(anchor, documentation)
+
     def test_public_docs_describe_the_paid_wallet_limited_four_token_contract(self) -> None:
         for path in PUBLIC_FOUR_TOKEN_DOCUMENTS:
             with self.subTest(path=path.relative_to(ROOT)):

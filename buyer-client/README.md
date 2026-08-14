@@ -408,8 +408,8 @@ does not send a payment signature and never verifies or settles payment again.
 curl "$X402_ENDPOINT/x402/price"
 
 # First request: receive HTTP 402 and the live supported requirements
-curl -X POST "$X402_ENDPOINT/x402/analyze/async" \\
-  -H "Content-Type: application/json" \\
+curl -X POST "$X402_ENDPOINT/x402/analyze/async" \
+  -H "Content-Type: application/json" \
   -d '{"symbols": ["AAPL", "NVDA"]}'
 
 # Paid mode: repeat the request with the exact proof returned by the HTTP 402

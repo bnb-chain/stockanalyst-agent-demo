@@ -43,3 +43,31 @@ queued state using `settledAt`.
 
 ERC-8183 is a separate escrow channel, not x402; its fixed price remains 0.21
 U and its behavior is unchanged.
+
+## Key files
+
+| File | Purpose |
+|------|---------|
+| `main.py` | Entrypoint: A2A on `:9000` + x402 on `:9000` (local) / `:9001` (platform) |
+| `x402_handler.py` | x402 routes: paid price, async create/query/resume, and settlement |
+| `x402_verify.py` | Fixed-code EIP-712 EIP-3009 and Permit2 exact proof verification |
+| `x402_job_service.py` | Durable paid job admission, settlement, execution, and recovery |
+| `x402_job_store.py` | Private durable job and idempotency storage |
+| `seller_core.py` | ERC-8183 seller logic — negotiate / notify_funded / fulfill |
+| `signing.py` | Deterministic ERC-8183 signing — quote / submit / settle (never LLM tools) |
+| `analysis.py` | yfinance data engine + RSI/MACD/Bollinger computation |
+| `tools.py` | LLM-callable read-only tools (`get_stock_quote`, `get_technical_signals`, …) |
+| `studio.toml` | Agent config (wallet, LLM, pricing, x402 dual-port, storage) |
+
+## Run locally
+
+```bash
+# From the app/agent directory
+python main.py                     # single-port: paid x402 + A2A on :9000
+
+# With env:
+OPENAI_API_KEY=<kimi-key> WALLET_PASSWORD=<pw> python main.py
+```
+
+Deployed platform uses `X402_PORT=9001` to serve paid x402 on a separate
+public port without the Cognito-protected A2A gateway.
