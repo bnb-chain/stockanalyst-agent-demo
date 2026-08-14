@@ -23,6 +23,7 @@ CUSTOM_DOMAIN_CUTOVER_STATE = (
 )
 STUDIO = ROOT / "stockanalyst" / "app" / "agent" / "studio.toml"
 TOKENS = ROOT / "stockanalyst" / "app" / "agent" / "x402_tokens.py"
+BUYER_PAYMENT_TOKENS = ROOT / "buyer-client" / "src" / "x402-payment.ts"
 VERIFIER = ROOT / "stockanalyst" / "app" / "agent" / "x402_verify.py"
 RUNTIME_X402_SOURCE_ROOT = ROOT / "stockanalyst" / "app" / "agent"
 GATEWAY_X402_SOURCE_ROOT = ROOT / "gateway" / "x402_lambda" / "src"
@@ -289,6 +290,55 @@ def affirmative_payment_guidance_violations(documentation: str) -> list[str]:
 
 
 class MainnetInfrastructureContractTests(unittest.TestCase):
+    def test_seller_and_buyer_payment_registries_match(self) -> None:
+        seller_tree = ast.parse(TOKENS.read_text())
+        seller: dict[str, dict[str, object]] = {}
+        for node in seller_tree.body:
+            if not isinstance(node, ast.Assign) or len(node.targets) != 1:
+                continue
+            target = node.targets[0]
+            if (
+                not isinstance(target, ast.Name)
+                or not target.id.endswith("_TOKEN")
+                or not isinstance(node.value, ast.Call)
+            ):
+                continue
+            fields = {
+                keyword.arg: ast.literal_eval(keyword.value)
+                for keyword in node.value.keywords
+                if keyword.arg is not None
+            }
+            seller[str(fields["symbol"])] = {
+                "asset": fields["address"],
+                "name": fields["domain_name"],
+                "version": fields["domain_version"],
+                "transferMethod": fields.get("transfer_method", "eip3009"),
+            }
+
+        source = BUYER_PAYMENT_TOKENS.read_text()
+        buyer: dict[str, dict[str, str]] = {}
+        for symbol, block in re.findall(
+            r"^  (U|USD1|USDC|USDT): \{(.*?)^  \},$",
+            source,
+            flags=re.MULTILINE | re.DOTALL,
+        ):
+            buyer[symbol] = dict(
+                re.findall(
+                    r'^    (asset|name|version|transferMethod): "([^"]+)",$',
+                    block,
+                    flags=re.MULTILINE,
+                )
+            )
+
+        self.assertEqual(set(seller), {"U", "USD1", "USDC", "USDT"})
+        self.assertEqual(buyer, seller)
+
+    def test_retired_free_buyer_artifacts_are_absent(self) -> None:
+        self.assertFalse((BUYER_X402_SOURCE_ROOT / "x402-free-client.ts").exists())
+        self.assertFalse(
+            (BUYER_X402_SOURCE_ROOT / "x402-free-client.test.ts").exists()
+        )
+
     def test_paid_runtime_has_no_zero_settlement_demo_bypass(self) -> None:
         handler = RUNTIME_X402_HANDLER.read_text(encoding="utf-8")
         studio = STUDIO.read_text(encoding="utf-8")

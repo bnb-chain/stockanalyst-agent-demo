@@ -101,12 +101,25 @@ def _wire_uint256(value: object) -> int | None:
     return canonical_uint256(value)
 
 
-def _valid_extra(extra: object, token: PaymentToken) -> bool:
+def _valid_extra(
+    extra: object,
+    token: PaymentToken,
+    *,
+    allow_legacy_usdc_v1: bool = False,
+) -> bool:
+    version = extra.get("version") if isinstance(extra, Mapping) else None
     return bool(
         isinstance(extra, Mapping)
         and _EXTRA_KEYS.issubset(extra.keys())
         and extra.get("name") == token.domain_name
-        and extra.get("version") == token.domain_version
+        and (
+            version == token.domain_version
+            or (
+                allow_legacy_usdc_v1
+                and token.symbol == "USDC"
+                and version == "1"
+            )
+        )
         and extra.get("assetTransferMethod") == token.transfer_method
         and _address(extra.get("signerAddress")) is not None
         and _address(extra.get("spenderAddress")) is not None
@@ -186,26 +199,36 @@ def verify_permit2_exact(
     expected_requirement: Mapping[str, Any] | None,
     now: int,
     allow_expired: bool,
+    required_amount: int | None = None,
+    allow_legacy_usdc_v1: bool = False,
 ) -> tuple[Any | None, str]:
     """Verify one exact Permit2 proof without consuming its nonce."""
     try:
         from .x402_verify import (
-            PRICE_WEI,
             VerifiedPayment,
             build_payment_requirement,
         )
     except ImportError:  # Direct imports from stockanalyst/app/agent.
         from x402_verify import (  # type: ignore[no-redef]
-            PRICE_WEI,
             VerifiedPayment,
             build_payment_requirement,
         )
+    if required_amount is None:
+        try:
+            from .x402_verify import PRICE_WEI
+        except ImportError:
+            from x402_verify import PRICE_WEI
+        required_amount = PRICE_WEI
 
     accepted = proof.get("accepted")
     if not isinstance(accepted, dict):
         return None, _REQUIREMENT_REJECTION
     accepted_extra = accepted.get("extra")
-    if not _valid_extra(accepted_extra, token):
+    if not _valid_extra(
+        accepted_extra,
+        token,
+        allow_legacy_usdc_v1=allow_legacy_usdc_v1,
+    ):
         return None, _REQUIREMENT_REJECTION
 
     expected_extra: object = accepted_extra
@@ -213,10 +236,18 @@ def verify_permit2_exact(
         if not isinstance(expected_requirement, Mapping):
             return None, _REQUIREMENT_REJECTION
         expected_extra = expected_requirement.get("extra")
-    if not _valid_extra(expected_extra, token):
+    if not _valid_extra(
+        expected_extra,
+        token,
+        allow_legacy_usdc_v1=allow_legacy_usdc_v1,
+    ):
         return None, _REQUIREMENT_REJECTION
 
-    canonical = build_payment_requirement(token, expected_extra)
+    canonical = build_payment_requirement(
+        token,
+        expected_extra,
+        amount=required_amount,
+    )
     if (
         expected_requirement is not None
         and dict(expected_requirement) != canonical
@@ -271,7 +302,7 @@ def verify_permit2_exact(
     accepted_extra_dict = dict(accepted_extra)
     if (
         permitted_token != token.address.lower()
-        or amount != PRICE_WEI
+        or amount != required_amount
         or amount != canonical_uint256(accepted.get("amount"))
         or spender != str(accepted_extra_dict["spenderAddress"]).lower()
         or recipient != str(accepted["payTo"]).lower()

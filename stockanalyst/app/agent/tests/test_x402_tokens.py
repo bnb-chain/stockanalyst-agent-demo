@@ -1,7 +1,6 @@
 import unittest
 
 from stockanalyst.app.agent.x402_tokens import (
-    PROMOTIONAL_TOKENS,
     TOKENS,
     U_TOKEN,
     USD1_TOKEN,
@@ -31,10 +30,6 @@ class PaymentTokenRegistryTests(unittest.TestCase):
             [token.transfer_method for token in TOKENS],
             ["eip3009", "eip3009", "permit2-exact", "permit2-exact"],
         )
-        self.assertEqual(
-            [token.symbol for token in PROMOTIONAL_TOKENS],
-            ["U", "USD1"],
-        )
         self.assertEqual([token.decimals for token in TOKENS], [18] * 4)
         self.assertEqual([token.amount for token in TOKENS], [10**18] * 4)
         self.assertEqual(U_TOKEN.domain, ("United Stables", "1"))
@@ -42,8 +37,12 @@ class PaymentTokenRegistryTests(unittest.TestCase):
             USD1_TOKEN.domain,
             ("World Liberty Financial USD", "1"),
         )
-        self.assertEqual(USDC_TOKEN.domain, ("USD Coin", "1"))
+        self.assertEqual(USDC_TOKEN.domain, ("USD Coin", "2"))
         self.assertEqual(USDT_TOKEN.domain, ("Tether USD", "1"))
+
+        import stockanalyst.app.agent.x402_tokens as registry
+
+        self.assertFalse(hasattr(registry, "PROMOTIONAL_TOKENS"))
 
     def test_asset_lookup_is_case_insensitive_and_closed(self) -> None:
         self.assertIs(token_by_asset(U_TOKEN.address.lower()), U_TOKEN)

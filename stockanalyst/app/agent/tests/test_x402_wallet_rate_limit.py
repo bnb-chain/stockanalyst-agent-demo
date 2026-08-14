@@ -9,6 +9,7 @@ import threading
 import unittest
 from collections.abc import Callable
 from typing import Any
+from unittest.mock import AsyncMock
 
 from botocore.exceptions import ClientError
 
@@ -134,7 +135,11 @@ class WalletRateLimiterTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(first.wallet_digest, expected)
         self.assertEqual(retry.wallet_digest, expected)
-        self.assertEqual(first, retry)
+        self.assertTrue(first.created_by_caller)
+        self.assertFalse(retry.created_by_caller)
+        self.assertEqual(first.reservation_id, retry.reservation_id)
+        self.assertEqual(first.reserved_at, retry.reserved_at)
+        self.assertEqual(first.state, retry.state)
         self.assertNotEqual(keyed.wallet_digest, expected)
 
     async def test_rate_object_contains_only_bounded_non_secret_fields(self) -> None:
@@ -262,8 +267,33 @@ class WalletRateLimiterTests(unittest.IsolatedAsyncioTestCase):
 
         second = await self.limiter.reserve(WALLET, reservation_id(1))
 
-        self.assertEqual(second, first)
+        self.assertTrue(first.created_by_caller)
+        self.assertFalse(second.created_by_caller)
+        self.assertEqual(second.wallet_digest, first.wallet_digest)
+        self.assertEqual(second.reservation_id, first.reservation_id)
+        self.assertEqual(second.reserved_at, first.reserved_at)
+        self.assertEqual(second.state, first.state)
         self.assertEqual(len(only_record(self.s3)["entries"]), 1)
+
+    async def test_cas_conflicts_use_injected_bounded_backoff(self) -> None:
+        sleeps = AsyncMock()
+        self.s3.put_errors = [s3_error("409")] * 4
+        limiter = WalletRateLimiter(
+            store=make_store(self.s3),
+            token_secret=SECRET,
+            clock=self.clock,
+            max_attempts=3,
+            conflict_sleep=sleeps,
+            conflict_delay=lambda attempt: 0.001 * attempt,
+        )
+
+        reservation = await limiter.reserve(WALLET, reservation_id(1))
+
+        self.assertTrue(reservation.created_by_caller)
+        self.assertEqual(
+            [call.args[0] for call in sleeps.await_args_list],
+            [0.001, 0.002],
+        )
 
     async def test_commit_changes_only_matching_entry_and_is_idempotent(self) -> None:
         first = await self.limiter.reserve(WALLET, reservation_id(1))
@@ -335,6 +365,26 @@ class WalletRateLimiterTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(only_record(self.s3)["entries"][0]["state"], "committed")
 
+    async def test_confirm_requires_the_exact_active_durable_reservation(self) -> None:
+        reservation = await self.limiter.reserve(WALLET, reservation_id(1))
+
+        self.assertEqual(await self.limiter.confirm(reservation), "active")
+
+        missing = WalletRateReservation(
+            wallet_digest=reservation.wallet_digest,
+            reservation_id=reservation_id(2),
+            reserved_at=reservation.reserved_at,
+            state="reserved",
+        )
+        with self.assertRaises(WalletRateLimitUnavailable):
+            await self.limiter.confirm(missing)
+
+    async def test_confirm_recognizes_naturally_expired_reservation(self) -> None:
+        reservation = await self.limiter.reserve(WALLET, reservation_id(1))
+        self.clock.now += WINDOW_MILLISECONDS
+
+        self.assertEqual(await self.limiter.confirm(reservation), "expired")
+
     async def test_release_removes_only_matching_entry_and_is_idempotent(self) -> None:
         first = await self.limiter.reserve(WALLET, reservation_id(1))
         second = await self.limiter.reserve(WALLET, reservation_id(2))
@@ -389,12 +439,51 @@ class WalletRateLimiterTests(unittest.IsolatedAsyncioTestCase):
             token_secret=SECRET,
             clock=self.clock,
             max_attempts=3,
+            conflict_sleep=AsyncMock(),
+            conflict_delay=lambda _attempt: 0.001,
         )
 
         with self.assertRaises(WalletRateLimitUnavailable):
             await limiter.reserve(WALLET, reservation_id(1))
 
         self.assertEqual(len(self.s3.put_calls), 6)
+
+    async def test_conflict_exhaustion_backs_off_before_failing_closed(self) -> None:
+        sleeps = AsyncMock()
+        self.s3.put_errors = [s3_error("409")] * 6
+        limiter = WalletRateLimiter(
+            store=make_store(self.s3),
+            token_secret=SECRET,
+            clock=self.clock,
+            max_attempts=3,
+            conflict_sleep=sleeps,
+            conflict_delay=lambda attempt: attempt / 1_000,
+        )
+
+        with self.assertRaises(WalletRateLimitUnavailable):
+            await limiter.reserve(WALLET, reservation_id(1))
+
+        self.assertEqual(
+            [call.args[0] for call in sleeps.await_args_list],
+            [0.001, 0.002],
+        )
+
+    async def test_commit_conflict_uses_the_same_injected_backoff(self) -> None:
+        sleeps = AsyncMock()
+        limiter = WalletRateLimiter(
+            store=make_store(self.s3),
+            token_secret=SECRET,
+            clock=self.clock,
+            max_attempts=3,
+            conflict_sleep=sleeps,
+            conflict_delay=lambda attempt: attempt / 1_000,
+        )
+        reservation = await limiter.reserve(WALLET, reservation_id(1))
+        self.s3.put_errors = [s3_error("409")] * 2
+
+        await limiter.commit(reservation)
+
+        sleeps.assert_awaited_once_with(0.001)
 
     async def test_s3_read_uncertainty_fails_closed(self) -> None:
         self.s3.get_errors = [s3_error("ServiceUnavailable")]

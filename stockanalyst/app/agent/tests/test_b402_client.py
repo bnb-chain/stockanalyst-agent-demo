@@ -168,7 +168,7 @@ USD1_SUPPORTED_EXTRA = {
 }
 USDC_SUPPORTED_EXTRA = {
     "name": "USD Coin",
-    "version": "1",
+    "version": "2",
     "assetTransferMethod": "permit2-exact",
     "signerAddress": "0x3333333333333333333333333333333333333333",
     "spenderAddress": "0x4444444444444444444444444444444444444444",
@@ -283,7 +283,7 @@ class B402SupportedKindTests(unittest.IsolatedAsyncioTestCase):
             {**USDC_SUPPORTED_EXTRA, "spenderAddress": "invalid"},
             {**USDC_SUPPORTED_EXTRA, "assetTransferMethod": "permit2-upto"},
             {**USDC_SUPPORTED_EXTRA, "name": "USDC"},
-            {**USDC_SUPPORTED_EXTRA, "version": "2"},
+            {**USDC_SUPPORTED_EXTRA, "version": "1"},
         )
 
         for extra in invalid_extras:

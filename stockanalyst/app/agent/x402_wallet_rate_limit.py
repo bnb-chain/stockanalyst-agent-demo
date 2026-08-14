@@ -4,8 +4,9 @@ import asyncio
 import hashlib
 import hmac
 import re
+import secrets
 import time
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Literal
 
@@ -35,6 +36,12 @@ class WalletRateReservation:
     reservation_id: str
     reserved_at: int
     state: Literal["reserved", "committed"]
+    created_by_caller: bool = False
+
+
+def _default_conflict_delay(attempt: int) -> float:
+    ceiling = min(0.025, 0.001 * (2 ** (attempt - 1)))
+    return ceiling * (0.5 + secrets.randbelow(501) / 1_000)
 
 
 class WalletRateLimiter:
@@ -45,6 +52,8 @@ class WalletRateLimiter:
         token_secret: bytes,
         clock: Callable[[], int] | None = None,
         max_attempts: int = _DEFAULT_MAX_ATTEMPTS,
+        conflict_sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+        conflict_delay: Callable[[int], float] = _default_conflict_delay,
     ) -> None:
         if not isinstance(token_secret, bytes) or len(token_secret) < 32:
             raise ValueError("wallet rate-limit secret must contain at least 32 bytes")
@@ -54,6 +63,8 @@ class WalletRateLimiter:
         self._token_secret = token_secret
         self._clock = clock or (lambda: int(time.time() * 1000))
         self._max_attempts = max_attempts
+        self._conflict_sleep = conflict_sleep
+        self._conflict_delay = conflict_delay
 
     def _wallet_digest(self, wallet: str) -> str:
         if not isinstance(wallet, str) or not 1 <= len(wallet) <= 256:
@@ -89,6 +100,8 @@ class WalletRateLimiter:
     def _reservation(
         wallet_digest: str,
         entry: dict[str, object],
+        *,
+        created_by_caller: bool,
     ) -> WalletRateReservation:
         state = entry["state"]
         if state not in {"reserved", "committed"}:
@@ -98,7 +111,23 @@ class WalletRateLimiter:
             reservation_id=str(entry["reservationId"]),
             reserved_at=int(entry["reservedAt"]),
             state=state,
+            created_by_caller=created_by_caller,
         )
+
+    async def _backoff(self, attempt: int) -> None:
+        try:
+            delay = self._conflict_delay(attempt)
+        except Exception as exc:
+            raise WalletRateLimitUnavailable(
+                "wallet rate limit unavailable"
+            ) from exc
+        if (
+            isinstance(delay, bool)
+            or not isinstance(delay, (int, float))
+            or not 0 <= delay <= 0.1
+        ):
+            raise WalletRateLimitUnavailable("wallet rate limit unavailable")
+        await self._conflict_sleep(float(delay))
 
     async def reserve(
         self,
@@ -128,8 +157,14 @@ class WalletRateLimiter:
                         {"version": 1, "entries": [entry]},
                     )
                     if created is None:
+                        if _attempt + 1 < self._max_attempts:
+                            await self._backoff(_attempt + 1)
                         continue
-                    return self._reservation(wallet_digest, entry)
+                    return self._reservation(
+                        wallet_digest,
+                        entry,
+                        created_by_caller=True,
+                    )
 
                 entries = self._active_entries(stored, now)
                 matching = next(
@@ -147,7 +182,11 @@ class WalletRateLimiter:
                             stored,
                             {"version": 1, "entries": entries},
                         )
-                    return self._reservation(wallet_digest, matching)
+                    return self._reservation(
+                        wallet_digest,
+                        matching,
+                        created_by_caller=False,
+                    )
 
                 if len(entries) >= _CAPACITY:
                     oldest = min(int(entry["reservedAt"]) for entry in entries)
@@ -165,10 +204,16 @@ class WalletRateLimiter:
                     stored,
                     {"version": 1, "entries": [*entries, entry]},
                 )
-                return self._reservation(wallet_digest, entry)
+                return self._reservation(
+                    wallet_digest,
+                    entry,
+                    created_by_caller=True,
+                )
             except WalletRateLimitExceeded:
                 raise
             except JobConflict:
+                if _attempt + 1 < self._max_attempts:
+                    await self._backoff(_attempt + 1)
                 continue
             except WalletRateLimitUnavailable:
                 raise
@@ -183,6 +228,18 @@ class WalletRateLimiter:
 
     async def release(self, reservation: WalletRateReservation) -> None:
         await self._mutate(reservation, commit=False)
+
+    async def confirm(
+        self,
+        reservation: WalletRateReservation,
+    ) -> Literal["active", "expired"]:
+        now = self._now()
+        if not self._reservation_is_active(reservation, now):
+            return "expired"
+        state = await self._read_commit_state(reservation)
+        if state != "reserved":
+            raise WalletRateLimitUnavailable("wallet rate limit unavailable")
+        return "active"
 
     async def _mutate(
         self,
@@ -241,6 +298,8 @@ class WalletRateLimiter:
                         {"version": 1, "entries": entries},
                     )
                 except JobConflict:
+                    if _attempt + 1 < self._max_attempts:
+                        await self._backoff(_attempt + 1)
                     continue
                 except asyncio.CancelledError:
                     raise
@@ -255,6 +314,8 @@ class WalletRateLimiter:
                     continue
                 return
             except JobConflict:
+                if _attempt + 1 < self._max_attempts:
+                    await self._backoff(_attempt + 1)
                 continue
             except WalletRateLimitUnavailable:
                 raise

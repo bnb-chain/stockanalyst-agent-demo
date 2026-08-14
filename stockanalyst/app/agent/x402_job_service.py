@@ -19,7 +19,13 @@ from prompt_builder import _build_stock_analysis_prompt
 from x402_job_store import JobConflict, StoredJob, X402JobStore
 from x402_settlement import SettlementOutcome
 from x402_tokens import U_TOKEN, token_by_asset
-from x402_verify import CHAIN_ID, VerifiedPayment, validate_payment_proof
+from x402_verify import (
+    CHAIN_ID,
+    LEGACY_PAID_AMOUNT_FOR_RECOVERY,
+    VerifiedPayment,
+    validate_legacy_paid_payment_proof,
+    validate_payment_proof,
+)
 from x402_wallet_rate_limit import (
     WalletRateLimiter,
     WalletRateLimitUnavailable,
@@ -40,6 +46,7 @@ _CLAIM_DRIVE_ATTEMPTS = 3
 _DEFAULT_ACCOUNTING_RETRY_ATTEMPTS = 3
 _MAX_ACCOUNTING_BACKOFF_SECONDS = 30.0
 _PENDING_PERSIST_ATTEMPTS = 3
+_DEFAULT_RESERVATION_OBSERVER_ATTEMPTS = 3
 
 SettlementMode = Literal["verify-and-settle", "settle-only"]
 
@@ -153,6 +160,12 @@ class X402JobService:
         heartbeat_sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         accounting_sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         accounting_retry_attempts: int = _DEFAULT_ACCOUNTING_RETRY_ATTEMPTS,
+        reservation_observer_sleep: Callable[
+            [float], Awaitable[None]
+        ] = asyncio.sleep,
+        reservation_observer_attempts: int = (
+            _DEFAULT_RESERVATION_OBSERVER_ATTEMPTS
+        ),
     ) -> None:
         self._store = store
         self._token_secret = token_secret
@@ -174,6 +187,10 @@ class X402JobService:
         if not 1 <= accounting_retry_attempts <= 10:
             raise X402JobError("invalid_accounting_retry_attempts")
         self._accounting_retry_attempts = accounting_retry_attempts
+        if not 1 <= reservation_observer_attempts <= 10:
+            raise X402JobError("invalid_reservation_observer_attempts")
+        self._reservation_observer_sleep = reservation_observer_sleep
+        self._reservation_observer_attempts = reservation_observer_attempts
         self._tasks_lock = threading.Lock()
         self._tasks: dict[str, asyncio.Task[None]] = {}
         self._accounting_tasks: dict[str, asyncio.Task[None]] = {}
@@ -492,22 +509,55 @@ class X402JobService:
         )
         expired_recovery = False
         if payment is None:
-            if _reason != "authorization expired":
-                raise X402JobError("payment_rejected")
-            payment, _recovery_reason = validate_payment_proof(
-                proof_header,
-                now=now // 1000,
-                allow_expired=True,
-            )
-            if payment is None:
-                raise X402JobError("payment_rejected")
-            expired_recovery = True
+            if _reason == "authorization expired":
+                payment, _recovery_reason = validate_payment_proof(
+                    proof_header,
+                    now=now // 1000,
+                    allow_expired=True,
+                )
+                if payment is None:
+                    raise X402JobError("payment_rejected")
+                expired_recovery = True
+            else:
+                legacy_payment, _legacy_reason = (
+                    validate_legacy_paid_payment_proof(
+                        proof_header,
+                        now=now // 1000,
+                        allow_expired=True,
+                    )
+                )
+                if legacy_payment is None:
+                    raise X402JobError("payment_rejected")
+                return await self._recover_legacy_paid_job(
+                    proof_header,
+                    request,
+                    legacy_payment,
+                )
         proof_digest = self._proof_digest(proof_header)
         identity = self.derive_identity(payment)
         stored = await self._store.read(identity.job_id)
         if stored is not None:
             if stored.record.get("paymentKey") != identity.payment_key:
                 raise JobIdentityCollision("job_identity_collision")
+            reservation = self._rate_reservation_from_record(stored.record)
+            if reservation is not None:
+                normalized_request = self._normalize_request(request)
+                self._require_exact_job_binding(
+                    stored,
+                    identity,
+                    payment,
+                    proof_digest,
+                    normalized_request,
+                )
+                if (
+                    stored.record.get("status") == "settling"
+                    and stored.record.get("paymentStatus") == "settling"
+                ):
+                    if self._rate_limiter is None:
+                        raise WalletRateLimitUnavailable(
+                            "wallet rate limit unavailable"
+                        )
+                    await self._rate_limiter.confirm(reservation)
             stored = await self._reconcile_settling(
                 stored,
                 payment,
@@ -530,6 +580,14 @@ class X402JobService:
                 payment.from_address,
                 identity.job_id,
             )
+            if not reservation.created_by_caller:
+                observed = await self._wait_for_exact_reserved_job(
+                    identity,
+                    payment,
+                    proof_digest,
+                    normalized_request,
+                )
+                return self._create_result(identity, observed)
         record = {
             "version": 1,
             "jobId": identity.job_id,
@@ -565,16 +623,17 @@ class X402JobService:
                     "rateLimitState": reservation.state,
                 }
             )
-        created_here = False
+        create_task = asyncio.create_task(
+            self._store.create(record),
+            name=f"x402-job-create:{identity.job_id}",
+        )
         try:
-            stored = await self._store.create(record)
-            created_here = stored is not None
+            stored = await asyncio.shield(create_task)
         except asyncio.CancelledError:
-            if reservation is not None:
-                await self._release_cancelled_create_if_absent(
-                    identity,
-                    reservation,
-                )
+            # The underlying create may be an asyncio.to_thread S3 write.  Do
+            # not release or settle after cancellation; wait only to avoid
+            # abandoning an in-flight persistence task, then retain admission.
+            await asyncio.gather(create_task, return_exceptions=True)
             raise
         except Exception:
             try:
@@ -587,39 +646,80 @@ class X402JobService:
                     retryable=True,
                 ) from None
             if stored is None:
-                if reservation is not None:
-                    await self._rate_limiter.release(reservation)
-                raise
-            if stored.record.get("paymentKey") != identity.payment_key:
-                if reservation is not None:
-                    await self._rate_limiter.release(reservation)
-                raise JobIdentityCollision("job_identity_collision")
+                raise X402JobError(
+                    "job_state_unavailable",
+                    retryable=True,
+                ) from None
+            self._require_exact_job_binding(
+                stored,
+                identity,
+                payment,
+                proof_digest,
+                normalized_request,
+            )
+            return self._create_result(identity, stored)
         if stored is None:
-            stored = await self._require_existing_identity(identity)
-            stored = await self._reconcile_settling(
-                stored,
+            observed = await self._wait_for_exact_reserved_job(
+                identity,
                 payment,
-                proof_header,
                 proof_digest,
+                normalized_request,
             )
-            stored = await self._reconcile_rate_limit(stored)
-        elif created_here:
-            stored = await self._settle_and_transition(
-                stored,
-                payment,
-                proof_header,
-                "verify-and-settle",
-            )
-        else:
-            stored = await self._reconcile_settling(
-                stored,
-                payment,
-                proof_header,
-                proof_digest,
-            )
-            stored = await self._reconcile_rate_limit(stored)
+            return self._create_result(identity, observed)
+        if reservation is not None:
+            await self._rate_limiter.confirm(reservation)
+        stored = await self._settle_and_transition(
+            stored,
+            payment,
+            proof_header,
+            "verify-and-settle",
+        )
         stored = await self._retry_accounting(stored, payment)
         return self._create_result_and_spawn(identity, stored)
+
+    async def _recover_legacy_paid_job(
+        self,
+        proof_header: str,
+        request: dict[str, Any],
+        payment: VerifiedPayment,
+    ) -> CreateJobResult:
+        try:
+            normalized_request = self._normalize_request(request)
+            proof_digest = self._proof_digest(proof_header)
+            identity = self.derive_identity(payment)
+            stored = await self._store.read(identity.job_id)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            raise X402JobError("payment_rejected") from None
+        if stored is None:
+            raise X402JobError("payment_rejected")
+        record = stored.record
+        token = token_by_asset(payment.asset)
+        if (
+            payment.value != LEGACY_PAID_AMOUNT_FOR_RECOVERY
+            or token is None
+            or payment.transfer_method != token.transfer_method
+            or record.get("version") != 1
+            or record.get("jobId") != identity.job_id
+            or record.get("paymentKey") != identity.payment_key
+            or record.get("jobTokenHash") != identity.job_token_hash
+            or record.get("paymentMode") != "paid"
+            or str(record.get("asset") or "").lower()
+            != payment.asset.lower()
+            or str(record.get("address") or "").lower()
+            != payment.from_address.lower()
+            or record.get("paymentProofDigest") != proof_digest
+            or record.get("request") != normalized_request
+            or record.get("paymentStatus")
+            not in {"settling", "settled", "failed"}
+            or record.get("status")
+            not in {"settling", "queued", "running", "succeeded", "failed"}
+            or type(record.get("expiresAt")) is not int
+            or int(record["expiresAt"]) <= int(self._clock())
+        ):
+            raise X402JobError("payment_rejected")
+        return self._create_result(identity, stored)
 
     def _create_result_and_spawn(
         self,
@@ -682,29 +782,55 @@ class X402JobService:
             raise JobIdentityCollision("job_identity_collision")
         return stored
 
-    async def _release_cancelled_create_if_absent(
+    def _require_exact_job_binding(
+        self,
+        stored: StoredJob,
+        identity: JobIdentity,
+        payment: VerifiedPayment,
+        proof_digest: str,
+        normalized_request: dict[str, Any],
+    ) -> None:
+        record = stored.record
+        if record.get("paymentKey") != identity.payment_key:
+            raise JobIdentityCollision("job_identity_collision")
+        if (
+            record.get("jobId") != identity.job_id
+            or record.get("paymentMode") != "paid"
+            or record.get("paymentProofDigest") != proof_digest
+            or record.get("request") != normalized_request
+            or str(record.get("address") or "").lower()
+            != payment.from_address.lower()
+            or str(record.get("asset") or "").lower()
+            != payment.asset.lower()
+        ):
+            raise X402JobError("payment_rejected")
+
+    async def _wait_for_exact_reserved_job(
         self,
         identity: JobIdentity,
-        reservation: WalletRateReservation,
-    ) -> None:
-        try:
-            stored = await self._store.read(identity.job_id)
-        except asyncio.CancelledError:
-            return
-        except Exception:
-            # Ambiguous persistence retains admission. An exact retry will
-            # reconcile either the durable job or the expiring reservation.
-            return
-        if stored is not None:
-            return
-        release = asyncio.create_task(
-            self._rate_limiter.release(reservation),
-            name=f"x402-rate-release:{identity.job_id}",
-        )
-        try:
-            await asyncio.shield(release)
-        except asyncio.CancelledError:
-            await asyncio.gather(release, return_exceptions=True)
+        payment: VerifiedPayment,
+        proof_digest: str,
+        normalized_request: dict[str, Any],
+    ) -> StoredJob:
+        for attempt in range(self._reservation_observer_attempts):
+            try:
+                stored = await self._store.read(identity.job_id)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                stored = None
+            if stored is not None:
+                self._require_exact_job_binding(
+                    stored,
+                    identity,
+                    payment,
+                    proof_digest,
+                    normalized_request,
+                )
+                return stored
+            if attempt + 1 < self._reservation_observer_attempts:
+                await self._reservation_observer_sleep(0.01)
+        raise X402JobError("job_state_unavailable", retryable=True)
 
     async def _reconcile_settling(
         self,
@@ -834,6 +960,7 @@ class X402JobService:
             reservation_id=reservation_id,
             reserved_at=reserved_at,
             state="committed" if state == "committed" else "reserved",
+            created_by_caller=False,
         )
 
     async def _reconcile_rate_limit(self, stored: StoredJob) -> StoredJob:

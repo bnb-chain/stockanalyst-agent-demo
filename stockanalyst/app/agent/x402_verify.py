@@ -177,6 +177,7 @@ B402_PAY_TO_ADDRESS = _resolve_b402_pay_to_address()
 SELLER_WALLET = B402_PAY_TO_ADDRESS  # compatibility alias
 U_TOKEN_ADDRESS = U_TOKEN.address
 PRICE_WEI = 100_000_000_000_000_000
+LEGACY_PAID_AMOUNT_FOR_RECOVERY = 210_000_000_000_000_000
 CHAIN_ID = _resolve_x402_chain_id()
 
 
@@ -291,13 +292,15 @@ def build_payment_challenge(
 def build_payment_requirement(
     token: PaymentToken,
     extra: Mapping[str, Any],
+    *,
+    amount: int = PRICE_WEI,
 ) -> dict[str, Any]:
     """Build an exact paid-token requirement."""
     clean_extra = copy.deepcopy(dict(extra))
     return {
         "scheme": "exact",
         "network": f"eip155:{CHAIN_ID}",
-        "amount": str(PRICE_WEI),
+        "amount": str(amount),
         "asset": token.address,
         "payTo": B402_PAY_TO_ADDRESS.lower(),
         "maxTimeoutSeconds": 600,
@@ -318,6 +321,39 @@ def validate_payment_proof(
     bypasses the wall-clock expiry rejection but preserves every other
     semantic, domain, and cryptographic check.
     """
+    return _validate_payment_proof_amount(
+        proof_header,
+        expected_requirement=expected_requirement,
+        now=now,
+        allow_expired=allow_expired,
+        required_amount=PRICE_WEI,
+    )
+
+
+def validate_legacy_paid_payment_proof(
+    proof_header: str,
+    *,
+    now: int | None = None,
+    allow_expired: bool = True,
+) -> tuple[VerifiedPayment | None, str]:
+    """Locally authenticate one former-0.21 proof for durable lookup only."""
+    return _validate_payment_proof_amount(
+        proof_header,
+        expected_requirement=None,
+        now=now,
+        allow_expired=allow_expired,
+        required_amount=LEGACY_PAID_AMOUNT_FOR_RECOVERY,
+    )
+
+
+def _validate_payment_proof_amount(
+    proof_header: str,
+    *,
+    expected_requirement: Mapping[str, Any] | None,
+    now: int | None,
+    allow_expired: bool,
+    required_amount: int,
+) -> tuple[VerifiedPayment | None, str]:
     proof = decode_payment_signature(proof_header)
     if proof is None:
         return None, _PAYMENT_SIGNATURE_REJECTION
@@ -354,6 +390,10 @@ def validate_payment_proof(
             expected_requirement=expected_requirement,
             now=int(time.time()) if now is None else int(now),
             allow_expired=allow_expired,
+            required_amount=required_amount,
+            allow_legacy_usdc_v1=(
+                required_amount == LEGACY_PAID_AMOUNT_FOR_RECOVERY
+            ),
         )
     extra = accepted.get("extra")
     if (
@@ -390,6 +430,7 @@ def validate_payment_proof(
     canonical = build_payment_requirement(
         token,
         canonical_extra,
+        amount=required_amount,
     )
     if (
         expected_requirement is not None

@@ -40,7 +40,7 @@ USDC_TOKEN = PaymentToken(
     address="0x8AC76a51cc950d9822D68b83fE1Ad97B32Cd580d",
     decimals=18,
     domain_name="USD Coin",
-    domain_version="1",
+    domain_version="2",
     transfer_method="permit2-exact",
 )
 USDT_TOKEN = PaymentToken(
@@ -57,7 +57,6 @@ TOKENS: tuple[PaymentToken, ...] = (
     USDC_TOKEN,
     USDT_TOKEN,
 )
-PROMOTIONAL_TOKENS: tuple[PaymentToken, ...] = (U_TOKEN, USD1_TOKEN)
 _BY_ASSET = {token.address.lower(): token for token in TOKENS}
 
 

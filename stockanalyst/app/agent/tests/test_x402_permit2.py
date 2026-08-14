@@ -91,6 +91,7 @@ def permit2_proof(
     extra_fields: dict[str, Any] | None = None,
     accepted_spender: str = SPENDER,
     authorization_spender: str | None = None,
+    amount: str | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     extra = {
         "name": token.domain_name,
@@ -102,6 +103,8 @@ def permit2_proof(
     if extra_fields is not None:
         extra.update(copy.deepcopy(extra_fields))
     accepted = verify.build_payment_requirement(token, extra)
+    if amount is not None:
+        accepted["amount"] = amount
     authorization = {
         "permitted": {
             "token": token.address,
@@ -142,6 +145,35 @@ def permit2_proof(
         },
     }
     return proof, accepted
+
+
+@pytest.mark.parametrize("token", [USDC_TOKEN, USDT_TOKEN])
+def test_legacy_paid_validator_accepts_real_former_permit2_amount_only(token) -> None:
+    legacy_amount = "210000000000000000"
+    proof, _accepted = permit2_proof(
+        token,
+        amount=legacy_amount,
+        extra_fields=(
+            {"version": "1"}
+            if token is USDC_TOKEN
+            else None
+        ),
+    )
+
+    canonical, _reason = verify.validate_payment_proof(
+        encoded_proof(proof),
+        now=NOW,
+    )
+    recovered, reason = verify.validate_legacy_paid_payment_proof(
+        encoded_proof(proof),
+        now=NOW,
+    )
+
+    assert canonical is None
+    assert reason == ""
+    assert recovered is not None
+    assert recovered.value == int(legacy_amount)
+    assert recovered.transfer_method == "permit2-exact"
 
 
 def encoded_proof(proof: dict[str, Any]) -> str:

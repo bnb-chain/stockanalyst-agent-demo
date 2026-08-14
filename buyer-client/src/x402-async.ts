@@ -86,6 +86,8 @@ const CLI_LOCK_PATH = resolve(
 );
 const MAX_RECEIPT_BYTES = 16 * 1024;
 const MAX_PENDING_BYTES = 256 * 1024;
+const MAX_COOLDOWN_BYTES = 1_024;
+const MAX_WALLET_COOLDOWN_MILLISECONDS = 3_600_000;
 const PENDING_RECOVERY_MILLISECONDS = 7 * 24 * 60 * 60 * 1_000;
 const MAX_CREATE_ATTEMPTS = 3;
 const CREATE_RETRY_MILLISECONDS = 1_000;
@@ -124,7 +126,8 @@ const SAFE_ASYNC_JOB_CLIENT_ERROR_CODES = new Set([
   "pending_create_mismatch",
   "pending_job_mismatch",
   "poll_timeout",
-  "promo_rate_limited",
+  "wallet_rate_limited",
+  "wallet_rate_limit_unavailable",
   "report_not_ready",
   "report_too_large",
   "request_too_large",
@@ -332,12 +335,20 @@ export interface AsyncStartupOptions {
   receiptPath: string;
   pendingPath: string;
   env?: Readonly<Record<string, string | undefined>>;
+  now?: () => number;
   dependencies?: Partial<AsyncStartupDependencies>;
 }
 
 export interface AsyncStartupResult {
   receipt: AsyncJobReceipt;
   symbols: string[];
+}
+
+interface WalletRateLimitCooldown {
+  version: 1;
+  kind: "wallet-rate-limit-cooldown";
+  notBefore: number;
+  mac: string;
 }
 
 export interface AsyncCliProcess {
@@ -609,6 +620,108 @@ function atomicPrivateJson(
     if (descriptor !== undefined) closeSync(descriptor);
     safeUnlink(temporaryPath);
   }
+}
+
+function cooldownSecretPath(pendingPath: string): string {
+  return `${pendingPath}.cooldown-key`;
+}
+
+function loadOrCreateCooldownSecret(pendingPath: string): Buffer {
+  const path = cooldownSecretPath(pendingPath);
+  if (!existsSync(path)) {
+    atomicPrivateJson(path, {
+      version: 1,
+      secret: randomBytes(32).toString("base64url"),
+    }, 256);
+  }
+  try {
+    if (statSync(path).size > 256) throw new Error("oversized");
+    const value = JSON.parse(readFileSync(path, "utf8")) as unknown;
+    if (
+      !isRecord(value)
+      || Object.keys(value).sort().join(",") !== "secret,version"
+      || value["version"] !== 1
+      || typeof value["secret"] !== "string"
+      || !/^[A-Za-z0-9_-]{43}$/.test(value["secret"])
+    ) {
+      throw new Error("invalid secret");
+    }
+    const secret = Buffer.from(value["secret"], "base64url");
+    if (secret.byteLength !== 32) throw new Error("invalid secret");
+    return secret;
+  } catch {
+    throw new AsyncJobClientError("pending_binding_invalid");
+  }
+}
+
+function cooldownMac(secret: Buffer, notBefore: number): Buffer {
+  return createHmac("sha256", secret)
+    .update("stockanalyst:x402-wallet-rate-limit-cooldown:v1\n", "utf8")
+    .update(String(notBefore), "utf8")
+    .digest();
+}
+
+function persistWalletRateLimitCooldown(
+  pendingPath: string,
+  notBefore: number,
+): void {
+  if (!Number.isSafeInteger(notBefore) || notBefore <= 0) {
+    throw new AsyncJobClientError("pending_binding_invalid");
+  }
+  const secret = loadOrCreateCooldownSecret(pendingPath);
+  const record: WalletRateLimitCooldown = {
+    version: 1,
+    kind: "wallet-rate-limit-cooldown",
+    notBefore,
+    mac: cooldownMac(secret, notBefore).toString("base64url"),
+  };
+  atomicPrivateJson(pendingPath, record, MAX_COOLDOWN_BYTES);
+}
+
+function loadWalletRateLimitCooldown(
+  pendingPath: string,
+): WalletRateLimitCooldown | undefined {
+  let value: unknown;
+  try {
+    if (statSync(pendingPath).size > MAX_PENDING_BYTES) {
+      throw new Error("oversized");
+    }
+    value = JSON.parse(readFileSync(pendingPath, "utf8")) as unknown;
+  } catch {
+    throw new AsyncJobClientError("pending_binding_invalid");
+  }
+  if (!isRecord(value) || value["kind"] === undefined) return undefined;
+  const notBefore = value["notBefore"];
+  const mac = value["mac"];
+  if (
+    Object.keys(value).sort().join(",") !== "kind,mac,notBefore,version"
+    || value["version"] !== 1
+    || value["kind"] !== "wallet-rate-limit-cooldown"
+    || typeof notBefore !== "number"
+    || !Number.isSafeInteger(notBefore)
+    || notBefore <= 0
+    || typeof mac !== "string"
+    || !/^[A-Za-z0-9_-]{43}$/.test(mac)
+  ) {
+    throw new AsyncJobClientError("pending_binding_invalid");
+  }
+  const supplied = Buffer.from(mac, "base64url");
+  const expected = cooldownMac(
+    loadOrCreateCooldownSecret(pendingPath),
+    notBefore,
+  );
+  if (
+    supplied.byteLength !== expected.byteLength
+    || !timingSafeEqual(supplied, expected)
+  ) {
+    throw new AsyncJobClientError("pending_binding_invalid");
+  }
+  return {
+    version: 1,
+    kind: "wallet-rate-limit-cooldown",
+    notBefore,
+    mac,
+  };
 }
 
 export function cleanupPrivateStateTemps(
@@ -1110,6 +1223,26 @@ export async function createReceiptFromPending(
       return receipt;
     } catch (error) {
       if (
+        error instanceof AsyncJobClientError
+        && error.httpStatus === 429
+      ) {
+        const delay = error.retryAfterMilliseconds
+          ?? MAX_WALLET_COOLDOWN_MILLISECONDS;
+        const current = now();
+        if (!Number.isSafeInteger(current) || current <= 0) {
+          throw new AsyncJobClientError("pending_binding_invalid");
+        }
+        persistWalletRateLimitCooldown(
+          pendingPath,
+          current + delay,
+        );
+        throw new AsyncJobClientError("wallet_rate_limited", {
+          httpStatus: 429,
+          retryable: true,
+          retryAfterMilliseconds: delay,
+        });
+      }
+      if (
         !(error instanceof AsyncJobClientError)
         || !error.retryable
         || attempt + 1 >= attempts
@@ -1304,8 +1437,30 @@ export async function runAsyncStartup(
     ...DEFAULT_ASYNC_STARTUP_DEPENDENCIES,
     ...options.dependencies,
   };
+  const now = options.now ?? Date.now;
   let receipt: AsyncJobReceipt | undefined;
   let symbols: string[];
+
+  if (existsSync(options.pendingPath)) {
+    const cooldown = loadWalletRateLimitCooldown(options.pendingPath);
+    if (cooldown !== undefined) {
+      if (existsSync(options.receiptPath)) {
+        throw new AsyncJobClientError("pending_binding_invalid");
+      }
+      const current = now();
+      if (!Number.isSafeInteger(current) || current <= 0) {
+        throw new AsyncJobClientError("pending_binding_invalid");
+      }
+      if (current < cooldown.notBefore) {
+        throw new AsyncJobClientError("wallet_rate_limited", {
+          httpStatus: 429,
+          retryable: true,
+          retryAfterMilliseconds: cooldown.notBefore - current,
+        });
+      }
+      durableUnlink(options.pendingPath);
+    }
+  }
 
   if (existsSync(options.receiptPath)) {
     receipt = loadAsyncJobReceipt(options.receiptPath);

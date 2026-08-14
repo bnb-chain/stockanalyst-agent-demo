@@ -265,6 +265,7 @@ type RunAsyncStartup = (options: {
   receiptPath: string;
   pendingPath: string;
   env: Readonly<Record<string, string | undefined>>;
+  now?: () => number;
   dependencies?: Partial<{
     fetch: FetchImpl;
     loadContext: () => Promise<StartupContext>;
@@ -998,6 +999,54 @@ test("runAsyncStartup recovers a legacy 0.21 paid pending record with a safe sum
       logs.join("\n"),
       /210000000000000000|private-eip3009-signature|nonce|d10bddc/i,
     );
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("runAsyncStartup recovers a legacy 0.21 Permit2 pending proof without preflight or signing", async () => {
+  const runStartup = runAsyncStartup();
+  const directory = mkdtempSync(join(tmpdir(), "x402-startup-legacy-permit2-recovery-"));
+  const pendingPath = join(directory, "pending.json");
+  const receiptPath = join(directory, "receipt.json");
+  const request = { symbols: ["AAPL"], analysis_type: "comprehensive" };
+  const legacyProof = permit2Proof(paymentChallenge({
+    token: "USDC",
+    accepted: { amount: "210000000000000000" },
+  }));
+  persistPendingCreate(pendingPath, createPendingRecord(legacyProof, request));
+  let submittedProof = "";
+  try {
+    const result = await runStartup({
+      endpoint: ENDPOINT,
+      receiptPath,
+      pendingPath,
+      env: {
+        X402_PAYMENT_TOKEN: "invalid-after-signing",
+        BSC_RPC_URL: "not a URL",
+      },
+      dependencies: {
+        loadContext: async () => {
+          throw new Error("legacy recovery must not load context");
+        },
+        loadWallet: async () => {
+          throw new Error("legacy recovery must not decrypt");
+        },
+        createPermit2AllowanceReader: () => {
+          throw new Error("legacy recovery must not preflight");
+        },
+        buildPaymentProof: async () => {
+          throw new Error("legacy recovery must not sign");
+        },
+        fetch: async (_input, init) => {
+          submittedProof = new Headers(init?.headers).get("PAYMENT-SIGNATURE") ?? "";
+          return json(receipt(), { status: 202 });
+        },
+        log: () => undefined,
+      },
+    });
+    assert.equal(result.receipt.jobId, JOB_ID);
+    assert.equal(submittedProof, legacyProof);
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }
@@ -4216,6 +4265,287 @@ test("retryable create failures back off and reuse the identical pending identit
       JSON.stringify(pending.request),
     ]);
     assert.deepEqual(clock.waits, [1_000]);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("wallet 429 exposes only a strict bounded Retry-After delay", async () => {
+  await assert.rejects(
+    createAsyncAnalysis(
+      ENDPOINT,
+      "private-proof",
+      { symbols: ["AAPL"] },
+      async () => json({
+        errorCode: "wallet_rate_limited",
+        retryable: true,
+      }, {
+        status: 429,
+        headers: { "Retry-After": "37" },
+      }),
+    ),
+    (error: unknown) => error instanceof AsyncJobClientError
+      && error.code === "wallet_rate_limited"
+      && error.httpStatus === 429
+      && error.retryable
+      && error.retryAfterMilliseconds === 37_000,
+  );
+
+  for (const invalid of ["0", "-1", "1.5", "3601", "secret-value"]) {
+    await assert.rejects(
+      createAsyncAnalysis(
+        ENDPOINT,
+        "private-proof",
+        { symbols: ["AAPL"] },
+        async () => json({
+          errorCode: "wallet_rate_limited",
+          retryable: true,
+        }, {
+          status: 429,
+          headers: { "Retry-After": invalid },
+        }),
+      ),
+      (error: unknown) => error instanceof AsyncJobClientError
+        && error.code === "wallet_rate_limited"
+        && error.httpStatus === 429
+        && error.retryAfterMilliseconds === undefined
+        && !error.message.includes("secret-value"),
+    );
+  }
+});
+
+test("wallet rate-store 503 uses the fixed safe public classification", async () => {
+  await assert.rejects(
+    createAsyncAnalysis(
+      ENDPOINT,
+      "private-proof",
+      { symbols: ["AAPL"] },
+      async () => json({
+        errorCode: "wallet_rate_limit_unavailable",
+        retryable: true,
+        detail: "private-s3-detail",
+      }, { status: 503 }),
+    ),
+    (error: unknown) => error instanceof AsyncJobClientError
+      && error.code === "wallet_rate_limit_unavailable"
+      && error.httpStatus === 503
+      && error.retryable
+      && !error.message.includes("private-s3-detail"),
+  );
+});
+
+test("authoritative wallet 429 replaces proof with a private durable cooldown", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "x402-wallet-cooldown-"));
+  const pendingPath = join(directory, "pending.json");
+  const receiptPath = join(directory, "receipt.json");
+  const now = 1_900_000_000_000;
+  const challenge = paymentChallenge({ token: "U" });
+  const proof = eip3009Proof(challenge);
+  const pending = createPendingRecord(proof, { symbols: ["AAPL"] }, now);
+  persistPendingCreate(pendingPath, pending);
+  let posts = 0;
+  const waits: number[] = [];
+  try {
+    await assert.rejects(
+      createReceiptFromPending(
+        ENDPOINT,
+        pending,
+        pendingPath,
+        receiptPath,
+        async () => {
+          posts += 1;
+          return json({
+            errorCode: "wallet_rate_limited",
+            retryable: true,
+          }, {
+            status: 429,
+            headers: { "Retry-After": "37" },
+          });
+        },
+        {
+          now: () => now,
+          sleep: async (milliseconds) => { waits.push(milliseconds); },
+          maxAttempts: 3,
+        },
+      ),
+      (error: unknown) => error instanceof AsyncJobClientError
+        && error.code === "wallet_rate_limited"
+        && error.retryAfterMilliseconds === 37_000,
+    );
+
+    assert.equal(posts, 1);
+    assert.deepEqual(waits, []);
+    const serialized = readFileSync(pendingPath, "utf8");
+    assert.doesNotMatch(
+      serialized,
+      /paymentProof|signature|nonce|private|jobToken|AAPL|210000000000000000/i,
+    );
+    assert.equal(statSync(pendingPath).mode & 0o777, 0o600);
+    const state = JSON.parse(serialized) as Record<string, unknown>;
+    assert.equal(state["kind"], "wallet-rate-limit-cooldown");
+    assert.equal(state["notBefore"], now + 37_000);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("restart honors cooldown without network context wallet or signing", async () => {
+  const runStartup = runAsyncStartup();
+  const directory = mkdtempSync(join(tmpdir(), "x402-wallet-cooldown-restart-"));
+  const pendingPath = join(directory, "pending.json");
+  const receiptPath = join(directory, "receipt.json");
+  const now = 1_900_000_000_000;
+  const proof = eip3009Proof(paymentChallenge({ token: "U" }));
+  const pending = createPendingRecord(proof, { symbols: ["AAPL"] }, now);
+  persistPendingCreate(pendingPath, pending);
+  await assert.rejects(
+    createReceiptFromPending(
+      ENDPOINT,
+      pending,
+      pendingPath,
+      receiptPath,
+      async () => json({
+        errorCode: "wallet_rate_limited",
+        retryable: true,
+      }, { status: 429, headers: { "Retry-After": "60" } }),
+      { now: () => now },
+    ),
+    AsyncJobClientError,
+  );
+  const calls: string[] = [];
+  try {
+    await assert.rejects(
+      runStartup({
+        endpoint: ENDPOINT,
+        receiptPath,
+        pendingPath,
+        env: {
+          X402_SELLER_WALLET: SELLER,
+          X402_PAYMENT_TOKEN: "U",
+        },
+        now: () => now + 1_000,
+        dependencies: {
+          fetch: async () => {
+            calls.push("fetch");
+            throw new Error("must not fetch");
+          },
+          loadContext: async () => {
+            calls.push("context");
+            throw new Error("must not load context");
+          },
+          loadWallet: async () => {
+            calls.push("wallet");
+            throw new Error("must not load wallet");
+          },
+          buildPaymentProof: async () => {
+            calls.push("sign");
+            throw new Error("must not sign");
+          },
+        },
+      }),
+      (error: unknown) => error instanceof AsyncJobClientError
+        && error.code === "wallet_rate_limited"
+        && error.retryAfterMilliseconds === 59_000,
+    );
+    assert.deepEqual(calls, []);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("cooldown tampering fails closed and expiry fresh-signs", async () => {
+  const runStartup = runAsyncStartup();
+  const directory = mkdtempSync(join(tmpdir(), "x402-wallet-cooldown-tamper-"));
+  const pendingPath = join(directory, "pending.json");
+  const receiptPath = join(directory, "receipt.json");
+  const now = 1_900_000_000_000;
+  const proof = eip3009Proof(paymentChallenge({ token: "U" }));
+  const pending = createPendingRecord(proof, { symbols: ["AAPL"] }, now);
+  persistPendingCreate(pendingPath, pending);
+  await assert.rejects(
+    createReceiptFromPending(
+      ENDPOINT,
+      pending,
+      pendingPath,
+      receiptPath,
+      async () => json({
+        errorCode: "wallet_rate_limited",
+        retryable: true,
+      }, { status: 429, headers: { "Retry-After": "30" } }),
+      { now: () => now },
+    ),
+    AsyncJobClientError,
+  );
+  const original = JSON.parse(readFileSync(pendingPath, "utf8")) as Record<string, unknown>;
+  writeFileSync(pendingPath, JSON.stringify({
+    ...original,
+    notBefore: now + 1,
+  }));
+  let fetches = 0;
+  try {
+    await assert.rejects(
+      runStartup({
+        endpoint: ENDPOINT,
+        receiptPath,
+        pendingPath,
+        env: { X402_SELLER_WALLET: SELLER, X402_PAYMENT_TOKEN: "U" },
+        now: () => now,
+        dependencies: {
+          fetch: async () => {
+            fetches += 1;
+            throw new Error("must not fetch tampered state");
+          },
+        },
+      }),
+      (error: unknown) => error instanceof AsyncJobClientError
+        && error.code === "pending_binding_invalid",
+    );
+    assert.equal(fetches, 0);
+
+    writeFileSync(pendingPath, JSON.stringify(original), { mode: 0o600 });
+    let contexts = 0;
+    let wallets = 0;
+    let signs = 0;
+    const result = await runStartup({
+      endpoint: ENDPOINT,
+      receiptPath,
+      pendingPath,
+      env: { X402_SELLER_WALLET: SELLER, X402_PAYMENT_TOKEN: "U" },
+      now: () => Number(original["notBefore"]),
+      dependencies: {
+        loadContext: async () => {
+          contexts += 1;
+          return { symbols: ["MSFT"] };
+        },
+        loadWallet: async () => {
+          wallets += 1;
+          return new Wallet(Wallet.createRandom().privateKey);
+        },
+        buildPaymentProof: async (_wallet, challenge) => {
+          signs += 1;
+          return eip3009Proof(challenge);
+        },
+        fetch: async () => {
+          fetches += 1;
+          if (fetches === 1) {
+            const challenge = paymentChallenge({ token: "U" });
+            const required = paymentRequired([challenge]);
+            const body = { paymentRequired: required };
+            return json(body, {
+              status: 402,
+              headers: { "PAYMENT-REQUIRED": base64Json(required) },
+            });
+          }
+          return json(receipt(), { status: 202 });
+        },
+        log: () => undefined,
+      },
+    });
+    assert.equal(result.receipt.jobId, JOB_ID);
+    assert.equal(contexts, 1);
+    assert.equal(wallets, 1);
+    assert.equal(signs, 1);
+    assert.equal(fetches, 2);
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }

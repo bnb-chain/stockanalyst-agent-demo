@@ -79,16 +79,22 @@ export class AsyncJobClientError extends Error {
   readonly code: string;
   readonly httpStatus?: number;
   readonly retryable: boolean;
+  readonly retryAfterMilliseconds?: number;
 
   constructor(
     code: string,
-    options: { httpStatus?: number; retryable?: boolean } = {},
+    options: {
+      httpStatus?: number;
+      retryable?: boolean;
+      retryAfterMilliseconds?: number;
+    } = {},
   ) {
     super(`x402 asynchronous job failed: ${code}`);
     this.name = "AsyncJobClientError";
     this.code = code;
     this.httpStatus = options.httpStatus;
     this.retryable = options.retryable ?? false;
+    this.retryAfterMilliseconds = options.retryAfterMilliseconds;
   }
 }
 
@@ -151,7 +157,8 @@ const SAFE_SERVER_ERROR_CODES = new Set([
   "payment_backend_unavailable",
   "payment_rejected",
   "payment_unavailable",
-  "promo_rate_limited",
+  "wallet_rate_limited",
+  "wallet_rate_limit_unavailable",
   "request_too_large",
   "settlement_pending",
 ]);
@@ -714,7 +721,19 @@ async function responseError(response: Response): Promise<AsyncJobClientError> {
   return new AsyncJobClientError(code, {
     httpStatus: response.status,
     retryable,
+    retryAfterMilliseconds: strictWalletRetryAfterMilliseconds(response),
   });
+}
+
+function strictWalletRetryAfterMilliseconds(
+  response: Response,
+): number | undefined {
+  if (response.status !== 429) return undefined;
+  const raw = response.headers.get("Retry-After");
+  if (raw === null || !/^[1-9][0-9]{0,3}$/.test(raw)) return undefined;
+  const seconds = Number(raw);
+  if (!Number.isSafeInteger(seconds) || seconds > 3_600) return undefined;
+  return seconds * 1_000;
 }
 
 function tokenHeaders(token: string): HeadersInit {
