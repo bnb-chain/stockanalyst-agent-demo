@@ -192,15 +192,17 @@ public = true
 # is facilitator EOA metadata, while the live spenderAddress is the B402 proxy
 # and Permit2 typed-data spender. ERC-20 approval still targets canonical
 # Permit2 0x000000000022D473030F116dDEE9F6B43aC78BA3.
-# Promotional access is proofless: paymentRequired=false, accepts=[],
-# and no payment proof is required; it never invokes B402 verify/settle or
-# automatic approval. supportedAssets may still list all four registry entries.
+# Promotional access uses Wallet-Signature identity: paymentRequired=false, accepts=[],
+# and no token payment proof is required; it never invokes B402 verify/settle,
+# Permit2 preflight, RPC, or automatic approval. supportedAssets may still list
+# all four registry entries.
 #
 # ── Promotional asynchronous access (manual production control) ───────────
 # Disabled by default. Enable or disable explicitly, then redeploy:
 #   bag env set X402_PROMO_FREE_MODE 1
 #   bag env set X402_PROMO_FREE_MODE 0
-# Promotional access is IP-only at 30 accepted creates per rolling 24 hours.
+# Promotional access requires a locally verified wallet signature and permits
+# 30 newly accepted creates per trusted IP in a rolling 24-hour window.
 # The limiter is process-local: a restart clears it and multiple replicas do
 # not share it. The trusted IP comes from API Gateway requestContext, never
 # from a caller-controlled header. The public /x402/free route remains retired.

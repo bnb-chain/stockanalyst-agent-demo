@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import unittest
 from dataclasses import dataclass
 from unittest.mock import AsyncMock, Mock, patch
 
+from eth_account import Account
+from eth_account.messages import encode_typed_data
 from stockanalyst.app.agent import x402_handler as handler_module
 from stockanalyst.app.agent import x402_verify
 from stockanalyst.app.agent.tests.test_x402_verify import (
@@ -75,6 +78,66 @@ SUPPORTED_ASSETS = [
     }
     for token in TOKENS
 ]
+
+
+def promo_wallet_header(
+    request: dict,
+    *,
+    now: int,
+    expires_at: int | None = None,
+) -> tuple[str, str]:
+    account = Account.create("promo-handler-test")
+    nonce = "0x" + "34" * 32
+    expires_at = now + 600 if expires_at is None else expires_at
+    body = json.dumps(request).encode()
+    typed = {
+        "types": {
+            "EIP712Domain": [
+                {"name": "name", "type": "string"},
+                {"name": "version", "type": "string"},
+                {"name": "chainId", "type": "uint256"},
+            ],
+            "PromoAuthorization": [
+                {"name": "address", "type": "address"},
+                {"name": "method", "type": "string"},
+                {"name": "path", "type": "string"},
+                {"name": "bodyHash", "type": "bytes32"},
+                {"name": "nonce", "type": "bytes32"},
+                {"name": "expiresAt", "type": "uint64"},
+            ],
+        },
+        "primaryType": "PromoAuthorization",
+        "domain": {
+            "name": "Stock Analyst Promo",
+            "version": "1",
+            "chainId": 56,
+        },
+        "message": {
+            "address": account.address,
+            "method": "POST",
+            "path": "/x402/analyze/async",
+            "bodyHash": "0x" + hashlib.sha256(body).hexdigest(),
+            "nonce": nonce,
+            "expiresAt": expires_at,
+        },
+    }
+    signature = Account.sign_message(
+        encode_typed_data(full_message=typed),
+        account.key,
+    ).signature.hex()
+    envelope = {
+        "version": 1,
+        "address": account.address,
+        "nonce": nonce,
+        "expiresAt": expires_at,
+        "signature": "0x" + signature.removeprefix("0x"),
+    }
+    return (
+        base64.urlsafe_b64encode(
+            json.dumps(envelope, separators=(",", ":")).encode()
+        ).decode().rstrip("="),
+        account.address.lower(),
+    )
 
 
 @dataclass(frozen=True)
@@ -429,7 +492,7 @@ class X402AsyncHandlerTests(unittest.IsolatedAsyncioTestCase):
             {"symbols": ["AAPL"]},
         )
 
-    async def test_promotional_create_without_payment_returns_202(
+    async def test_promotional_create_requires_wallet_signature(
         self,
     ) -> None:
         service = AsyncMock()
@@ -453,14 +516,47 @@ class X402AsyncHandlerTests(unittest.IsolatedAsyncioTestCase):
             scope_overrides={"x402_source_ip": "198.51.100.8"},
         )
 
-        self.assertEqual(response.status, 202)
+        self.assertEqual(response.status, 401)
         self.assert_private_no_store(response, token_authenticated=False)
-        service.create_promotional_job.assert_awaited_once_with(
-            {"symbols": ["AAPL"]},
-            source_ip="198.51.100.8",
-        )
+        self.assertEqual(response.json["errorCode"], "wallet_signature_required")
+        service.create_promotional_job.assert_not_awaited()
         service.create_job.assert_not_awaited()
         client.payment_extras.assert_not_awaited()
+
+    async def test_promotional_create_rejects_invalid_or_duplicate_wallet_signature(
+        self,
+    ) -> None:
+        for label, headers, scope_overrides in (
+            ("malformed", {"wallet-signature": "not-base64!"}, None),
+            (
+                "duplicate",
+                None,
+                {
+                    "headers": [
+                        (b"wallet-signature", b"first"),
+                        (b"Wallet-Signature", b"second"),
+                    ],
+                },
+            ),
+        ):
+            service = AsyncMock()
+            service.promo_free = True
+            with self.subTest(label=label):
+                response = await call_handler(
+                    make_handler(service),
+                    method="POST",
+                    path="/x402/analyze/async",
+                    headers=headers,
+                    json_body={"symbols": ["AAPL"]},
+                    scope_overrides=scope_overrides,
+                )
+
+            self.assertEqual(response.status, 401)
+            self.assertEqual(
+                response.json["errorCode"],
+                "wallet_signature_invalid",
+            )
+            service.create_promotional_job.assert_not_awaited()
 
     async def test_promotional_price_is_zero_without_b402_lookup(self) -> None:
         service = AsyncMock()
@@ -488,6 +584,14 @@ class X402AsyncHandlerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(response.json["signingScheme"])
         self.assertEqual(response.json["signingSchemes"], [])
         self.assertIsNone(response.json["facilitator"])
+        self.assertEqual(
+            response.json["walletAuthorization"]["header"],
+            "Wallet-Signature",
+        )
+        self.assertEqual(
+            response.json["walletAuthorization"]["scheme"],
+            "eip712-wallet",
+        )
         client.payment_extras.assert_not_awaited()
 
     async def test_promotional_create_receives_trusted_source_ip(self) -> None:
@@ -499,23 +603,61 @@ class X402AsyncHandlerTests(unittest.IsolatedAsyncioTestCase):
             status="queued",
             expires_at=EXPIRES_AT,
         )
-
-        response = await call_handler(
-            make_handler(service),
-            method="POST",
-            path="/x402/analyze/async",
-            json_body={"symbols": ["AAPL"]},
-            scope_overrides={"x402_source_ip": "198.51.100.8"},
+        request = {"symbols": ["AAPL"]}
+        wallet_header, wallet_address = promo_wallet_header(
+            request,
+            now=SIGNED_NOW,
         )
+
+        with patch.object(handler_module.time, "time", return_value=SIGNED_NOW):
+            response = await call_handler(
+                make_handler(service),
+                method="POST",
+                path="/x402/analyze/async",
+                headers={"wallet-signature": wallet_header},
+                json_body=request,
+                scope_overrides={"x402_source_ip": "198.51.100.8"},
+            )
 
         self.assertEqual(response.status, 202)
-        service.create_promotional_job.assert_awaited_once_with(
-            {"symbols": ["AAPL"]},
-            source_ip="198.51.100.8",
-        )
+        call = service.create_promotional_job.await_args
+        self.assertEqual(call.args, (request,))
+        self.assertEqual(call.kwargs["source_ip"], "198.51.100.8")
+        self.assertEqual(call.kwargs["authorization"].address, wallet_address)
         service.create_job.assert_not_awaited()
 
-    async def test_promotional_create_ignores_payment_header(self) -> None:
+    async def test_promotional_create_allows_expired_signature_for_service_recovery(
+        self,
+    ) -> None:
+        service = AsyncMock()
+        service.promo_free = True
+        service.create_promotional_job.return_value = CreateJobResult(
+            job_id=JOB_ID,
+            job_token="token",
+            status="queued",
+            expires_at=EXPIRES_AT,
+        )
+        request = {"symbols": ["AAPL"]}
+        wallet_header, _address = promo_wallet_header(
+            request,
+            now=SIGNED_NOW,
+            expires_at=SIGNED_NOW - 1,
+        )
+
+        with patch.object(handler_module.time, "time", return_value=SIGNED_NOW):
+            response = await call_handler(
+                make_handler(service),
+                method="POST",
+                path="/x402/analyze/async",
+                headers={"wallet-signature": wallet_header},
+                json_body=request,
+                scope_overrides={"x402_source_ip": "198.51.100.8"},
+            )
+
+        self.assertEqual(response.status, 202)
+        service.create_promotional_job.assert_awaited_once()
+
+    async def test_promotional_create_ignores_payment_header_when_wallet_signed(self) -> None:
         service = AsyncMock()
         service.promo_free = True
         service.create_promotional_job.return_value = CreateJobResult(
@@ -528,21 +670,27 @@ class X402AsyncHandlerTests(unittest.IsolatedAsyncioTestCase):
         client.payment_extras.side_effect = AssertionError(
             "promo must not call B402"
         )
-
-        response = await call_handler(
-            make_handler(service, b402_client=client),
-            method="POST",
-            path="/x402/analyze/async",
-            headers={"payment-signature": "must-not-be-decoded"},
-            json_body={"symbols": ["AAPL"]},
-            scope_overrides={"x402_source_ip": "198.51.100.8"},
+        request = {"symbols": ["AAPL"]}
+        wallet_header, _wallet_address = promo_wallet_header(
+            request,
+            now=SIGNED_NOW,
         )
+
+        with patch.object(handler_module.time, "time", return_value=SIGNED_NOW):
+            response = await call_handler(
+                make_handler(service, b402_client=client),
+                method="POST",
+                path="/x402/analyze/async",
+                headers={
+                    "payment-signature": "must-not-be-decoded",
+                    "wallet-signature": wallet_header,
+                },
+                json_body=request,
+                scope_overrides={"x402_source_ip": "198.51.100.8"},
+            )
 
         self.assertEqual(response.status, 202)
-        service.create_promotional_job.assert_awaited_once_with(
-            {"symbols": ["AAPL"]},
-            source_ip="198.51.100.8",
-        )
+        self.assertEqual(service.create_promotional_job.await_count, 1)
         service.create_job.assert_not_awaited()
         client.payment_extras.assert_not_awaited()
 
@@ -554,22 +702,29 @@ class X402AsyncHandlerTests(unittest.IsolatedAsyncioTestCase):
         service.create_promotional_job.side_effect = X402JobError(
             "promo_source_ip_required"
         )
-
-        response = await call_handler(
-            make_handler(service),
-            method="POST",
-            path="/x402/analyze/async",
-            json_body={"symbols": ["AAPL"]},
+        request = {"symbols": ["AAPL"]}
+        wallet_header, _wallet_address = promo_wallet_header(
+            request,
+            now=SIGNED_NOW,
         )
+
+        with patch.object(handler_module.time, "time", return_value=SIGNED_NOW):
+            response = await call_handler(
+                make_handler(service),
+                method="POST",
+                path="/x402/analyze/async",
+                headers={"wallet-signature": wallet_header},
+                json_body=request,
+            )
 
         self.assertEqual(response.status, 503)
         self.assertEqual(
             response.json["errorCode"],
             "job_service_unavailable",
         )
-        service.create_promotional_job.assert_awaited_once_with(
-            {"symbols": ["AAPL"]},
-            source_ip=None,
+        self.assertEqual(service.create_promotional_job.await_count, 1)
+        self.assertIsNone(
+            service.create_promotional_job.await_args.kwargs["source_ip"]
         )
         service.create_job.assert_not_awaited()
 
@@ -582,14 +737,21 @@ class X402AsyncHandlerTests(unittest.IsolatedAsyncioTestCase):
             "promo_rate_limited",
             retry_after_seconds=123,
         )
-
-        response = await call_handler(
-            make_handler(service),
-            method="POST",
-            path="/x402/analyze/async",
-            json_body={"symbols": ["AAPL"]},
-            scope_overrides={"x402_source_ip": "198.51.100.8"},
+        request = {"symbols": ["AAPL"]}
+        wallet_header, _wallet_address = promo_wallet_header(
+            request,
+            now=SIGNED_NOW,
         )
+
+        with patch.object(handler_module.time, "time", return_value=SIGNED_NOW):
+            response = await call_handler(
+                make_handler(service),
+                method="POST",
+                path="/x402/analyze/async",
+                headers={"wallet-signature": wallet_header},
+                json_body=request,
+                scope_overrides={"x402_source_ip": "198.51.100.8"},
+            )
 
         self.assertEqual(response.status, 429)
         self.assertEqual(response.headers["retry-after"], "123")

@@ -36,6 +36,7 @@ import { GuardUserMemory, buildTaskFromMemory } from "./uomp.js";
 import {
   beginAsyncAnalysis,
   createAsyncAnalysis,
+  createPromotionalAnalysis,
   canonicalStatusPath,
   downloadAsyncReport,
   pollAsyncAnalysis,
@@ -49,6 +50,11 @@ import {
   type PollOptions,
   type SleepImpl,
 } from "./x402-async-client.js";
+import {
+  buildPromoWalletSignature,
+  parsePromoWalletSignature,
+  type PromoWalletSigner,
+} from "./promo-wallet.js";
 import {
   PAID_AMOUNT,
   PAYMENT_TOKENS,
@@ -300,6 +306,7 @@ interface StoredReceipt {
 export interface PendingCreateRecord {
   version: 1;
   paymentProof: string;
+  credentialKind?: "promo";
   request: AsyncAnalysisRequest;
   createdAt: number;
   proofExpiresAt: number;
@@ -343,6 +350,10 @@ export interface AsyncStartupDependencies extends PaidPendingCreateDependencies 
   loadWallet(
     env: Readonly<Record<string, string | undefined>>,
   ): Promise<Wallet>;
+  buildPromoWalletSignature(
+    signer: PromoWalletSigner,
+    body: string,
+  ): Promise<{ header: string; expiresAt: number }>;
   log(message: string): void;
 }
 
@@ -417,6 +428,7 @@ const DEFAULT_ASYNC_STARTUP_DEPENDENCIES: AsyncStartupDependencies = {
   fetch: globalThis.fetch,
   loadContext: () => buildTaskFromMemory(new GuardUserMemory()),
   loadWallet: loadDefaultPaymentWallet,
+  buildPromoWalletSignature,
   log: console.log,
 };
 
@@ -470,6 +482,7 @@ function pendingBindingMac(
   const parts = [
     "stockanalyst:x402-pending-binding:v1",
     jobId,
+    ...(pending.credentialKind === "promo" ? ["promo"] : []),
     pending.paymentProof,
     canonicalJson(pending.request),
   ].map((part) => Buffer.from(part, "utf8"));
@@ -741,6 +754,39 @@ export function createPendingRecord(
   };
 }
 
+export function createPromotionalPendingRecord(
+  walletSignature: string,
+  request: AsyncAnalysisRequest,
+  now = Date.now(),
+): PendingCreateRecord {
+  if (!Number.isSafeInteger(now) || now <= 0 || !isRecord(request)) {
+    throw new Error("Pending x402 request is invalid");
+  }
+  let proofExpiresAt: number;
+  try {
+    proofExpiresAt = parsePromoWalletSignature(walletSignature).expiresAt * 1_000;
+  } catch {
+    throw new Error("Pending promo wallet signature is invalid");
+  }
+  if (!Number.isSafeInteger(proofExpiresAt) || proofExpiresAt <= now) {
+    throw new Error("Pending promo wallet signature is expired");
+  }
+  try {
+    JSON.stringify(request);
+  } catch {
+    throw new Error("Pending x402 request is invalid");
+  }
+  return {
+    version: 1,
+    credentialKind: "promo",
+    paymentProof: walletSignature,
+    request,
+    createdAt: now,
+    proofExpiresAt,
+    recoveryExpiresAt: now + PENDING_RECOVERY_MILLISECONDS,
+  };
+}
+
 export async function preparePaidPendingCreate(
   wallet: Wallet,
   challenge: PaidPaymentChallenge,
@@ -808,6 +854,7 @@ async function buildPaidPendingCreate(
 function parsePendingCreate(value: unknown): PendingCreateRecord {
   if (!isRecord(value)) throw new Error("Stored pending x402 request is invalid");
   const paymentProof = value["paymentProof"];
+  const credentialKind = value["credentialKind"];
   const request = value["request"];
   const symbols = isRecord(request) ? request["symbols"] : undefined;
   const createdAt = value["createdAt"];
@@ -817,6 +864,7 @@ function parsePendingCreate(value: unknown): PendingCreateRecord {
   const binding = value["binding"];
   if (
     value["version"] !== 1
+    || (credentialKind !== undefined && credentialKind !== "promo")
     || typeof paymentProof !== "string"
     || paymentProof.length === 0
     || paymentProof.length > 128 * 1024
@@ -829,7 +877,17 @@ function parsePendingCreate(value: unknown): PendingCreateRecord {
     || createdAt <= 0
     || typeof proofExpiresAt !== "number"
     || !Number.isSafeInteger(proofExpiresAt)
-    || proofExpiresAt !== paymentProofExpiresAt(paymentProof)
+    || proofExpiresAt !== (
+      credentialKind === "promo"
+        ? (() => {
+          try {
+            return parsePromoWalletSignature(paymentProof).expiresAt * 1_000;
+          } catch {
+            return -1;
+          }
+        })()
+        : paymentProofExpiresAt(paymentProof)
+    )
     || typeof recoveryExpiresAt !== "number"
     || !Number.isSafeInteger(recoveryExpiresAt)
     || recoveryExpiresAt !== createdAt + PENDING_RECOVERY_MILLISECONDS
@@ -854,6 +912,7 @@ function parsePendingCreate(value: unknown): PendingCreateRecord {
   }
   return {
     version: 1,
+    ...(credentialKind === "promo" ? { credentialKind } : {}),
     paymentProof,
     request: request as unknown as AsyncAnalysisRequest,
     createdAt,
@@ -885,6 +944,9 @@ function paymentAccessFromProof(paymentProof: string): X402PaymentAccess {
 
 export function pendingAccessSummary(pending: PendingCreateRecord): string {
   const canonical = parsePendingCreate(pending);
+  if (canonical.credentialKind === "promo") {
+    return "Promotional access: wallet verified; no payment or settlement";
+  }
   return formatX402AccessSummary(paymentAccessFromProof(canonical.paymentProof));
 }
 
@@ -1052,13 +1114,21 @@ export async function createReceiptFromPending(
 
   for (let attempt = 0; attempt < attempts; attempt += 1) {
     try {
-      const receipt = await createAsyncAnalysis(
-        endpoint,
-        validated.paymentProof,
-        validated.request,
-        fetchImpl,
-        options,
-      );
+      const receipt = validated.credentialKind === "promo"
+        ? await createPromotionalAnalysis(
+          endpoint,
+          validated.paymentProof,
+          validated.request,
+          fetchImpl,
+          options,
+        )
+        : await createAsyncAnalysis(
+          endpoint,
+          validated.paymentProof,
+          validated.request,
+          fetchImpl,
+          options,
+        );
       if (
         options.expectedJobId !== undefined
         && receipt.jobId !== options.expectedJobId
@@ -1333,16 +1403,6 @@ export async function runAsyncStartup(
       risk_profile: context.riskProfile,
     };
     let wallet: Wallet | undefined;
-    if (paymentToken === "USDC" || paymentToken === "USDT") {
-      wallet = await dependencies.loadWallet(env);
-      dependencies.log("Checking Permit2 allowance before requesting analysis access...");
-      await preflightPermit2Payment(
-        wallet,
-        paymentToken,
-        env,
-        dependencies,
-      );
-    }
 
     dependencies.log("Requesting asynchronous analysis access...");
     const initial = await beginAsyncAnalysis(
@@ -1353,12 +1413,32 @@ export async function runAsyncStartup(
       paymentToken,
     );
     if (initial.kind === "created") {
-      receipt = initial.receipt;
-      persistAsyncJobReceipt(options.receiptPath, receipt);
-      dependencies.log(`Created asynchronous job ${receipt.jobId}`);
-      dependencies.log("Promotional access: free (no wallet or payment)");
+      throw new Error(
+        "Promotional server did not require a wallet identity challenge",
+      );
+    } else if (initial.kind === "wallet_signature_required") {
+      wallet = await dependencies.loadWallet(env);
+      dependencies.log("Signing promotional wallet identity authorization...");
+      const signed = await dependencies.buildPromoWalletSignature(
+        wallet,
+        JSON.stringify(request),
+      );
+      pending = createPromotionalPendingRecord(
+        signed.header,
+        request,
+      );
+      persistPendingCreate(options.pendingPath, pending);
     } else {
       wallet ??= await dependencies.loadWallet(env);
+      if (paymentToken === "USDC" || paymentToken === "USDT") {
+        dependencies.log("Checking Permit2 allowance before signing payment...");
+        await preflightPermit2Payment(
+          wallet,
+          paymentToken,
+          env,
+          dependencies,
+        );
+      }
       dependencies.log(
         initial.challenge.accepted.extra.assetTransferMethod === "permit2-exact"
           ? "Signing one exact Permit2 payment authorization..."

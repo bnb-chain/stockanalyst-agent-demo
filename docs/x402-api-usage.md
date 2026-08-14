@@ -151,15 +151,32 @@ bypass recovery.
 
 In promotional mode, `paymentRequired=false` and the active `accepts=[]`;
 `supportedAssets` may still list all four tokens as registry metadata and is
-not an active payment requirement. There is no USDC/USDT promotional proof,
-B402 verify/settle, or automatic approval. With `X402_PROMO_FREE_MODE=1`, a
-create returns HTTP 202 without a wallet or `Payment-Signature` and performs no
-chain write. On a genuinely new CLI run with `X402_PAYMENT_TOKEN=USDC` or
-`USDT`, the zero-POST safety policy may perform a read-only Permit2 preflight
-before discovering the proofless promotional response; it still performs no
-approval.
+not an active payment requirement. With `X402_PROMO_FREE_MODE=1`, a create is
+free but requires an identity-only `Wallet-Signature`; it never uses
+`Payment-Signature`, B402 verify/settle, Permit2 allowance, RPC, approval, or a
+chain write. The buyer first receives HTTP 401 `wallet_signature_required`,
+signs locally, persists that authorization before retrying, and then receives
+the normal HTTP 202 job receipt.
+
+`Wallet-Signature` is unpadded base64url JSON with exactly these fields:
+
+```json
+{"version":1,"address":"0x...","nonce":"0x<32 bytes>","expiresAt":1780000600,"signature":"0x<65 bytes>"}
+```
+
+The EIP-712 domain is `name="Stock Analyst Promo"`, `version="1"`,
+`chainId=56`. The `PromoAuthorization` fields are `address address`,
+`method string`, `path string`, `bodyHash bytes32`, `nonce bytes32`, and
+`expiresAt uint64`. `method` is `POST`, `path` is
+`/x402/analyze/async`, and `bodyHash` is SHA-256 of the exact HTTP request body
+bytes. The expiry must be within the next 600 seconds. The Runtime recovers the
+wallet locally and never sends this signature to another service.
 
 The promotional quota is 30 accepted creates per trusted IP in a rolling 24
 hours and is process-local. Restarts clear it and replicas do not share it.
 The source IP comes from trusted API Gateway request context, never a caller
-header. `/x402/free` remains retired.
+header. Wallet plus nonce provides durable idempotency: an exact retry returns
+the same job without consuming another quota slot or creating another
+Competition event; nonce reuse with a different body is rejected. A newly
+accepted promo job is reported to Competition with the verified wallet address
+at the same lifecycle point as a settled paid job. `/x402/free` remains retired.

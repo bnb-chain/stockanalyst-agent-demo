@@ -41,11 +41,9 @@ allowance before starting a new Permit2 payment.
 
 In promotional mode, `paymentRequired=false` and the active `accepts=[]`;
 `supportedAssets` may still list all four tokens as registry metadata and is
-not an active payment requirement. There is no USDC/USDT promotional proof,
-B402 verify/settle, or automatic approval. On a genuinely new CLI run with
-`X402_PAYMENT_TOKEN=USDC` or `USDT`, the zero-POST safety policy may perform a
-read-only Permit2 preflight before discovering the proofless promotional
-response; it still performs no approval. Only a freshly created Permit2
+not an active payment requirement. Promo uses the independent EIP-712
+`Wallet-Signature` identity proof and never performs a USDC/USDT Permit2
+preflight, B402 verify/settle, payment, or automatic approval. Only a freshly created Permit2
 reservation in the same request uses verify-and-settle. Every pre-existing
 stale Permit2 reservation is recovered settle-only with the identical
 persisted proof, regardless of `pendingSettlementReference` or deadline;
@@ -309,22 +307,29 @@ live B402-supported subset. In promotional mode, `paymentRequired` remains
 interpret `supportedAssets` as a payment request or try to sign it.
 
 Promotional mode uses the same async route but sits outside the payment
-protocol. When `X402_PROMO_FREE_MODE=1`, callers POST directly without a wallet
-or `Payment-Signature`. Promotional access is free. The Runtime does not parse an incoming payment header or call
-B402 verify, settlement, authorization-used RPC, or any blockchain RPC. Enable
-and disable it manually, then redeploy:
+protocol. When `X402_PROMO_FREE_MODE=1`, promotional access is free but callers
+must retry HTTP 401 `wallet_signature_required` with an identity-only
+`Wallet-Signature`. The EIP-712 domain is `Stock Analyst Promo` version `1` on
+chain ID 56; `PromoAuthorization` binds the verified wallet, exact request-body
+SHA-256, `POST`, `/x402/analyze/async`, a 32-byte nonce, and an expiry no more
+than 600 seconds in the future. The Runtime verifies it locally and does not
+call B402 verify, settlement, authorization-used RPC, Permit2 allowance, or any
+blockchain RPC. Enable and disable it manually, then redeploy:
 
 ```bash
 bag env set X402_PROMO_FREE_MODE 1
 bag env set X402_PROMO_FREE_MODE 0
 ```
 
-Every accepted POST creates a new job and consumes one of the 30 requests per
-trusted IP in the rolling 24-hour window, including an identical retry. The
-limiter is process-local, so restarts clear counters and multiple replicas do
-not share state. Only API Gateway `requestContext` is trusted for the source
-IP; forwarding headers supplied by callers are ignored. This is an explicitly
-limited promotional control, not a durable distributed quota. Setting
+Every newly accepted wallet/nonce creates one job and consumes one of the 30
+requests per trusted IP in the rolling 24-hour window. An exact signed retry
+returns the same job without consuming quota or duplicating the Competition
+event; the verified wallet address is reported through the same durable marker
+flow used by paid jobs. The limiter is process-local, so restarts clear
+counters and multiple replicas do not share state. Only API Gateway
+`requestContext` is trusted for the source IP; forwarding headers supplied by
+callers are ignored. The signature header and raw IP are never persisted or
+logged. Setting
 `X402_PROMO_FREE_MODE=0` restores the four-token paid HTTP 402 flow. Its
 EIP-3009 options cost 0.21 U or 0.21 USD1, and its Permit2 options cost 0.21
 USDC or 0.21 USDT when the live B402 capability is available.
@@ -921,18 +926,23 @@ domain 名为 `World Liberty Financial USD`。两者 version 均为 `1`、均为
 `paymentRequired=false` 且 `accepts=[]` 保持不变，客户端不得把
 `supportedAssets` 当作支付结构或尝试签名。
 
-`X402_PROMO_FREE_MODE=1` 时，调用方免费直接 POST，不需要钱包或
-`Payment-Signature`；服务端不解析付款证明，也不调用 B402 verify/settle、RPC 或链上
-接口。手动开启/关闭命令为：
+`X402_PROMO_FREE_MODE=1` 时调用免费，但必须使用钱包对独立的 EIP-712
+`PromoAuthorization` 签名，并通过 `Wallet-Signature` 请求头提交；它不是
+`Payment-Signature`。签名绑定钱包、请求体 SHA-256、`POST`、
+`/x402/analyze/async`、32 字节 nonce 和最长 600 秒有效期。服务端只在本地恢复
+钱包地址，不调用 B402 verify/settle、Permit2 allowance、RPC 或链上接口。手动
+开启/关闭命令为：
 
 ```bash
 bag env set X402_PROMO_FREE_MODE 1
 bag env set X402_PROMO_FREE_MODE 0
 ```
 
-每次成功 POST 都创建新任务并消耗一次额度，相同请求的重试也不去重。限额是
-单 IP 滚动 24 小时内 30 次，且只保存在当前进程：重启会清空，多副本不共享。
-可信 IP 只来自 API Gateway `requestContext`，不接受请求头伪造的来源地址。
+每个新钱包/nonce 创建一个任务并消耗一次额度；完全相同的签名重试返回原任务，
+不重复占用额度或上报 Competition。新任务使用验签得到的钱包地址，通过与收费
+任务相同的持久化 marker 流程上报。限额是单 IP 滚动 24 小时内 30 次，且只保存
+在当前进程：重启会清空，多副本不共享。可信 IP 只来自 API Gateway
+`requestContext`，不接受请求头伪造的来源地址；原始 IP 和签名不会持久化或写日志。
 促销模式对所有 token 都不发布付款要求或证明；`supportedAssets` 仍列出四 token，
 但只作为 registry 能力元数据。设回 `X402_PROMO_FREE_MODE=0` 后恢复四 token 的
 HTTP 402 付费流程；每次价格严格为所选 token 的 0.21。

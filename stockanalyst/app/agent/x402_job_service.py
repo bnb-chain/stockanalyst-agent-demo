@@ -15,11 +15,12 @@ from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from typing import Any, Literal
 
+from promo_wallet_authorization import PromoWalletAuthorization
 from prompt_builder import _build_stock_analysis_prompt
 from x402_job_store import JobConflict, StoredJob, X402JobStore
 from x402_promo import PromoRateLimiter, PromoRateLimitExceeded
 from x402_settlement import SettlementOutcome
-from x402_tokens import U_TOKEN, token_by_asset
+from x402_tokens import token_by_asset
 from x402_verify import CHAIN_ID, VerifiedPayment, validate_payment_proof
 
 logger = logging.getLogger("seller-agent.x402.jobs")
@@ -34,7 +35,6 @@ _MAX_EXECUTION_ATTEMPTS = 3
 _CLAIM_DRIVE_ATTEMPTS = 3
 _DEFAULT_ACCOUNTING_RETRY_ATTEMPTS = 3
 _MAX_ACCOUNTING_BACKOFF_SECONDS = 30.0
-_MAX_PROMOTIONAL_IDENTITY_ATTEMPTS = 3
 _PENDING_PERSIST_ATTEMPTS = 3
 
 SettlementMode = Literal["verify-and-settle", "settle-only"]
@@ -442,8 +442,33 @@ class X402JobService:
             job_token_hash=hashlib.sha256(job_token.encode()).hexdigest(),
         )
 
-    def _new_promotional_identity(self) -> JobIdentity:
-        return self._identity_from_payment_key(secrets.token_bytes(32).hex())
+    def _promotional_identity(
+        self,
+        authorization: PromoWalletAuthorization,
+    ) -> JobIdentity:
+        if (
+            not isinstance(authorization, PromoWalletAuthorization)
+            or not re.fullmatch(r"0x[0-9a-f]{40}", authorization.address)
+            or not re.fullmatch(r"0x[0-9a-f]{64}", authorization.nonce)
+            or not re.fullmatch(r"[0-9a-f]{64}", authorization.request_digest)
+        ):
+            raise X402JobError("wallet_signature_invalid")
+        material = (
+            f"promo-wallet:{CHAIN_ID}:{authorization.address}:"
+            f"{authorization.nonce}"
+        ).encode("ascii")
+        return self._identity_from_payment_key(
+            hashlib.sha256(material).hexdigest()
+        )
+
+    @staticmethod
+    def _promotional_event_id(
+        authorization: PromoWalletAuthorization,
+    ) -> str:
+        return (
+            f"promo:{CHAIN_ID}:{authorization.address}:"
+            f"{authorization.nonce}"
+        )
 
     def _normalize_request(self, request: dict[str, Any]) -> dict[str, Any]:
         raw_symbols = request.get("symbols")
@@ -588,15 +613,34 @@ class X402JobService:
         self,
         request: dict[str, Any],
         *,
+        authorization: PromoWalletAuthorization,
         source_ip: str | None,
     ) -> CreateJobResult:
         if not self._promo_free:
             raise X402JobError("payment_required")
-        if not self._accept_new_jobs:
-            raise X402JobError("async_jobs_paused", retryable=True)
         normalized_request = self._normalize_request(request)
         if source_ip is None:
             raise X402JobError("promo_source_ip_required")
+        identity = self._promotional_identity(authorization)
+        event_id = self._promotional_event_id(authorization)
+        stored = await self._store.read(identity.job_id)
+        if stored is not None:
+            if (
+                stored.record.get("paymentKey") != identity.payment_key
+                or stored.record.get("paymentMode") != "promotional"
+                or stored.record.get("address") != authorization.address
+                or stored.record.get("competitionEventId") != event_id
+                or stored.record.get("requestDigest")
+                != authorization.request_digest
+                or stored.record.get("request") != normalized_request
+            ):
+                raise X402JobError("wallet_signature_invalid")
+            await self._redrive_accounting(stored)
+            return self._create_result_and_spawn(identity, stored)
+        if authorization.expires_at <= int(self._clock()) // 1000:
+            raise X402JobError("wallet_signature_invalid")
+        if not self._accept_new_jobs:
+            raise X402JobError("async_jobs_paused", retryable=True)
         try:
             reservation = self._promo_limiter.reserve(source_ip)
         except PromoRateLimitExceeded as exc:
@@ -610,41 +654,53 @@ class X402JobService:
 
         now = int(self._clock())
         try:
-            for _attempt in range(_MAX_PROMOTIONAL_IDENTITY_ATTEMPTS):
-                identity = self._new_promotional_identity()
-                record = {
-                    "version": 1,
-                    "jobId": identity.job_id,
-                    "paymentKey": identity.payment_key,
-                    "paymentStatus": "promotional",
-                    "paymentMode": "promotional",
-                    "asset": None,
-                    "settlementReference": None,
-                    "reportId": None,
-                    "address": None,
-                    "status": "queued",
-                    "request": normalized_request,
-                    "jobTokenHash": identity.job_token_hash,
-                    "competitionEventId": None,
-                    "settledAt": None,
-                    "attempt": 0,
-                    "leaseOwner": None,
-                    "leaseExpiresAt": None,
-                    "createdAt": now,
-                    "updatedAt": now,
-                    "expiresAt": now + 7 * 24 * 60 * 60 * 1000,
-                    "errorCode": None,
-                    "retryable": None,
-                }
-                stored = await self._store.create(record)
-                if stored is not None:
-                    reservation.commit()
-                    return self._create_result_and_spawn(identity, stored)
+            record = {
+                "version": 1,
+                "jobId": identity.job_id,
+                "paymentKey": identity.payment_key,
+                "paymentStatus": "promotional",
+                "paymentMode": "promotional",
+                "asset": None,
+                "settlementReference": None,
+                "reportId": None,
+                "address": authorization.address,
+                "status": "queued",
+                "request": normalized_request,
+                "requestDigest": authorization.request_digest,
+                "jobTokenHash": identity.job_token_hash,
+                "competitionEventId": event_id,
+                "competitionCalledAt": now,
+                "settledAt": None,
+                "attempt": 0,
+                "leaseOwner": None,
+                "leaseExpiresAt": None,
+                "createdAt": now,
+                "updatedAt": now,
+                "expiresAt": now + 7 * 24 * 60 * 60 * 1000,
+                "errorCode": None,
+                "retryable": None,
+            }
+            stored = await self._store.create(record)
+            if stored is None:
+                reservation.rollback()
+                stored = await self._store.read(identity.job_id)
+                if stored is None or (
+                    stored.record.get("paymentKey") != identity.payment_key
+                    or stored.record.get("paymentMode") != "promotional"
+                    or stored.record.get("address") != authorization.address
+                    or stored.record.get("competitionEventId") != event_id
+                    or stored.record.get("requestDigest")
+                    != authorization.request_digest
+                    or stored.record.get("request") != normalized_request
+                ):
+                    raise X402JobError("wallet_signature_invalid")
+            else:
+                reservation.commit()
+            await self._redrive_accounting(stored)
+            return self._create_result_and_spawn(identity, stored)
         except BaseException:
             reservation.rollback()
             raise
-        reservation.rollback()
-        raise X402JobError("promo_identity_unavailable", retryable=True)
 
     def _create_result_and_spawn(
         self,
@@ -950,12 +1006,11 @@ class X402JobService:
             canonical_nonce,
             canonical_asset,
         ) = self._canonical_payment_parts(payment)
-        legacy = f"b402:{CHAIN_ID}:{canonical_address}:{canonical_nonce}"
-        # Competition deduplication follows the same U-compatible transition
-        # as job identity: U remains byte-for-byte stable; non-U is asset scoped.
-        if canonical_asset == U_TOKEN.address.lower():
-            return legacy
-        return f"{legacy}:{canonical_asset}"
+        material = (
+            f"{canonical_address}:{canonical_nonce}:{canonical_asset}"
+        ).encode("ascii")
+        digest = hashlib.sha256(material).hexdigest()
+        return f"b402:{CHAIN_ID}:{digest}"
 
     async def _retry_accounting(
         self,
@@ -968,15 +1023,25 @@ class X402JobService:
     @staticmethod
     def _accounting_is_pending(record: dict[str, Any]) -> bool:
         event_id = record.get("competitionEventId")
-        settled_at = record.get("settledAt")
+        called_at = X402JobService._accounting_called_at(record)
         return (
-            record.get("paymentStatus") == "settled"
+            record.get("paymentStatus") in {"settled", "promotional"}
             and isinstance(event_id, str)
             and bool(event_id)
-            and not isinstance(settled_at, bool)
-            and isinstance(settled_at, int)
-            and settled_at > 0
+            and called_at is not None
         )
+
+    @staticmethod
+    def _accounting_called_at(record: dict[str, Any]) -> int | None:
+        field = (
+            "competitionCalledAt"
+            if record.get("paymentStatus") == "promotional"
+            else "settledAt"
+        )
+        value = record.get(field)
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            return None
+        return value
 
     async def _redrive_accounting(self, stored: StoredJob) -> None:
         if not self._accounting_is_pending(stored.record):
@@ -1058,7 +1123,9 @@ class X402JobService:
                     "eventId": str(
                         stored.record.get("competitionEventId") or ""
                     ),
-                    "settledAt": int(stored.record.get("settledAt") or 0),
+                    "settledAt": int(
+                        self._accounting_called_at(stored.record) or 0
+                    ),
                 }
                 created = await self._store.create_accounting_marker(
                     job_id,
@@ -1089,7 +1156,8 @@ class X402JobService:
         return (
             marker.get("version") == 1
             and marker.get("eventId") == record.get("competitionEventId")
-            and marker.get("settledAt") == record.get("settledAt")
+            and marker.get("settledAt")
+            == X402JobService._accounting_called_at(record)
         )
 
     async def _report_accounting_record(
@@ -1098,14 +1166,13 @@ class X402JobService:
     ) -> bool:
         event_id = record.get("competitionEventId")
         address = record.get("address")
-        settled_at = record.get("settledAt")
+        called_at = self._accounting_called_at(record)
         if (
             not isinstance(event_id, str)
             or not event_id
             or not isinstance(address, str)
             or not address
-            or not isinstance(settled_at, int)
-            or settled_at <= 0
+            or called_at is None
         ):
             logger.warning("x402 competition accounting failed")
             return False
@@ -1113,7 +1180,7 @@ class X402JobService:
             reported = await self._report(
                 event_id=event_id,
                 address=address,
-                called_at=settled_at,
+                called_at=called_at,
             )
         except Exception:
             logger.warning("x402 competition accounting failed")

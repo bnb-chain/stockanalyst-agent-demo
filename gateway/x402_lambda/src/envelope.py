@@ -10,12 +10,19 @@ from typing import Any
 from urllib.parse import urlencode, urlsplit
 
 
-_ALLOWED_HEADERS = {"accept", "content-type", "payment-signature", "x-job-token"}
+_ALLOWED_HEADERS = {
+    "accept",
+    "content-type",
+    "payment-signature",
+    "wallet-signature",
+    "x-job-token",
+}
 _JOB_PATH = re.compile(r"/x402/jobs/x402_[0-9a-f]{32}(?:/resume)?\Z")
 _FREE_SYMBOL = re.compile(r"[A-Za-z0-9.^_-]{1,32}\Z")
 _HEADER_NAME = re.compile(r"[a-z0-9-]+\Z")
 _MAX_BODY_BYTES = 256 * 1024
 _MAX_PAYMENT_SIGNATURE_CHARACTERS = 32 * 1024
+_MAX_WALLET_SIGNATURE_CHARACTERS = 4096
 
 
 class GatewayRequestError(ValueError):
@@ -39,6 +46,7 @@ def build_envelope(event: Mapping[str, Any], *, public_base_url: str) -> dict[st
         b"x402-gateway-v1\0", method.encode("ascii"), b"\0", path.encode("ascii"),
         b"\0", query_string.encode("ascii"),
         b"\0", headers.get("payment-signature", "").encode("utf-8"), b"\0",
+        headers.get("wallet-signature", "").encode("utf-8"), b"\0",
         headers.get("x-job-token", "").encode("utf-8"), b"\0", body,
     ):
         digest.update(part)
@@ -184,6 +192,11 @@ def _record_header(headers: dict[str, str], raw_name: Any, value: Any) -> None:
     if (
         name == "payment-signature"
         and len(value) > _MAX_PAYMENT_SIGNATURE_CHARACTERS
+    ):
+        raise GatewayRequestError("request_header_not_allowed")
+    if (
+        name == "wallet-signature"
+        and len(value) > _MAX_WALLET_SIGNATURE_CHARACTERS
     ):
         raise GatewayRequestError("request_header_not_allowed")
     try:

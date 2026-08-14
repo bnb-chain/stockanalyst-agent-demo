@@ -146,6 +146,21 @@ class EnvelopeTests(unittest.TestCase):
         self.assertEqual(first["headers"]["payment-signature"], "proof-a")
         self.assertNotEqual(first["requestId"], second["requestId"])
 
+    def test_forwards_wallet_signature_and_binds_request_id(self):
+        first = build_envelope(
+            api_event(headers={"Wallet-Signature": "wallet-proof-a"}),
+            public_base_url=PUBLIC_BASE,
+        )
+        second = build_envelope(
+            api_event(headers={"Wallet-Signature": "wallet-proof-b"}),
+            public_base_url=PUBLIC_BASE,
+        )
+        self.assertEqual(
+            first["headers"]["wallet-signature"],
+            "wallet-proof-a",
+        )
+        self.assertNotEqual(first["requestId"], second["requestId"])
+
     def test_drops_legacy_x_payment(self):
         envelope = build_envelope(
             api_event(headers={"X-Payment": "legacy"}),

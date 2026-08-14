@@ -25,7 +25,13 @@ _JOB_ROUTE = re.compile(r"/x402/jobs/x402_[0-9a-f]{32}(?:/resume)?\Z")
 _FREE_SYMBOL = re.compile(r"[A-Za-z0-9.^_-]{1,32}\Z")
 _HEADER_NAME = re.compile(r"[a-z0-9-]+\Z")
 _REQUEST_ID = re.compile(r"x402gw_[0-9a-f]{64}\Z")
-_REQUEST_HEADERS = {"accept", "content-type", "payment-signature", "x-job-token"}
+_REQUEST_HEADERS = {
+    "accept",
+    "content-type",
+    "payment-signature",
+    "wallet-signature",
+    "x-job-token",
+}
 _RESPONSE_HEADERS = {
     "content-type",
     "location",
@@ -36,6 +42,7 @@ _RESPONSE_HEADERS = {
     "payment-response",
 }
 _MAX_REQUEST_BYTES = 256 * 1024
+_MAX_WALLET_SIGNATURE_CHARACTERS = 4096
 _MAX_RESPONSE_BYTES = 2 * 1024 * 1024
 _BASE_ENVELOPE_FIELDS = {
     "version",
@@ -227,6 +234,10 @@ def _validate_request_headers(headers: Any) -> list[tuple[bytes, bytes]]:
             or "\r" in value
             or "\n" in value
             or "\x00" in value
+            or (
+                name == "wallet-signature"
+                and len(value) > _MAX_WALLET_SIGNATURE_CHARACTERS
+            )
         ):
             raise EnvelopeError("request_header_not_allowed")
         try:

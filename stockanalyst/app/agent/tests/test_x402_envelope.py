@@ -94,6 +94,36 @@ class X402EnvelopeTests(unittest.IsolatedAsyncioTestCase):
             captured_scope["headers"],
         )
 
+    async def test_dispatch_preserves_wallet_signature_transport(self) -> None:
+        captured_scope = None
+        proof = "opaque-wallet-proof"
+
+        async def capture_scope(scope, receive, send) -> None:
+            nonlocal captured_scope
+            captured_scope = scope
+            await recording_app(scope, receive, send)
+
+        result = await dispatch_x402_envelope(
+            capture_scope,
+            request_envelope(
+                method="POST",
+                path="/x402/analyze/async",
+                headers={
+                    "accept": "application/json",
+                    "content-type": "application/json",
+                    "wallet-signature": proof,
+                },
+                bodyBase64=base64.b64encode(b"{}").decode(),
+            ),
+            expected_public_base_url=PUBLIC_BASE,
+        )
+
+        self.assertEqual(result["status"], 200)
+        self.assertIn(
+            (b"wallet-signature", proof.encode()),
+            captured_scope["headers"],
+        )
+
     async def test_dispatch_propagates_normalized_source_ip_only_in_scope(self) -> None:
         captured_scope = None
 

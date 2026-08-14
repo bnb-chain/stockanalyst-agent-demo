@@ -35,6 +35,11 @@ if __package__:
         B402IndeterminateError,
         B402RejectedError,
     )
+    from .promo_wallet_authorization import (
+        PromoWalletAuthorizationError,
+        promo_wallet_metadata,
+        verify_promo_wallet_authorization,
+    )
     from .x402_job_service import (
         JobView,
         SettlementIndeterminate,
@@ -61,6 +66,11 @@ else:
         B402ConfigurationError,
         B402IndeterminateError,
         B402RejectedError,
+    )
+    from promo_wallet_authorization import (
+        PromoWalletAuthorizationError,
+        promo_wallet_metadata,
+        verify_promo_wallet_authorization,
     )
     from x402_job_service import (
         JobView,
@@ -410,6 +420,7 @@ class X402Handler:
                 "signingScheme": None,
                 "signingSchemes": [],
                 "facilitator": None,
+                "walletAuthorization": promo_wallet_metadata(),
             })
             return
         try:
@@ -469,7 +480,7 @@ class X402Handler:
     async def _handle_async_analyze(self, scope, receive, send) -> None:
         """POST /x402/analyze/async — settle and return a durable job handle."""
         try:
-            req = await _read_json_body(receive)
+            req, raw_body = await _read_json_body(receive)
         except BodyTooLarge:
             await _send_json(
                 send,
@@ -499,7 +510,39 @@ class X402Handler:
 
         promo_free = self._job_service.promo_free is True
         payment_header = ""
-        if not promo_free:
+        promo_authorization = None
+        if promo_free:
+            try:
+                wallet_header = _single_header(scope, b"wallet-signature")
+            except InvalidHeaderValue:
+                await _send_job_error(
+                    send,
+                    X402JobError("wallet_signature_invalid"),
+                    token_authenticated=False,
+                )
+                return
+            if not wallet_header:
+                await _send_job_error(
+                    send,
+                    X402JobError("wallet_signature_required"),
+                    token_authenticated=False,
+                )
+                return
+            try:
+                promo_authorization = verify_promo_wallet_authorization(
+                    wallet_header,
+                    raw_body,
+                    now=int(time.time()),
+                    allow_expired=True,
+                )
+            except PromoWalletAuthorizationError:
+                await _send_job_error(
+                    send,
+                    X402JobError("wallet_signature_invalid"),
+                    token_authenticated=False,
+                )
+                return
+        else:
             try:
                 payment_header = _header(scope, b"payment-signature")
             except InvalidHeaderValue:
@@ -541,8 +584,11 @@ class X402Handler:
 
         try:
             if promo_free:
+                if promo_authorization is None:
+                    raise X402JobError("wallet_signature_invalid")
                 result = await self._job_service.create_promotional_job(
                     req,
+                    authorization=promo_authorization,
                     source_ip=scope.get("x402_source_ip"),
                 )
             else:
@@ -812,7 +858,7 @@ async def _read_json_body(
     receive,
     *,
     max_bytes: int = _ASYNC_BODY_MAX_BYTES,
-) -> Any:
+) -> tuple[Any, bytes]:
     chunks: list[bytes] = []
     total = 0
     while True:
@@ -828,7 +874,8 @@ async def _read_json_body(
         chunks.append(chunk)
         if not message.get("more_body"):
             break
-    return json.loads(b"".join(chunks)) if chunks else {}
+    raw = b"".join(chunks)
+    return (json.loads(raw) if raw else {}, raw)
 
 
 def _header(scope, name: bytes) -> str:
@@ -840,6 +887,26 @@ def _header(scope, name: bytes) -> str:
             except UnicodeDecodeError as exc:
                 raise InvalidHeaderValue("invalid request header") from exc
     return ""
+
+
+def _single_header(scope, name: bytes) -> str:
+    expected = name.lower()
+    values = [
+        value
+        for header_name, value in scope.get("headers") or []
+        if header_name.lower() == expected
+    ]
+    if len(values) > 1:
+        raise InvalidHeaderValue("duplicate request header")
+    if not values:
+        return ""
+    try:
+        decoded = values[0].decode("utf-8", errors="strict")
+    except UnicodeDecodeError as exc:
+        raise InvalidHeaderValue("invalid request header") from exc
+    if "\r" in decoded or "\n" in decoded:
+        raise InvalidHeaderValue("invalid request header")
+    return decoded
 
 
 def _job_view_body(view: JobView) -> dict[str, Any]:
@@ -919,6 +986,16 @@ async def _send_job_error(
             send,
             402,
             {"errorCode": "payment_rejected"},
+            extra_headers=headers,
+        )
+    elif code in {"wallet_signature_required", "wallet_signature_invalid"}:
+        body: dict[str, Any] = {"errorCode": code}
+        if code == "wallet_signature_required":
+            body["walletAuthorization"] = promo_wallet_metadata()
+        await _send_json(
+            send,
+            401,
+            body,
             extra_headers=headers,
         )
     elif code == "promo_rate_limited":

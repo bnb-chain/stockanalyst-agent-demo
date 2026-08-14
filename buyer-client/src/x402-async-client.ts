@@ -11,6 +11,10 @@ import {
   PAYMENT_TOKENS,
   type PaymentTokenSymbol,
 } from "./x402-payment.js";
+import {
+  parsePromoWalletRequirement,
+  type PROMO_WALLET_REQUIREMENT,
+} from "./promo-wallet.js";
 
 export type FetchImpl = (
   input: RequestInfo | URL,
@@ -36,6 +40,10 @@ export interface AsyncJobReceipt {
 
 export type BeginAsyncAnalysisResult =
   | { kind: "created"; receipt: AsyncJobReceipt }
+  | {
+    kind: "wallet_signature_required";
+    requirement: typeof PROMO_WALLET_REQUIREMENT.metadata;
+  }
   | { kind: "payment_required"; challenge: PaidPaymentChallenge };
 
 export interface AsyncJobStatus {
@@ -153,6 +161,8 @@ const SAFE_SERVER_ERROR_CODES = new Set([
   "promo_rate_limited",
   "request_too_large",
   "settlement_pending",
+  "wallet_signature_invalid",
+  "wallet_signature_required",
 ]);
 const AWS_REGION_PATTERN = /^(?:af|ap|ca|cn|eu|il|me|mx|sa|us|us-gov|us-iso|us-isob)-[a-z0-9-]+-\d+$/;
 const DNS_LABEL_PATTERN = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
@@ -901,6 +911,30 @@ export async function beginAsyncAnalysis(
       receipt: parseReceipt(endpoint, await readJson(response)),
     };
   }
+  if (response.status === 401) {
+    const value = await readJson(response);
+    if (
+      !isRecord(value)
+      || Object.keys(value).length !== 2
+      || value["errorCode"] !== "wallet_signature_required"
+    ) {
+      throw new AsyncJobClientError("invalid_response", {
+        httpStatus: response.status,
+      });
+    }
+    try {
+      return {
+        kind: "wallet_signature_required",
+        requirement: parsePromoWalletRequirement(
+          value["walletAuthorization"],
+        ),
+      };
+    } catch {
+      throw new AsyncJobClientError("invalid_response", {
+        httpStatus: response.status,
+      });
+    }
+  }
   if (response.status !== 402) throw await responseError(response);
   try {
     return {
@@ -926,6 +960,77 @@ export async function beginAsyncAnalysis(
     throw new AsyncJobClientError("invalid_payment_challenge", {
       httpStatus: response.status,
     });
+  }
+}
+
+export async function createPromotionalAnalysis(
+  endpoint: string,
+  walletSignature: string,
+  request: AsyncAnalysisRequest,
+  fetchImpl: FetchImpl = globalThis.fetch,
+  options: CreateRequestOptions = {},
+): Promise<AsyncJobReceipt> {
+  if (
+    typeof walletSignature !== "string"
+    || !/^[A-Za-z0-9_-]{1,4096}$/.test(walletSignature)
+  ) {
+    throw new AsyncJobClientError("wallet_signature_invalid");
+  }
+  let body: string;
+  try {
+    body = JSON.stringify(request);
+  } catch {
+    throw new AsyncJobClientError("invalid_request");
+  }
+  const requestTimeoutMilliseconds = (
+    options.requestTimeoutMilliseconds ?? DEFAULT_CREATE_TIMEOUT_MILLISECONDS
+  );
+  if (
+    !Number.isSafeInteger(requestTimeoutMilliseconds)
+    || requestTimeoutMilliseconds < 1
+    || requestTimeoutMilliseconds > MAX_CREATE_TIMEOUT_MILLISECONDS
+  ) {
+    throw new AsyncJobClientError("invalid_request");
+  }
+  const scheduleTimeout = options.scheduleTimeout ?? (
+    (callback: () => void, milliseconds: number) => (
+      setTimeout(callback, milliseconds)
+    )
+  );
+  const clearScheduledTimeout = options.clearScheduledTimeout ?? (
+    (handle: unknown) => clearTimeout(handle as ReturnType<typeof setTimeout>)
+  );
+  const controller = new AbortController();
+  const timeoutHandle = scheduleTimeout(
+    () => controller.abort(),
+    requestTimeoutMilliseconds,
+  );
+  try {
+    const response = await safeFetch(
+      fetchImpl,
+      routeUrl(endpoint, "/x402/analyze/async"),
+      {
+        method: "POST",
+        headers: {
+          Accept: "application/json",
+          "Content-Type": "application/json",
+          "Wallet-Signature": walletSignature,
+        },
+        body,
+        redirect: "error",
+        signal: controller.signal,
+      },
+    );
+    if (response.headers.has("PAYMENT-RESPONSE")) {
+      throw new AsyncJobClientError("invalid_response");
+    }
+    if (response.status !== 202) throw await responseError(response);
+    return parseReceipt(endpoint, await readJson(response));
+  } catch (error) {
+    if (error instanceof AsyncJobClientError) throw error;
+    throw new AsyncJobClientError("network_error", { retryable: true });
+  } finally {
+    clearScheduledTimeout(timeoutHandle);
   }
 }
 

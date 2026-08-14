@@ -308,7 +308,7 @@ class MainnetInfrastructureContractTests(unittest.TestCase):
                     "Every pre-existing stale Permit2 reservation is recovered settle-only with the identical persisted proof, regardless of `pendingSettlementReference` or deadline; recovery does not call `/verify`.",
                     "Both approve and revoke require confirmation; `--yes` is an explicit noninteractive bypass.",
                     "In promotional mode, `paymentRequired=false` and the active `accepts=[]`; `supportedAssets` may still list all four tokens as registry metadata and is not an active payment requirement.",
-                    "There is no USDC/USDT promotional proof, B402 verify/settle, or automatic approval.",
+                    "identity-only `Wallet-Signature`",
                 ):
                     self.assertIn(required, normalized)
 
@@ -656,18 +656,9 @@ Witness(address to, uint256 validAfter)
         self.assertIn("bag env set X402_PROMO_FREE_MODE 1", documents[2])
         self.assertIn("bag env set X402_PROMO_FREE_MODE 0", documents[2])
 
-    def test_async_promotional_runbook_is_proofless_and_ip_limited(self) -> None:
+    def test_async_promotional_runbook_is_wallet_verified_and_ip_limited(self) -> None:
         buyer = BUYER_README.read_text(encoding="utf-8")
         seller = STOCKANALYST_README.read_text(encoding="utf-8")
-        expected = (
-            "When `X402_PROMO_FREE_MODE=1`, callers POST directly without a "
-            "wallet or `Payment-Signature`."
-        )
-        quota = (
-            "Every accepted POST creates a new job and consumes one of the "
-            "30 requests per trusted IP in the rolling 24-hour window, "
-            "including an identical retry."
-        )
         rollback = (
             "Setting `X402_PROMO_FREE_MODE=0` restores the four-token paid "
             "HTTP 402 flow."
@@ -675,8 +666,15 @@ Witness(address to, uint256 validAfter)
 
         for document in (buyer, seller):
             normalized = " ".join(document.split())
-            self.assertIn(expected, normalized)
-            self.assertIn(quota, normalized)
+            self.assertIn("`X402_PROMO_FREE_MODE=1`", normalized)
+            self.assertIn("`wallet_signature_required`", normalized)
+            self.assertIn("`Wallet-Signature`", normalized)
+            self.assertIn(
+                "30 requests per trusted IP in the rolling 24-hour window",
+                normalized,
+            )
+            self.assertIn("without consuming quota", normalized)
+            self.assertIn("Competition", normalized)
             self.assertIn(rollback, normalized)
 
     def test_runtime_configuration_is_mainnet_only(self) -> None:
@@ -734,10 +732,10 @@ Witness(address to, uint256 validAfter)
         self.assertIn("bag env set X402_PROMO_FREE_MODE 1", studio)
         self.assertIn("bag env set X402_PROMO_FREE_MODE 0", studio)
         self.assertIn(
-            "Promotional access is proofless: paymentRequired=false, accepts=[],",
+            "Promotional access uses Wallet-Signature identity: paymentRequired=false, accepts=[],",
             studio,
         )
-        self.assertIn("and no payment proof is required", studio)
+        self.assertIn("and no token payment proof is required", studio)
         self.assertNotIn("still require an EIP-3009 wallet signature", studio)
         self.assertNotIn("MIN_PRICE_WEI", verifier)
         self.assertIn("U_TOKEN_ADDRESS = U_TOKEN.address", verifier)

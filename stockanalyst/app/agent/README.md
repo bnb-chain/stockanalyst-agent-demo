@@ -28,11 +28,10 @@ never approves or revokes.
 
 In promotional mode, `paymentRequired=false` and the active `accepts=[]`;
 `supportedAssets` may still list all four tokens as registry metadata and is
-not an active payment requirement. There is no USDC/USDT promotional proof,
-B402 verify/settle, or automatic approval. On a genuinely new CLI run with
-`X402_PAYMENT_TOKEN=USDC` or `USDT`, the zero-POST safety policy may perform a
-read-only Permit2 preflight before discovering the proofless promotional
-response; it still performs no approval. Only a freshly created Permit2
+not an active payment requirement. Promo requires an identity-only
+`Wallet-Signature`, verified locally for Competition attribution. It has no
+token payment proof, B402 verify/settle, Permit2 preflight, RPC, or automatic
+approval. Only a freshly created Permit2
 reservation in the same request uses verify-and-settle. Every pre-existing
 stale Permit2 reservation is recovered settle-only with the identical
 persisted proof, regardless of `pendingSettlementReference` or deadline;

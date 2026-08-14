@@ -19,6 +19,7 @@ import {
   AsyncJobClientError,
   beginAsyncAnalysis,
   createAsyncAnalysis,
+  createPromotionalAnalysis,
   downloadAsyncReport,
   fetchPaymentChallenge,
   pollAsyncAnalysis,
@@ -27,6 +28,10 @@ import {
   type AsyncJobStatus,
   type FetchImpl,
 } from "./x402-async-client.js";
+import {
+  buildPromoWalletSignature,
+  PROMO_WALLET_REQUIREMENT,
+} from "./promo-wallet.js";
 import {
   BSC_MAINNET_CHAIN_ID,
   PAID_AMOUNT,
@@ -292,6 +297,7 @@ type RunAsyncStartup = (options: {
       wallet: Wallet,
       challenge: PaidPaymentChallenge,
     ) => Promise<string>;
+    buildPromoWalletSignature: typeof buildPromoWalletSignature;
     log: (message: string) => void;
   }>;
 }) => Promise<{ receipt: AsyncJobReceipt; symbols: string[] }>;
@@ -375,7 +381,7 @@ test("parses X402_PAYMENT_TOKEN as the exact four-token enum with U default", ()
   }
 });
 
-test("real CLI startup rejects unsafe Permit2 preflight before every fetch and signature", async () => {
+test("real CLI startup rejects unsafe Permit2 preflight after discovery and before signing", async () => {
   const runStartup = runAsyncStartup();
   const wallet = { address: "0x3333333333333333333333333333333333333333" } as Wallet;
   const cases: Array<{
@@ -451,7 +457,15 @@ test("real CLI startup rejects unsafe Permit2 preflight before every fetch and s
             },
             fetch: async () => {
               fetches += 1;
-              throw new Error("unexpected fetch");
+              const challenge = paymentChallenge({ token: testCase.token });
+              const required = paymentRequired([challenge]);
+              return json(
+                { paymentRequired: required },
+                {
+                  status: 402,
+                  headers: { "PAYMENT-REQUIRED": base64Json(required) },
+                },
+              );
             },
             buildPaymentProof: async () => {
               signatures += 1;
@@ -464,7 +478,7 @@ test("real CLI startup rejects unsafe Permit2 preflight before every fetch and s
         testCase.name,
       );
       assert.equal(decryptions, 1, testCase.name);
-      assert.equal(fetches, 0, testCase.name);
+      assert.equal(fetches, 1, testCase.name);
       assert.equal(signatures, 0, testCase.name);
       assert.equal(existsSync(pendingPath), false, testCase.name);
     } finally {
@@ -543,7 +557,15 @@ test("real async CLI output redacts hostile Permit2 preflight failures and exits
               createPermit2AllowanceReader: failure.createReader,
               fetch: async () => {
                 fetches += 1;
-                throw new Error("unexpected fetch");
+                const challenge = paymentChallenge({ token: failure.token });
+                const required = paymentRequired([challenge]);
+                return json(
+                  { paymentRequired: required },
+                  {
+                    status: 402,
+                    headers: { "PAYMENT-REQUIRED": base64Json(required) },
+                  },
+                );
               },
               buildPaymentProof: async () => {
                 signatures += 1;
@@ -569,7 +591,7 @@ test("real async CLI output redacts hostile Permit2 preflight failures and exits
         "No durable x402 retry state was created.",
       ]);
       assert.deepEqual(exitCodes, [1]);
-      assert.equal(fetches, 0);
+      assert.equal(fetches, 1);
       assert.equal(signatures, 0);
       assert.doesNotMatch(
         stderr.join("\n"),
@@ -609,7 +631,15 @@ test("real async CLI output preserves exact insufficient-allowance guidance", as
                 210000000000000000n - 1n
               ),
               fetch: async () => {
-                throw new Error("unexpected fetch");
+                const challenge = paymentChallenge({ token });
+                const required = paymentRequired([challenge]);
+                return json(
+                  { paymentRequired: required },
+                  {
+                    status: 402,
+                    headers: { "PAYMENT-REQUIRED": base64Json(required) },
+                  },
+                );
               },
               buildPaymentProof: async () => {
                 throw new Error("unexpected signature");
@@ -756,7 +786,7 @@ test("real async CLI output reconstructs registry-derived unavailable-token alte
   }
 });
 
-test("real CLI startup composes Task 7 preflight before challenge fetch and reuses its wallet", async () => {
+test("real CLI startup discovers paid mode before Permit2 preflight and reuses its wallet", async () => {
   const runStartup = runAsyncStartup();
   const wallet = { address: "0x3333333333333333333333333333333333333333" } as Wallet;
 
@@ -830,16 +860,110 @@ test("real CLI startup composes Task 7 preflight before challenge fetch and reus
       assert.equal(result.receipt.jobId, JOB_ID);
       assert.deepEqual(events, [
         "context",
+        "fetch:challenge",
         "decrypt",
         `reader:${token}`,
         "allowance",
-        "fetch:challenge",
         `sign:${token}`,
         "fetch:create",
       ]);
     } finally {
       rmSync(directory, { recursive: true, force: true });
     }
+  }
+});
+
+test("real CLI promo startup signs durably without Permit2 RPC or payment", async () => {
+  const runStartup = runAsyncStartup();
+  const wallet = Wallet.createRandom() as unknown as Wallet;
+  const directory = mkdtempSync(join(tmpdir(), "x402-startup-promo-wallet-"));
+  const pendingPath = join(directory, "pending.json");
+  const receiptPath = join(directory, "receipt.json");
+  const events: string[] = [];
+  let fetchCount = 0;
+  try {
+    const result = await runStartup({
+      endpoint: ENDPOINT,
+      receiptPath,
+      pendingPath,
+      env: {
+        X402_SELLER_WALLET: SELLER,
+        X402_PAYMENT_TOKEN: "USDC",
+      },
+      dependencies: {
+        loadContext: async () => ({ symbols: ["AAPL"] }),
+        loadWallet: async () => {
+          events.push("decrypt");
+          return wallet;
+        },
+        createPermit2AllowanceReader: () => {
+          throw new Error("promo must not construct a Permit2 reader");
+        },
+        buildPaymentProof: async () => {
+          throw new Error("promo must not build a payment proof");
+        },
+        buildPromoWalletSignature: async (signer, body) => {
+          events.push("sign-wallet");
+          return buildPromoWalletSignature(signer, body);
+        },
+        fetch: async (_input, init) => {
+          fetchCount += 1;
+          events.push(fetchCount === 1 ? "fetch:discover" : "fetch:create");
+          const headers = new Headers(init?.headers);
+          if (fetchCount === 1) {
+            assert.equal(headers.has("Wallet-Signature"), false);
+            return json({
+              errorCode: "wallet_signature_required",
+              walletAuthorization: PROMO_WALLET_REQUIREMENT.metadata,
+            }, { status: 401 });
+          }
+          assert.equal(existsSync(pendingPath), true);
+          assert.equal(headers.has("PAYMENT-SIGNATURE"), false);
+          assert.match(headers.get("Wallet-Signature") ?? "", /^[A-Za-z0-9_-]+$/);
+          return json(receipt(), { status: 202 });
+        },
+        log: () => undefined,
+      },
+    });
+
+    assert.equal(result.receipt.jobId, JOB_ID);
+    assert.deepEqual(events, [
+      "fetch:discover",
+      "decrypt",
+      "sign-wallet",
+      "fetch:create",
+    ]);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("real CLI rejects an unsigned promotional 202 response", async () => {
+  const runStartup = runAsyncStartup();
+  const directory = mkdtempSync(join(tmpdir(), "x402-startup-unsigned-promo-"));
+  const pendingPath = join(directory, "pending.json");
+  const receiptPath = join(directory, "receipt.json");
+  try {
+    await assert.rejects(
+      runStartup({
+        endpoint: ENDPOINT,
+        receiptPath,
+        pendingPath,
+        env: { X402_SELLER_WALLET: SELLER },
+        dependencies: {
+          loadContext: async () => ({ symbols: ["AAPL"] }),
+          loadWallet: async () => {
+            throw new Error("unsigned response must not load wallet");
+          },
+          fetch: async () => json(receipt(), { status: 202 }),
+          log: () => undefined,
+        },
+      }),
+      /wallet identity challenge/,
+    );
+    assert.equal(existsSync(receiptPath), false);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
   }
 });
 
@@ -1914,25 +2038,44 @@ test("fetchPaymentChallenge requires the canonical 600-second payment timeout", 
   }
 });
 
-test("beginAsyncAnalysis accepts a proofless promotional 202 response", async () => {
-  const calls: Array<{ url: string; headers: Headers }> = [];
+test("beginAsyncAnalysis returns only the exact wallet authorization requirement", async () => {
   const result = await beginAsyncAnalysis(
     ENDPOINT,
     { symbols: ["AAPL"] },
     SELLER,
+    async () => json({
+      errorCode: "wallet_signature_required",
+      walletAuthorization: PROMO_WALLET_REQUIREMENT.metadata,
+    }, { status: 401 }),
+  );
+
+  assert.deepEqual(result, {
+    kind: "wallet_signature_required",
+    requirement: PROMO_WALLET_REQUIREMENT.metadata,
+  });
+});
+
+test("createPromotionalAnalysis sends only Wallet-Signature", async () => {
+  const calls: Array<{ url: string; headers: Headers; body: unknown }> = [];
+  const actual = await createPromotionalAnalysis(
+    ENDPOINT,
+    "wallet-proof",
+    { symbols: ["AAPL"] },
     async (input, init) => {
       calls.push({
         url: String(input),
         headers: new Headers(init?.headers),
+        body: init?.body,
       });
       return json(receipt(), { status: 202 });
     },
   );
 
-  assert.deepEqual(result, { kind: "created", receipt: receipt() });
-  assert.equal(calls.length, 1);
+  assert.deepEqual(actual, receipt());
   assert.equal(calls[0]?.url, `${ENDPOINT}/x402/analyze/async`);
+  assert.equal(calls[0]?.headers.get("Wallet-Signature"), "wallet-proof");
   assert.equal(calls[0]?.headers.has("PAYMENT-SIGNATURE"), false);
+  assert.equal(calls[0]?.body, JSON.stringify({ symbols: ["AAPL"] }));
 });
 
 test("beginAsyncAnalysis preserves the paid 402 challenge", async () => {

@@ -30,11 +30,9 @@ existing allowance is within the inclusive 0.21-to-50 safety range.
 
 In promotional mode, `paymentRequired=false` and the active `accepts=[]`;
 `supportedAssets` may still list all four tokens as registry metadata and is
-not an active payment requirement. There is no USDC/USDT promotional proof,
-B402 verify/settle, or automatic approval. On a genuinely new CLI run with
-`X402_PAYMENT_TOKEN=USDC` or `USDT`, the zero-POST safety policy may perform a
-read-only Permit2 preflight before discovering the proofless promotional
-response; it still performs no approval. Only a freshly created Permit2
+not an active payment requirement. Promo uses a local identity-only
+`Wallet-Signature`; it has no token payment proof, B402 verify/settle,
+Permit2 preflight, RPC, or automatic approval. Only a freshly created Permit2
 reservation in the same request uses verify-and-settle. Every pre-existing
 stale Permit2 reservation is recovered settle-only with the identical
 persisted proof, regardless of `pendingSettlementReference` or deadline;
@@ -389,7 +387,7 @@ bag erc8183 settle <job_id>
 ```
 src/
 ├── x402free.ts     — legacy mainnet-U free client for a matching local server
-├── x402-async.ts   — proofless-promo or durable paid buyer (npm run x402:async) — private job polling
+├── x402-async.ts   — wallet-verified promo or durable paid buyer (npm run x402:async) — private job polling
 ├── x402-async-client.ts — typed async create/poll/resume/download client
 ├── x402-payment.ts — shared side-effect-free EIP-3009 proof builder
 ├── index.ts        — ERC-8183 buyer    (npm run dev)        — 0.21 U, on-chain escrow
@@ -430,7 +428,8 @@ Buyer                              Agent (localhost:9000)
   │  POST /x402/analyze/async              │
   │  {"symbols": ["AAPL","NVDA"], ...}     │
   │  (without PAYMENT-SIGNATURE) ─────────▶│
-  │                                        ├─ promo=1: IP limit, create job
+  │◀── promo=1: 401 wallet_signature_required│
+  │  WALLET-SIGNATURE: identity proof ─────▶│ IP limit, create job
   │◀── 202 jobId + private jobToken ───────│
   │                                        │
   │  paid mode only:                       ├─ promo=0: B402 /supported
@@ -460,8 +459,9 @@ is U and any other spelling is rejected. The seller's fixed registry controls
 these assets. Legacy `X402_TOKEN_ADDRESS` and U-domain environment settings are
 compatibility inputs only and cannot replace or override the registry.
 
-When `X402_PROMO_FREE_MODE=1`, callers POST directly without a wallet or
-`Payment-Signature`. Promotional access is free. The same full async analysis runs, but the request does not enter
+When `X402_PROMO_FREE_MODE=1`, callers sign an identity-only
+`Wallet-Signature`; they never send `Payment-Signature`. Promotional access is
+free. The same full async analysis runs, but the request does not enter
 x402 proof validation, B402 verify/settle, authorization-used RPC, or any
 blockchain RPC. From `buyer-client/`, update the existing Runtime manually with:
 
@@ -479,12 +479,14 @@ The CLI reports only a safe mode summary; it never prints a proof, signature,
 job token, or private report URL:
 
 ```text
-Promotional access: free (no wallet or payment)
+Promotional access: wallet verified; no payment or settlement
 Payment: 0.21 USD1 → <public pay-to address>
 ```
 
-Every accepted POST creates a new job and consumes one of the 30 requests per
-trusted IP in the rolling 24-hour window, including an identical retry. The
+Every newly accepted wallet/nonce creates one job and consumes one of the 30
+requests per trusted IP in the rolling 24-hour window. An exact signed retry
+returns the same job without consuming quota or duplicating Competition
+reporting. The
 limiter is process-local: a restart clears it and replicas do not share
 counters. In the public deployment, the trusted source IP comes from API
 Gateway request context, never a caller-supplied forwarding header. Setting
@@ -547,10 +549,9 @@ does not send a payment signature and never verifies or settles payment again.
 # Get price / challenge
 curl "$X402_ENDPOINT/x402/price"
 
-# Promotional mode: create directly without a wallet or Payment-Signature
-curl -X POST "$X402_ENDPOINT/x402/analyze/async" \
-  -H "Content-Type: application/json" \
-  -d '{"symbols": ["AAPL", "NVDA"]}'
+# Promotional mode: the bundled client handles the 401 challenge and signs
+# Wallet-Signature locally; it never sends Payment-Signature.
+npm run x402:async
 
 # Paid mode: repeat the request with the exact proof returned by the HTTP 402
 curl -X POST "$X402_ENDPOINT/x402/analyze/async" \
@@ -593,9 +594,10 @@ To call the agent from your own code, here are the minimal integration points:
 ### x402 async (simplest — any language/framework)
 
 1. **POST** `/x402/analyze/async` without `Payment-Signature`.
-2. If the response is HTTP 202, promotional mode created the job directly;
-   persist its `jobId`, `jobToken`, status path, and expiry. Do not sign or send
-   a payment proof.
+2. If the response is HTTP 401 `wallet_signature_required`, validate the
+   returned wallet-authorization metadata, sign the exact request body and
+   retry with `Wallet-Signature`. Persist the same authorization before retry
+   so response-loss recovery reuses the nonce. The retry returns HTTP 202.
 3. If the response is HTTP 402, validate every advertised `accepts[]` entry
    against the four-token mainnet registry, reject duplicates or unknown
    assets, and explicitly select one live-supported token. The paid amount must be exactly
