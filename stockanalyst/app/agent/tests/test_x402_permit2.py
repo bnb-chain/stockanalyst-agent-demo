@@ -9,7 +9,6 @@ from typing import Any
 import pytest
 from eth_account import Account
 from eth_account.messages import encode_typed_data
-
 from stockanalyst.app.agent import x402_verify as verify
 from stockanalyst.app.agent.x402_permit2 import (
     UINT256_MAX,
@@ -17,7 +16,6 @@ from stockanalyst.app.agent.x402_permit2 import (
     verify_permit2_exact,
 )
 from stockanalyst.app.agent.x402_tokens import USDC_TOKEN, USDT_TOKEN
-
 
 NOW = 1_785_484_800
 PRIVATE_KEY = "0x" + "31" * 32

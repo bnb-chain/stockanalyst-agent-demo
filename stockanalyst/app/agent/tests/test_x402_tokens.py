@@ -4,9 +4,9 @@ from stockanalyst.app.agent.x402_tokens import (
     PROMOTIONAL_TOKENS,
     TOKENS,
     U_TOKEN,
+    USD1_TOKEN,
     USDC_TOKEN,
     USDT_TOKEN,
-    USD1_TOKEN,
     supported_assets,
     token_by_asset,
 )

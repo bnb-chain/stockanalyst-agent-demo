@@ -466,9 +466,11 @@ class SettlementOutcomeTests(unittest.TestCase):
             ("rejected", "0xunexpected"),
         )
         for status, transaction in invalid:
-            with self.subTest(status=status, transaction=transaction):
-                with self.assertRaises(ValueError):
-                    SettlementOutcome(status, transaction=transaction)  # type: ignore[arg-type]
+            with self.subTest(
+                status=status,
+                transaction=transaction,
+            ), self.assertRaises(ValueError):
+                SettlementOutcome(status, transaction=transaction)  # type: ignore[arg-type]
 
     def test_validates_bounded_printable_settlement_references(self) -> None:
         self.assertTrue(valid_settlement_reference("!"))

@@ -827,7 +827,9 @@ class X402JobService:
                 raise
             except JobConflict:
                 pass
-            except Exception:
+            except Exception:  # noqa: S110
+                # Retry below from the canonical stored state without logging
+                # potentially sensitive persistence details.
                 pass
 
             try:

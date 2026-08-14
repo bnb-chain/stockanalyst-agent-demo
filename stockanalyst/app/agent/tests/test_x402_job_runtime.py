@@ -33,7 +33,7 @@ from x402_job_service import (
 )
 from x402_job_store import X402JobStore
 from x402_promo import promo_free_mode
-from x402_tokens import U_TOKEN, USDT_TOKEN, USD1_TOKEN, token_by_asset
+from x402_tokens import U_TOKEN, USD1_TOKEN, USDT_TOKEN, token_by_asset
 from x402_verify import U_TOKEN_ADDRESS, VerifiedPayment
 
 MAIN_PATH = Path(__file__).parents[1] / "main.py"

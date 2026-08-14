@@ -26,8 +26,8 @@ from stockanalyst.app.agent.x402_settlement import SettlementOutcome
 from stockanalyst.app.agent.x402_tokens import (
     TOKENS,
     U_TOKEN,
-    USDC_TOKEN,
     USD1_TOKEN,
+    USDC_TOKEN,
     USDT_TOKEN,
 )
 

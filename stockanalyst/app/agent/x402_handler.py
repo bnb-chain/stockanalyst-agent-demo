@@ -42,8 +42,8 @@ if __package__:
         X402JobService,
         is_valid_settlement_reference,
     )
-    from .x402_tokens import TOKENS, U_TOKEN, supported_assets
     from .x402_settlement import SettlementOutcome
+    from .x402_tokens import TOKENS, supported_assets
     from .x402_verify import (
         CHAIN_ID,
         FREE_TIER_LIMIT,
@@ -69,8 +69,8 @@ else:
         X402JobService,
         is_valid_settlement_reference,
     )
-    from x402_tokens import TOKENS, U_TOKEN, supported_assets
     from x402_settlement import SettlementOutcome
+    from x402_tokens import TOKENS, supported_assets
     from x402_verify import (
         CHAIN_ID,
         FREE_TIER_LIMIT,
