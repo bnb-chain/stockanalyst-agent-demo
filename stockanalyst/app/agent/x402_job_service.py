@@ -17,7 +17,6 @@ from typing import Any, Literal
 
 from prompt_builder import _build_stock_analysis_prompt
 from x402_job_store import JobConflict, StoredJob, X402JobStore
-from x402_promo import PromoRateLimiter, PromoRateLimitExceeded
 from x402_settlement import SettlementOutcome
 from x402_tokens import U_TOKEN, token_by_asset
 from x402_verify import CHAIN_ID, VerifiedPayment, validate_payment_proof
@@ -34,7 +33,6 @@ _MAX_EXECUTION_ATTEMPTS = 3
 _CLAIM_DRIVE_ATTEMPTS = 3
 _DEFAULT_ACCOUNTING_RETRY_ATTEMPTS = 3
 _MAX_ACCOUNTING_BACKOFF_SECONDS = 30.0
-_MAX_PROMOTIONAL_IDENTITY_ATTEMPTS = 3
 _PENDING_PERSIST_ATTEMPTS = 3
 
 SettlementMode = Literal["verify-and-settle", "settle-only"]
@@ -148,8 +146,6 @@ class X402JobService:
         heartbeat_sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         accounting_sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         accounting_retry_attempts: int = _DEFAULT_ACCOUNTING_RETRY_ATTEMPTS,
-        promo_free: bool = False,
-        promo_limiter: PromoRateLimiter | None = None,
     ) -> None:
         self._store = store
         self._token_secret = token_secret
@@ -163,8 +159,6 @@ class X402JobService:
         self._analysis_timeout_seconds = analysis_timeout_seconds
         self._heartbeat_sleep = heartbeat_sleep
         self._accounting_sleep = accounting_sleep
-        self._promo_free = promo_free
-        self._promo_limiter = promo_limiter or PromoRateLimiter()
         if not 1 <= accounting_retry_attempts <= 10:
             raise X402JobError("invalid_accounting_retry_attempts")
         self._accounting_retry_attempts = accounting_retry_attempts
@@ -176,10 +170,6 @@ class X402JobService:
     @property
     def accept_new_jobs(self) -> bool:
         return self._accept_new_jobs
-
-    @property
-    def promo_free(self) -> bool:
-        return self._promo_free
 
     @staticmethod
     def _token_matches(record: dict[str, Any], token: str) -> bool:
@@ -395,18 +385,7 @@ class X402JobService:
             canonical_nonce,
             canonical_asset,
         ) = self._canonical_payment_parts(payment)
-        if payment.promotional:
-            material = (
-                b"promo:"
-                + canonical_asset.encode()
-                + b":"
-                + str(CHAIN_ID).encode()
-                + b":"
-                + canonical_address.encode()
-                + b":"
-                + canonical_nonce.encode()
-            )
-        elif payment.token_symbol == "U":
+        if payment.token_symbol == "U":
             material = (
                 str(CHAIN_ID).encode()
                 + b":"
@@ -441,9 +420,6 @@ class X402JobService:
             job_token=job_token,
             job_token_hash=hashlib.sha256(job_token.encode()).hexdigest(),
         )
-
-    def _new_promotional_identity(self) -> JobIdentity:
-        return self._identity_from_payment_key(secrets.token_bytes(32).hex())
 
     def _normalize_request(self, request: dict[str, Any]) -> dict[str, Any]:
         raw_symbols = request.get("symbols")
@@ -497,13 +473,10 @@ class X402JobService:
         *,
         source_ip: str | None = None,
     ) -> CreateJobResult:
-        if self._promo_free:
-            raise X402JobError("payment_not_required")
         now = int(self._clock())
         payment, _reason = validate_payment_proof(
             proof_header,
             now=now // 1000,
-            promotional=False,
         )
         expired_recovery = False
         if payment is None:
@@ -513,7 +486,6 @@ class X402JobService:
                 proof_header,
                 now=now // 1000,
                 allow_expired=True,
-                promotional=False,
             )
             if payment is None:
                 raise X402JobError("payment_rejected")
@@ -583,68 +555,6 @@ class X402JobService:
             )
         stored = await self._retry_accounting(stored, payment)
         return self._create_result_and_spawn(identity, stored)
-
-    async def create_promotional_job(
-        self,
-        request: dict[str, Any],
-        *,
-        source_ip: str | None,
-    ) -> CreateJobResult:
-        if not self._promo_free:
-            raise X402JobError("payment_required")
-        if not self._accept_new_jobs:
-            raise X402JobError("async_jobs_paused", retryable=True)
-        normalized_request = self._normalize_request(request)
-        if source_ip is None:
-            raise X402JobError("promo_source_ip_required")
-        try:
-            reservation = self._promo_limiter.reserve(source_ip)
-        except PromoRateLimitExceeded as exc:
-            raise X402JobError(
-                "promo_rate_limited",
-                retryable=True,
-                retry_after_seconds=exc.retry_after_seconds,
-            ) from None
-        except ValueError:
-            raise X402JobError("promo_source_ip_required") from None
-
-        now = int(self._clock())
-        try:
-            for _attempt in range(_MAX_PROMOTIONAL_IDENTITY_ATTEMPTS):
-                identity = self._new_promotional_identity()
-                record = {
-                    "version": 1,
-                    "jobId": identity.job_id,
-                    "paymentKey": identity.payment_key,
-                    "paymentStatus": "promotional",
-                    "paymentMode": "promotional",
-                    "asset": None,
-                    "settlementReference": None,
-                    "reportId": None,
-                    "address": None,
-                    "status": "queued",
-                    "request": normalized_request,
-                    "jobTokenHash": identity.job_token_hash,
-                    "competitionEventId": None,
-                    "settledAt": None,
-                    "attempt": 0,
-                    "leaseOwner": None,
-                    "leaseExpiresAt": None,
-                    "createdAt": now,
-                    "updatedAt": now,
-                    "expiresAt": now + 7 * 24 * 60 * 60 * 1000,
-                    "errorCode": None,
-                    "retryable": None,
-                }
-                stored = await self._store.create(record)
-                if stored is not None:
-                    reservation.commit()
-                    return self._create_result_and_spawn(identity, stored)
-        except BaseException:
-            reservation.rollback()
-            raise
-        reservation.rollback()
-        raise X402JobError("promo_identity_unavailable", retryable=True)
 
     def _create_result_and_spawn(
         self,

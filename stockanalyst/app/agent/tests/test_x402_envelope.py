@@ -241,52 +241,28 @@ class X402EnvelopeTests(unittest.IsolatedAsyncioTestCase):
                     expected_public_base_url=PUBLIC_BASE,
                 )
 
-    async def test_dispatch_allows_free_routes_and_forwards_symbol_query(self) -> None:
-        captured_scope = None
-
-        async def capture_scope(scope, receive, send) -> None:
-            nonlocal captured_scope
-            captured_scope = scope
-            await recording_app(scope, receive, send)
-
-        result = await dispatch_x402_envelope(
-            capture_scope,
-            request_envelope(
-                method="GET",
-                path="/x402/free",
-                queryString="symbol=%5EGSPC",
-            ),
-            expected_public_base_url=PUBLIC_BASE,
-        )
-        self.assertEqual(result["status"], 200)
-        self.assertEqual(captured_scope["query_string"], b"symbol=%5EGSPC")
-
-        result = await dispatch_x402_envelope(
-            recording_app,
-            request_envelope(
-                method="POST",
-                path="/x402/free",
-                bodyBase64=base64.b64encode(b'{"symbol":"AAPL"}').decode(),
-            ),
-            expected_public_base_url=PUBLIC_BASE,
-        )
-        self.assertEqual(result["status"], 200)
-
-    async def test_dispatch_rejects_query_on_other_routes_and_invalid_free_query(self) -> None:
-        for method, path, query in (
-            ("GET", "/x402/price", "symbol=AAPL"),
-            ("POST", "/x402/free", "symbol=AAPL"),
-            ("GET", "/x402/free", "unexpected=AAPL"),
-            ("GET", "/x402/free", "symbol=AAPL%2FUSD"),
-        ):
-            with self.subTest(method=method, path=path, query=query), self.assertRaisesRegex(
-                EnvelopeError, "query_not_allowed"
+    async def test_dispatch_rejects_free_routes(self) -> None:
+        for method in ("GET", "POST"):
+            with self.subTest(method=method), self.assertRaisesRegex(
+                EnvelopeError, "route_not_allowed"
             ):
                 await dispatch_x402_envelope(
                     recording_app,
-                    request_envelope(method=method, path=path, queryString=query),
+                    request_envelope(method=method, path="/x402/free"),
                     expected_public_base_url=PUBLIC_BASE,
                 )
+
+    async def test_dispatch_rejects_query_on_paid_routes(self) -> None:
+        with self.assertRaisesRegex(EnvelopeError, "query_not_allowed"):
+            await dispatch_x402_envelope(
+                recording_app,
+                request_envelope(
+                    method="GET",
+                    path="/x402/price",
+                    queryString="symbol=AAPL",
+                ),
+                expected_public_base_url=PUBLIC_BASE,
+            )
 
     async def test_dispatch_allows_job_method_path_pairs(self) -> None:
         for method, path in (

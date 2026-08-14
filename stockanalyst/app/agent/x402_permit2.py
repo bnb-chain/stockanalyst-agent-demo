@@ -316,7 +316,6 @@ def verify_permit2_exact(
             asset=token.address.lower(),
             token_symbol=token.symbol,
             transfer_method=token.transfer_method,
-            promotional=False,
         ),
         "",
     )

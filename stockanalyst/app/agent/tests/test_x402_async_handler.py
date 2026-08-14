@@ -33,7 +33,7 @@ from stockanalyst.app.agent.x402_tokens import (
 
 JOB_ID = "x402_" + "a" * 32
 EXPIRES_AT = 1_785_945_600_123
-PAID_PRICE_WEI = 210_000_000_000_000_000
+PAID_PRICE_WEI = 100_000_000_000_000_000
 SUPPORTED_EXTRA = {
     "name": U_TOKEN.domain_name,
     "version": "1",
@@ -204,13 +204,8 @@ def make_handler(service=None, *, b402_client=None) -> X402Handler:
     if b402_client is None:
         b402_client = AsyncMock()
         b402_client.payment_extras.return_value = SUPPORTED_EXTRAS
-    if service is not None and not isinstance(
-        getattr(service, "promo_free", None), bool
-    ):
-        service.promo_free = False
     return X402Handler(
         AsyncMock(),
-        free_work=Mock(),
         job_service=service,
         b402_client=b402_client,
     )
@@ -336,12 +331,31 @@ class X402AsyncHandlerTests(unittest.IsolatedAsyncioTestCase):
             response.json["signingSchemes"],
             ["eip3009", "permit2-exact"],
         )
-        self.assertEqual(response.json["price_u"], "0.21")
+        self.assertEqual(response.json["price_u"], "0.1")
         self.assertEqual(response.json["price_wei"], str(PAID_PRICE_WEI))
         self.assertEqual(response.json["supportedAssets"], SUPPORTED_ASSETS)
         self.assertTrue(response.json["paymentRequired"])
         self.assertNotIn("min_price_u", response.json)
         self.assertNotIn("min_price_wei", response.json)
+
+    async def test_price_is_always_paid_even_if_service_exposes_legacy_flag(
+        self,
+    ) -> None:
+        service = AsyncMock()
+        service.promo_free = True
+
+        response = await call_handler(
+            make_handler(service), method="GET", path="/x402/price"
+        )
+
+        self.assertEqual(response.status, 200)
+        self.assertTrue(response.json["paymentRequired"])
+        self.assertNotIn("promoFree", response.json)
+        self.assertEqual(response.json["price_wei"], str(PAID_PRICE_WEI))
+        self.assertEqual(
+            [item["amount"] for item in response.json["accepts"]],
+            [str(PAID_PRICE_WEI)] * len(TOKENS),
+        )
 
     async def test_paid_requirements_request_registry_tokens_from_b402(self) -> None:
         client = AsyncMock()
@@ -362,7 +376,6 @@ class X402AsyncHandlerTests(unittest.IsolatedAsyncioTestCase):
     async def test_paid_requirements_need_b402_backend(self) -> None:
         handler = X402Handler(
             AsyncMock(),
-            free_work=Mock(),
             job_service=AsyncMock(),
             b402_client=None,
         )
@@ -429,6 +442,53 @@ class X402AsyncHandlerTests(unittest.IsolatedAsyncioTestCase):
             {"symbols": ["AAPL"]},
         )
 
+    async def test_async_never_accepts_a_proofless_legacy_promo_service(
+        self,
+    ) -> None:
+        service = AsyncMock()
+        service.promo_free = True
+
+        response = await call_handler(
+            make_handler(service),
+            method="POST",
+            path="/x402/analyze/async",
+            json_body={"symbols": ["AAPL"]},
+        )
+
+        self.assertEqual(response.status, 402)
+        service.create_job.assert_not_awaited()
+        service.create_promotional_job.assert_not_awaited()
+
+    async def test_async_rejects_wallet_signature_as_payment_authorization(
+        self,
+    ) -> None:
+        service = AsyncMock()
+
+        response = await call_handler(
+            make_handler(service),
+            method="POST",
+            path="/x402/analyze/async",
+            headers={"wallet-signature": "identity-proof"},
+            json_body={"symbols": ["AAPL"]},
+        )
+
+        self.assertEqual(response.status, 402)
+        service.create_job.assert_not_awaited()
+
+    async def test_free_routes_are_not_routed(self) -> None:
+        handler = make_handler(AsyncMock())
+
+        for method in ("GET", "POST"):
+            with self.subTest(method=method):
+                response = await call_handler(
+                    handler,
+                    method=method,
+                    path="/x402/free",
+                    json_body={"symbol": "AAPL"} if method == "POST" else None,
+                )
+                self.assertEqual(response.status, 404)
+
+    @unittest.skip("promotional access was removed")
     async def test_promotional_create_without_payment_returns_202(
         self,
     ) -> None:
@@ -462,6 +522,7 @@ class X402AsyncHandlerTests(unittest.IsolatedAsyncioTestCase):
         service.create_job.assert_not_awaited()
         client.payment_extras.assert_not_awaited()
 
+    @unittest.skip("promotional access was removed")
     async def test_promotional_price_is_zero_without_b402_lookup(self) -> None:
         service = AsyncMock()
         service.promo_free = True
@@ -490,6 +551,7 @@ class X402AsyncHandlerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(response.json["facilitator"])
         client.payment_extras.assert_not_awaited()
 
+    @unittest.skip("promotional access was removed")
     async def test_promotional_create_receives_trusted_source_ip(self) -> None:
         service = AsyncMock()
         service.promo_free = True
@@ -515,6 +577,7 @@ class X402AsyncHandlerTests(unittest.IsolatedAsyncioTestCase):
         )
         service.create_job.assert_not_awaited()
 
+    @unittest.skip("promotional access was removed")
     async def test_promotional_create_ignores_payment_header(self) -> None:
         service = AsyncMock()
         service.promo_free = True
@@ -546,6 +609,7 @@ class X402AsyncHandlerTests(unittest.IsolatedAsyncioTestCase):
         service.create_job.assert_not_awaited()
         client.payment_extras.assert_not_awaited()
 
+    @unittest.skip("promotional access was removed")
     async def test_promotional_create_without_source_ip_fails_closed(
         self,
     ) -> None:
@@ -573,6 +637,7 @@ class X402AsyncHandlerTests(unittest.IsolatedAsyncioTestCase):
         )
         service.create_job.assert_not_awaited()
 
+    @unittest.skip("promotional access was removed")
     async def test_promotional_rate_limit_maps_to_429_with_retry_after(
         self,
     ) -> None:
@@ -851,6 +916,7 @@ class X402AsyncHandlerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.json["errorCode"], "payment_rejected")
         service.create_job.assert_not_awaited()
 
+    @unittest.skip("free routes were removed")
     async def test_paid_and_free_handlers_reject_malformed_nested_proofs(
         self,
     ) -> None:
@@ -965,6 +1031,7 @@ class X402AsyncHandlerTests(unittest.IsolatedAsyncioTestCase):
                 name,
             )
 
+    @unittest.skip("free routes were removed")
     async def test_free_handler_rejects_malformed_numeric_proof(self) -> None:
         proof = json.loads(
             base64.b64decode(
@@ -999,6 +1066,7 @@ class X402AsyncHandlerTests(unittest.IsolatedAsyncioTestCase):
             },
         )
 
+    @unittest.skip("free routes were removed")
     async def test_free_handler_rejects_a_thousand_digit_value(self) -> None:
         proof = json.loads(
             base64.b64decode(
@@ -1500,6 +1568,7 @@ class X402AsyncHandlerTests(unittest.IsolatedAsyncioTestCase):
                     response.json["x402_routes"],
                 )
 
+    @unittest.skip("free routes were removed")
     async def test_free_post_still_uses_original_handler(self) -> None:
         handler = make_handler(AsyncMock())
         with patch.object(
@@ -1520,6 +1589,7 @@ class X402AsyncHandlerTests(unittest.IsolatedAsyncioTestCase):
 
         free.assert_awaited_once()
 
+    @unittest.skip("free routes were removed")
     async def test_free_challenge_uses_trusted_public_resource_url(self) -> None:
         response = await call_handler(
             make_handler(AsyncMock()),
@@ -1537,6 +1607,7 @@ class X402AsyncHandlerTests(unittest.IsolatedAsyncioTestCase):
             "https://gateway.example/testnet/x402/free",
         )
 
+    @unittest.skip("free routes were removed")
     async def test_free_post_returns_buffered_json_report(self) -> None:
         handler = X402Handler(
             AsyncMock(),
@@ -1572,6 +1643,7 @@ class X402AsyncHandlerTests(unittest.IsolatedAsyncioTestCase):
             "format": "markdown",
         })
 
+    @unittest.skip("free routes were removed")
     async def test_free_post_returns_safe_error_when_quote_generation_fails(self) -> None:
         async def failed_work(symbol: str):
             yield "error", {"message": "private upstream failure"}

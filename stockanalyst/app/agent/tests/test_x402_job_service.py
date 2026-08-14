@@ -23,7 +23,6 @@ from x402_job_service import (
     load_job_token_secret,
 )
 from x402_job_store import JobConflict, StoredJob
-from x402_promo import PromoRateLimiter
 from x402_settlement import SettlementOutcome
 from x402_tokens import U_TOKEN, USD1_TOKEN, USDC_TOKEN
 from x402_verify import CHAIN_ID, VerifiedPayment, validate_payment_proof
@@ -41,7 +40,6 @@ def verified_payment(
     *,
     valid_before: int = NOW // 1000 + 600,
     token=U_TOKEN,
-    promotional: bool = False,
 ) -> VerifiedPayment:
     return VerifiedPayment(
         proof={},
@@ -54,7 +52,6 @@ def verified_payment(
         nonce_bytes=bytes.fromhex(NONCE.removeprefix("0x")),
         asset=token.address,
         token_symbol=token.symbol,
-        promotional=promotional,
         transfer_method=token.transfer_method,
     )
 
@@ -365,8 +362,6 @@ def make_service(
     heartbeat_sleep: Any = asyncio.sleep,
     accounting_sleep: Any = None,
     accounting_retry_attempts: int = 3,
-    promo_free: bool = False,
-    promo_limiter: PromoRateLimiter | None = None,
     accept_new_jobs: bool = True,
 ) -> X402JobService:
     async def idle_stream(
@@ -397,8 +392,6 @@ def make_service(
         heartbeat_sleep=heartbeat_sleep,
         accounting_sleep=accounting_sleep or immediate_accounting_sleep,
         accounting_retry_attempts=accounting_retry_attempts,
-        promo_free=promo_free,
-        promo_limiter=promo_limiter,
         accept_new_jobs=accept_new_jobs,
     )
 
@@ -577,38 +570,6 @@ class X402JobIdentityTests(unittest.IsolatedAsyncioTestCase):
             f"b402:{CHAIN_ID}:{ADDRESS}:{NONCE}:{normalized_asset}",
         )
 
-    async def test_paid_u_legacy_usd1_and_promotional_identities_are_isolated(
-        self,
-    ) -> None:
-        service = make_service()
-        paid_u = service.derive_identity(
-            verified_payment(token=U_TOKEN, promotional=False)
-        )
-        paid_usd1 = service.derive_identity(
-            verified_payment(token=USD1_TOKEN, promotional=False)
-        )
-        promo_u = service.derive_identity(
-            verified_payment(token=U_TOKEN, promotional=True)
-        )
-        legacy_key = hashlib.sha256(
-            f"{CHAIN_ID}:{ADDRESS}:{NONCE}".encode()
-        ).hexdigest()
-
-        self.assertEqual(paid_u.job_id, f"x402_{legacy_key[:32]}")
-        self.assertNotEqual(paid_u.job_id, paid_usd1.job_id)
-        self.assertNotEqual(paid_u.job_id, promo_u.job_id)
-
-    async def test_promotional_identity_is_asset_scoped(self) -> None:
-        service = make_service()
-        promo_u = service.derive_identity(
-            verified_payment(token=U_TOKEN, promotional=True)
-        )
-        promo_usd1 = service.derive_identity(
-            verified_payment(token=USD1_TOKEN, promotional=True)
-        )
-
-        self.assertNotEqual(promo_u.job_id, promo_usd1.job_id)
-
     async def test_identity_rejects_unknown_asset(self) -> None:
         service = make_service()
         payment = replace(
@@ -730,6 +691,7 @@ class X402JobIdentityTests(unittest.IsolatedAsyncioTestCase):
             await service.create_job(PROOF, REQUEST)
 
 
+@unittest.skip("promotional jobs were removed")
 class X402PromotionalJobCreationTests(unittest.IsolatedAsyncioTestCase):
     async def test_proofless_create_is_queued_without_payment_side_effects(
         self,

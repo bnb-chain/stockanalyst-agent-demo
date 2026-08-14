@@ -32,7 +32,6 @@ from x402_job_service import (
     load_job_token_secret,
 )
 from x402_job_store import X402JobStore
-from x402_promo import promo_free_mode
 from x402_tokens import U_TOKEN, USD1_TOKEN, USDT_TOKEN, token_by_asset
 from x402_verify import U_TOKEN_ADDRESS, VerifiedPayment
 
@@ -70,7 +69,6 @@ def _load_runtime_functions(
         "U_TOKEN_ADDRESS": U_TOKEN_ADDRESS,
         "token_by_asset": token_by_asset,
         "load_job_token_secret": load_job_token_secret,
-        "promo_free_mode": promo_free_mode,
         "_settle_via_facilitator": settle or AsyncMock(),
         "report_competition_call": report or AsyncMock(return_value=True),
         "get_8183_client": get_client or (lambda: None),
@@ -322,7 +320,7 @@ class X402JobRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(service._report, report)
         self.assertIs(service._stream_work, stream_work)
 
-    def test_configured_factory_enables_only_exact_promotional_flag(self) -> None:
+    def test_legacy_promo_environment_variable_is_ignored(self) -> None:
         build = _load_runtime_functions()["build_x402_job_service"]
 
         service = build(
@@ -336,18 +334,7 @@ class X402JobRuntimeTests(unittest.IsolatedAsyncioTestCase):
         )
 
         assert service is not None
-        self.assertTrue(service.promo_free)
-
-        with self.assertRaisesRegex(RuntimeError, "X402_PROMO_FREE_MODE"):
-            build(
-                {
-                    "X402_JOB_S3_BUCKET": "private-jobs",
-                    "X402_JOB_TOKEN_SECRET": "x" * 32,
-                    "X402_PROMO_FREE_MODE": "true",
-                },
-                stream_work=AsyncMock(),
-                s3_client=FakeS3(),
-            )
+        self.assertIsInstance(service, X402JobService)
 
     async def test_stale_recovery_queries_the_payment_token_contract(self) -> None:
         for selected_token in (U_TOKEN, USD1_TOKEN):
