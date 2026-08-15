@@ -26,7 +26,7 @@ from x402_job_service import (
 )
 from x402_job_store import JobConflict, StoredJob, StoredWalletRateLimit
 from x402_settlement import SettlementOutcome
-from x402_tokens import U_TOKEN, USD1_TOKEN, USDC_TOKEN
+from x402_tokens import U_TOKEN, USD1_TOKEN, USDC_TOKEN, USDT_TOKEN
 from x402_verify import (
     CHAIN_ID,
     VerifiedPayment,
@@ -47,6 +47,13 @@ REQUEST = {"symbols": "bnb, btc-usd"}
 NOW = 2_000_000_000_000
 STALE_TIME = NOW + 120_001
 TOKEN_SECRET = b"test-only-token-secret-with-32-bytes"
+
+
+def expected_competition_event_id(token=U_TOKEN) -> str:
+    material = (
+        f"{ADDRESS.lower()}:{NONCE.lower()}:{token.address.lower()}"
+    ).encode("ascii")
+    return f"b402:{CHAIN_ID}:{hashlib.sha256(material).hexdigest()}"
 
 
 def verified_payment(
@@ -625,7 +632,7 @@ class X402JobIdentityTests(unittest.IsolatedAsyncioTestCase):
         self.assertRegex(first.job_id, r"^x402_[0-9a-f]{32}$")
         self.assertEqual(len(base64.urlsafe_b64decode(first.job_token + "==")), 32)
 
-    async def test_u_identity_and_event_keep_legacy_material(self) -> None:
+    async def test_u_identity_keeps_legacy_material(self) -> None:
         service = make_service()
         payment = verified_payment(token=U_TOKEN)
         legacy_material = f"{CHAIN_ID}:{ADDRESS}:{NONCE}".encode()
@@ -635,12 +642,8 @@ class X402JobIdentityTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(identity.payment_key, expected_key)
         self.assertEqual(identity.job_id, f"x402_{expected_key[:32]}")
-        self.assertEqual(
-            service._competition_event_id(payment),
-            f"b402:{CHAIN_ID}:{ADDRESS}:{NONCE}",
-        )
 
-    async def test_usd1_identity_and_event_are_asset_scoped(self) -> None:
+    async def test_usd1_identity_is_asset_scoped(self) -> None:
         service = make_service()
         u_payment = verified_payment(token=U_TOKEN)
         usd1_payment = verified_payment(token=USD1_TOKEN)
@@ -663,9 +666,52 @@ class X402JobIdentityTests(unittest.IsolatedAsyncioTestCase):
             service.derive_identity(equivalent_usd1),
             usd1_identity,
         )
-        self.assertEqual(
-            service._competition_event_id(usd1_payment),
-            f"b402:{CHAIN_ID}:{ADDRESS}:{NONCE}:{normalized_asset}",
+
+    async def test_competition_event_ids_use_one_compact_hash_format(self) -> None:
+        service = make_service()
+
+        for token in (U_TOKEN, USD1_TOKEN, USDC_TOKEN, USDT_TOKEN):
+            with self.subTest(token=token.symbol):
+                payment = verified_payment(token=token)
+                material = (
+                    f"{ADDRESS.lower()}:{NONCE.lower()}:"
+                    f"{token.address.lower()}"
+                ).encode("ascii")
+                expected = (
+                    f"b402:{CHAIN_ID}:"
+                    f"{hashlib.sha256(material).hexdigest()}"
+                )
+
+                actual = service._competition_event_id(payment)
+
+                self.assertEqual(actual, expected)
+                self.assertEqual(service._competition_event_id(payment), actual)
+                self.assertEqual(len(actual), 72)
+                self.assertNotIn(ADDRESS.lower(), actual)
+                self.assertNotIn(NONCE.lower(), actual)
+                self.assertNotIn(token.address.lower(), actual)
+
+    async def test_competition_event_id_is_scoped_by_payment_parts(self) -> None:
+        service = make_service()
+        payment = verified_payment(token=U_TOKEN)
+        original = service._competition_event_id(payment)
+
+        different_wallet = replace(payment, from_address="0x" + "33" * 20)
+        different_nonce = replace(
+            payment,
+            nonce="0x" + "44" * 32,
+            nonce_bytes=bytes.fromhex("44" * 32),
+        )
+        different_asset = verified_payment(token=USD1_TOKEN)
+
+        self.assertNotEqual(
+            service._competition_event_id(different_wallet), original
+        )
+        self.assertNotEqual(
+            service._competition_event_id(different_nonce), original
+        )
+        self.assertNotEqual(
+            service._competition_event_id(different_asset), original
         )
 
     async def test_identity_rejects_unknown_asset(self) -> None:
@@ -740,7 +786,7 @@ class X402JobIdentityTests(unittest.IsolatedAsyncioTestCase):
 
         await wait_for_accounting(service)
         report.assert_awaited_once_with(
-            event_id=f"b402:{CHAIN_ID}:{ADDRESS}:{NONCE}",
+            event_id=expected_competition_event_id(),
             address=ADDRESS,
             called_at=ANY,
         )
@@ -2171,7 +2217,7 @@ class X402JobSettlementTests(unittest.IsolatedAsyncioTestCase):
         await service.wait_for_idle()
 
         durable = store.jobs[created.job_id].record
-        expected_event = f"b402:{CHAIN_ID}:{ADDRESS}:{NONCE}"
+        expected_event = expected_competition_event_id()
         self.assertEqual(
             store.accounting_markers[created.job_id],
             {
@@ -4387,7 +4433,7 @@ class X402WalletAdmissionContinuationTests(
         self.assertEqual(record["settledAt"], NOW)
         self.assertEqual(retried.job_id, result.job_id)
         report.assert_awaited_once_with(
-            event_id=f"b402:{CHAIN_ID}:{ADDRESS}:{NONCE}",
+            event_id=expected_competition_event_id(),
             address=ADDRESS,
             called_at=NOW,
         )

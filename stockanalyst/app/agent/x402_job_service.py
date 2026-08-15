@@ -18,7 +18,7 @@ from typing import Any, Literal
 from prompt_builder import _build_stock_analysis_prompt
 from x402_job_store import JobConflict, StoredJob, X402JobStore
 from x402_settlement import SettlementOutcome
-from x402_tokens import U_TOKEN, token_by_asset
+from x402_tokens import token_by_asset
 from x402_verify import (
     CHAIN_ID,
     LEGACY_PAID_AMOUNT_FOR_RECOVERY,
@@ -1235,12 +1235,11 @@ class X402JobService:
             canonical_nonce,
             canonical_asset,
         ) = self._canonical_payment_parts(payment)
-        legacy = f"b402:{CHAIN_ID}:{canonical_address}:{canonical_nonce}"
-        # Competition deduplication follows the same U-compatible transition
-        # as job identity: U remains byte-for-byte stable; non-U is asset scoped.
-        if canonical_asset == U_TOKEN.address.lower():
-            return legacy
-        return f"{legacy}:{canonical_asset}"
+        material = (
+            f"{canonical_address}:{canonical_nonce}:{canonical_asset}"
+        ).encode("ascii")
+        digest = hashlib.sha256(material).hexdigest()
+        return f"b402:{CHAIN_ID}:{digest}"
 
     async def _retry_accounting(
         self,
