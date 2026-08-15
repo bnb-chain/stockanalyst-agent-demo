@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
-import json
 import threading
 import unittest
 from dataclasses import replace
@@ -12,7 +11,6 @@ from unittest.mock import ANY, AsyncMock, Mock, patch
 
 import httpx
 
-from tests.test_x402_permit2 import encoded_proof, permit2_proof
 from tests.test_x402_verify import NOW as SIGNED_NOW
 from tests.test_x402_verify import signed_proof
 from x402_handler import _settle_generic
@@ -30,7 +28,6 @@ from x402_tokens import U_TOKEN, USD1_TOKEN, USDC_TOKEN, USDT_TOKEN
 from x402_verify import (
     CHAIN_ID,
     VerifiedPayment,
-    validate_legacy_paid_payment_proof,
     validate_payment_proof,
 )
 from x402_wallet_rate_limit import (
@@ -65,7 +62,7 @@ def verified_payment(
         proof={},
         from_address=ADDRESS,
         to_address="0x2222222222222222222222222222222222222222",
-        value=210_000_000_000_000_000,
+        value=100_000_000_000_000_000,
         valid_after=NOW // 1000 - 60,
         valid_before=valid_before,
         nonce=NONCE,
@@ -4017,132 +4014,25 @@ class X402WalletAdmissionLifecycleTests(unittest.IsolatedAsyncioTestCase):
         settle.assert_not_awaited()
 
 
-class X402LegacyPaidDurableRecoveryTests(unittest.IsolatedAsyncioTestCase):
-    async def _seed_legacy_job(
-        self,
-        service: X402JobService,
-        store: MemoryJobStore,
-        proof: str,
-        request: dict[str, Any] = REQUEST,
-    ) -> tuple[VerifiedPayment, CreateJobResult]:
-        payment, reason = validate_legacy_paid_payment_proof(
-            proof,
-            now=NOW // 1_000,
-            allow_expired=True,
-        )
-        self.assertEqual(reason, "")
-        assert payment is not None
-        identity = service.derive_identity(payment)
-        normalized = service._normalize_request(request)
-        stored = await store.create(
-            {
-                "version": 1,
-                "jobId": identity.job_id,
-                "paymentKey": identity.payment_key,
-                "paymentStatus": "settled",
-                "paymentMode": "paid",
-                "asset": payment.asset.lower(),
-                "paymentProofDigest": hashlib.sha256(
-                    proof.encode("ascii")
-                ).hexdigest(),
-                "settlementReference": "0xlegacy",
-                "address": payment.from_address,
-                "status": "succeeded",
-                "request": normalized,
-                "jobTokenHash": identity.job_token_hash,
-                "competitionEventId": "legacy-event",
-                "settledAt": NOW - 1,
-                "attempt": 1,
-                "leaseOwner": None,
-                "leaseExpiresAt": None,
-                "createdAt": NOW - 1_000,
-                "updatedAt": NOW - 1,
-                "expiresAt": NOW + 86_400_000,
-                "errorCode": None,
-                "retryable": None,
-            }
-        )
-        assert stored is not None
-        return payment, CreateJobResult(
-            job_id=identity.job_id,
-            job_token=identity.job_token,
-            status="succeeded",
-            expires_at=NOW + 86_400_000,
-        )
-
-    async def test_existing_legacy_eip3009_job_recovers_without_side_effects(
+class X402CurrentPriceBoundaryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_non_current_amount_is_rejected_without_side_effects(
         self,
     ) -> None:
-        legacy_amount = 210_000_000_000_000_000
+        class ReadCountingStore(MemoryJobStore):
+            def __init__(self) -> None:
+                super().__init__()
+                self.read_calls = 0
+
+            async def read(self, job_id: str) -> StoredJob | None:
+                self.read_calls += 1
+                return self.jobs.get(job_id)
+
+        wrong_amount = 100_000_000_000_000_001
         proof = signed_proof(
-            value=legacy_amount,
-            accepted_overrides={"amount": str(legacy_amount)},
+            value=wrong_amount,
+            accepted_overrides={"amount": str(wrong_amount)},
         )
-        store = MemoryJobStore()
-        limiter = AsyncMock(spec=WalletRateLimiter)
-        settle = AsyncMock()
-        report = AsyncMock()
-        service = make_service(
-            store=store,
-            rate_limiter=limiter,
-            settle=settle,
-            report=report,
-        )
-        _payment, expected = await self._seed_legacy_job(
-            service,
-            store,
-            proof,
-        )
-
-        with patch.object(service, "_spawn") as spawn:
-            recovered = await service.create_job(proof, REQUEST)
-
-        self.assertEqual(recovered.job_id, expected.job_id)
-        self.assertEqual(recovered.job_token, expected.job_token)
-        self.assertEqual(recovered.status, "succeeded")
-        limiter.reserve.assert_not_awaited()
-        limiter.commit.assert_not_awaited()
-        limiter.release.assert_not_awaited()
-        settle.assert_not_awaited()
-        report.assert_not_awaited()
-        spawn.assert_not_called()
-
-    async def test_existing_legacy_permit2_job_recovers_without_side_effects(
-        self,
-    ) -> None:
-        legacy_proof, _accepted = permit2_proof(
-            USDT_TOKEN,
-            amount="210000000000000000",
-        )
-        proof = encoded_proof(legacy_proof)
-        store = MemoryJobStore()
-        limiter = AsyncMock(spec=WalletRateLimiter)
-        settle = AsyncMock()
-        report = AsyncMock()
-        service = make_service(
-            store=store,
-            rate_limiter=limiter,
-            settle=settle,
-            report=report,
-        )
-        _payment, expected = await self._seed_legacy_job(
-            service,
-            store,
-            proof,
-        )
-
-        with patch.object(service, "_spawn") as spawn:
-            recovered = await service.create_job(proof, REQUEST)
-
-        self.assertEqual(recovered.job_id, expected.job_id)
-        self.assertEqual(recovered.status, "succeeded")
-        limiter.reserve.assert_not_awaited()
-        settle.assert_not_awaited()
-        report.assert_not_awaited()
-        spawn.assert_not_called()
-
-    async def test_legacy_usdc_is_rejected_without_side_effects(self) -> None:
-        store = MemoryJobStore()
+        store = ReadCountingStore()
         limiter = AsyncMock(spec=WalletRateLimiter)
         settle = AsyncMock()
         report = AsyncMock()
@@ -4153,70 +4043,21 @@ class X402LegacyPaidDurableRecoveryTests(unittest.IsolatedAsyncioTestCase):
             report=report,
         )
 
-        for version in ("1", "2"):
-            with self.subTest(version=version):
-                legacy_proof, _accepted = permit2_proof(
-                    USDC_TOKEN,
-                    amount="210000000000000000",
-                    extra_fields={"version": version},
-                )
-                proof = encoded_proof(legacy_proof)
+        with (
+            patch.object(service, "_spawn") as spawn,
+            self.assertRaises(X402JobError) as rejected,
+        ):
+            await service.create_job(proof, REQUEST)
 
-                with self.assertRaises(X402JobError) as rejected:
-                    await service.create_job(proof, REQUEST)
-
-                self.assertEqual(rejected.exception.code, "payment_rejected")
-
+        self.assertEqual(rejected.exception.code, "payment_rejected")
+        self.assertEqual(store.read_calls, 0)
         self.assertEqual(store.create_calls, 0)
         limiter.reserve.assert_not_awaited()
         limiter.commit.assert_not_awaited()
         limiter.release.assert_not_awaited()
         settle.assert_not_awaited()
         report.assert_not_awaited()
-
-    async def test_legacy_recovery_rejects_no_job_tamper_and_request_mismatch(
-        self,
-    ) -> None:
-        legacy_amount = 210_000_000_000_000_000
-        proof = signed_proof(
-            value=legacy_amount,
-            accepted_overrides={"amount": str(legacy_amount)},
-        )
-        store = MemoryJobStore()
-        limiter = AsyncMock(spec=WalletRateLimiter)
-        settle = AsyncMock()
-        report = AsyncMock()
-        service = make_service(
-            store=store,
-            rate_limiter=limiter,
-            settle=settle,
-            report=report,
-        )
-
-        with self.assertRaises(X402JobError) as no_job:
-            await service.create_job(proof, REQUEST)
-        self.assertEqual(no_job.exception.code, "payment_rejected")
-
-        await self._seed_legacy_job(service, store, proof)
-        decoded = json.loads(base64.b64decode(proof))
-        decoded["resource"]["description"] = "tampered"
-        tampered = base64.b64encode(
-            json.dumps(decoded, separators=(",", ":")).encode()
-        ).decode()
-        for candidate, request in (
-            (tampered, REQUEST),
-            (proof, {"symbols": ["ETH"]}),
-        ):
-            with self.subTest(candidate=candidate == tampered, request=request):
-                with self.assertRaises(X402JobError) as rejected:
-                    await service.create_job(candidate, request)
-                self.assertEqual(rejected.exception.code, "payment_rejected")
-
-        limiter.reserve.assert_not_awaited()
-        limiter.commit.assert_not_awaited()
-        limiter.release.assert_not_awaited()
-        settle.assert_not_awaited()
-        report.assert_not_awaited()
+        spawn.assert_not_called()
 
 
 class X402WalletAdmissionContinuationTests(

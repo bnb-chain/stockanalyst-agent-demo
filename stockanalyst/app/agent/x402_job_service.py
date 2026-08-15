@@ -21,9 +21,7 @@ from x402_settlement import SettlementOutcome
 from x402_tokens import token_by_asset
 from x402_verify import (
     CHAIN_ID,
-    LEGACY_PAID_AMOUNT_FOR_RECOVERY,
     VerifiedPayment,
-    validate_legacy_paid_payment_proof,
     validate_payment_proof,
 )
 from x402_wallet_rate_limit import (
@@ -519,20 +517,7 @@ class X402JobService:
                     raise X402JobError("payment_rejected")
                 expired_recovery = True
             else:
-                legacy_payment, _legacy_reason = (
-                    validate_legacy_paid_payment_proof(
-                        proof_header,
-                        now=now // 1000,
-                        allow_expired=True,
-                    )
-                )
-                if legacy_payment is None:
-                    raise X402JobError("payment_rejected")
-                return await self._recover_legacy_paid_job(
-                    proof_header,
-                    request,
-                    legacy_payment,
-                )
+                raise X402JobError("payment_rejected")
         proof_digest = self._proof_digest(proof_header)
         identity = self.derive_identity(payment)
         stored = await self._store.read(identity.job_id)
@@ -676,50 +661,6 @@ class X402JobService:
         )
         stored = await self._retry_accounting(stored, payment)
         return self._create_result_and_spawn(identity, stored)
-
-    async def _recover_legacy_paid_job(
-        self,
-        proof_header: str,
-        request: dict[str, Any],
-        payment: VerifiedPayment,
-    ) -> CreateJobResult:
-        try:
-            normalized_request = self._normalize_request(request)
-            proof_digest = self._proof_digest(proof_header)
-            identity = self.derive_identity(payment)
-            stored = await self._store.read(identity.job_id)
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            raise X402JobError("payment_rejected") from None
-        if stored is None:
-            raise X402JobError("payment_rejected")
-        record = stored.record
-        token = token_by_asset(payment.asset)
-        if (
-            payment.value != LEGACY_PAID_AMOUNT_FOR_RECOVERY
-            or token is None
-            or payment.transfer_method != token.transfer_method
-            or record.get("version") != 1
-            or record.get("jobId") != identity.job_id
-            or record.get("paymentKey") != identity.payment_key
-            or record.get("jobTokenHash") != identity.job_token_hash
-            or record.get("paymentMode") != "paid"
-            or str(record.get("asset") or "").lower()
-            != payment.asset.lower()
-            or str(record.get("address") or "").lower()
-            != payment.from_address.lower()
-            or record.get("paymentProofDigest") != proof_digest
-            or record.get("request") != normalized_request
-            or record.get("paymentStatus")
-            not in {"settling", "settled", "failed"}
-            or record.get("status")
-            not in {"settling", "queued", "running", "succeeded", "failed"}
-            or type(record.get("expiresAt")) is not int
-            or int(record["expiresAt"]) <= int(self._clock())
-        ):
-            raise X402JobError("payment_rejected")
-        return self._create_result(identity, stored)
 
     def _create_result_and_spawn(
         self,

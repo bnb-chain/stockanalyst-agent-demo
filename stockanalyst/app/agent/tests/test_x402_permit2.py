@@ -147,48 +147,6 @@ def permit2_proof(
     return proof, accepted
 
 
-def test_legacy_paid_validator_accepts_real_former_usdt_amount_only() -> None:
-    legacy_amount = "210000000000000000"
-    proof, _accepted = permit2_proof(
-        USDT_TOKEN,
-        amount=legacy_amount,
-    )
-
-    canonical, _reason = verify.validate_payment_proof(
-        encoded_proof(proof),
-        now=NOW,
-    )
-    recovered, reason = verify.validate_legacy_paid_payment_proof(
-        encoded_proof(proof),
-        now=NOW,
-    )
-
-    assert canonical is None
-    assert reason == ""
-    assert recovered is not None
-    assert recovered.value == int(legacy_amount)
-    assert recovered.transfer_method == "permit2-exact"
-
-
-@pytest.mark.parametrize("version", ["1", "2"])
-def test_legacy_paid_validator_rejects_usdc_for_every_domain_version(
-    version: str,
-) -> None:
-    proof, _accepted = permit2_proof(
-        USDC_TOKEN,
-        amount="210000000000000000",
-        extra_fields={"version": version},
-    )
-
-    recovered, reason = verify.validate_legacy_paid_payment_proof(
-        encoded_proof(proof),
-        now=NOW,
-    )
-
-    assert recovered is None
-    assert reason == "payment requirement is missing or invalid"
-
-
 def encoded_proof(proof: dict[str, Any]) -> str:
     return base64.b64encode(
         json.dumps(proof, separators=(",", ":")).encode()
@@ -534,7 +492,7 @@ def test_signature_from_a_different_signer_is_rejected() -> None:
         (("permitted", "amount"), str(2**256)),
         (("permitted", "amount"), True),
         (("permitted", "amount"), float(verify.PRICE_WEI)),
-        (("permitted", "amount"), "0210000000000000000"),
+        (("permitted", "amount"), "0100000000000000000"),
         (("nonce",), "-1"),
         (("nonce",), str(2**256)),
         (("nonce",), False),

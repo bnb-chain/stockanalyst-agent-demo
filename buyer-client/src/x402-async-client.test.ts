@@ -178,14 +178,14 @@ function fakeClock(start = 1_000): {
 }
 
 function proofExpiringAt(validBeforeSeconds: number): string {
-  return Buffer.from(JSON.stringify({
-    x402Version: 2,
-    payload: {
-      authorization: {
-        validBefore: String(validBeforeSeconds),
-      },
-    },
-  })).toString("base64");
+  const proof = JSON.parse(
+    Buffer.from(
+      eip3009Proof(paymentChallenge({ token: "U" })),
+      "base64",
+    ).toString("utf8"),
+  ) as { payload: { authorization: { validBefore: string } } };
+  proof.payload.authorization.validBefore = String(validBeforeSeconds);
+  return Buffer.from(JSON.stringify(proof)).toString("base64");
 }
 
 function permit2Proof(
@@ -958,101 +958,49 @@ test("pending-only startup ignores current payment env and resubmits the identic
   }
 });
 
-test("runAsyncStartup recovers a legacy 0.21 paid pending record with a safe summary", async () => {
+test("runAsyncStartup rejects a non-current pending amount before submission", async () => {
   const runStartup = runAsyncStartup();
-  const directory = mkdtempSync(join(tmpdir(), "x402-startup-legacy-paid-recovery-"));
+  const directory = mkdtempSync(join(tmpdir(), "x402-startup-invalid-amount-"));
   const pendingPath = join(directory, "pending.json");
   const receiptPath = join(directory, "receipt.json");
   const request = { symbols: ["AAPL"], analysis_type: "comprehensive" };
-  const legacyProof = eip3009Proof(paymentChallenge({
+  const invalidProof = eip3009Proof(paymentChallenge({
     token: "U",
-    accepted: { amount: "210000000000000000" },
+    accepted: { amount: "100000000000000001" },
   }));
-  const pending = createPendingRecord(legacyProof, request);
-  writeFileSync(pendingPath, JSON.stringify({ ...pending, promotional: false }));
-  const logs: string[] = [];
-  let submittedProof = "";
+  const pending = createPendingRecord(invalidProof, request);
+  writeFileSync(pendingPath, JSON.stringify(pending));
+  let fetchCalls = 0;
   try {
-    const result = await runStartup({
-      endpoint: ENDPOINT,
-      receiptPath,
-      pendingPath,
-      env: { X402_PAYMENT_TOKEN: "invalid-after-signing" },
-      dependencies: {
-        loadContext: async () => {
-          throw new Error("legacy recovery must not load context");
+    await assert.rejects(
+      runStartup({
+        endpoint: ENDPOINT,
+        receiptPath,
+        pendingPath,
+        env: { X402_PAYMENT_TOKEN: "invalid-after-signing" },
+        dependencies: {
+          loadContext: async () => {
+            throw new Error("invalid pending must not load context");
+          },
+          loadWallet: async () => {
+            throw new Error("invalid pending must not decrypt");
+          },
+          createPermit2AllowanceReader: () => {
+            throw new Error("invalid pending must not preflight");
+          },
+          buildPaymentProof: async () => {
+            throw new Error("invalid pending must not sign");
+          },
+          fetch: async () => {
+            fetchCalls += 1;
+            return json(receipt(), { status: 202 });
+          },
+          log: () => undefined,
         },
-        loadWallet: async () => {
-          throw new Error("legacy recovery must not decrypt");
-        },
-        createPermit2AllowanceReader: () => {
-          throw new Error("legacy recovery must not preflight");
-        },
-        buildPaymentProof: async () => {
-          throw new Error("legacy recovery must not sign");
-        },
-        fetch: async (_input, init) => {
-          submittedProof = new Headers(init?.headers).get("PAYMENT-SIGNATURE") ?? "";
-          return json(receipt(), { status: 202 });
-        },
-        log: (message) => logs.push(message),
-      },
-    });
-    assert.equal(result.receipt.jobId, JOB_ID);
-    assert.equal(submittedProof, legacyProof);
-    assert.ok(logs.includes("Payment: legacy paid request (submitted)"));
-    assert.doesNotMatch(
-      logs.join("\n"),
-      /210000000000000000|private-eip3009-signature|nonce|d10bddc/i,
+      }),
+      /Stored pending x402 request is invalid/,
     );
-  } finally {
-    rmSync(directory, { recursive: true, force: true });
-  }
-});
-
-test("runAsyncStartup recovers a legacy 0.21 Permit2 pending proof without preflight or signing", async () => {
-  const runStartup = runAsyncStartup();
-  const directory = mkdtempSync(join(tmpdir(), "x402-startup-legacy-permit2-recovery-"));
-  const pendingPath = join(directory, "pending.json");
-  const receiptPath = join(directory, "receipt.json");
-  const request = { symbols: ["AAPL"], analysis_type: "comprehensive" };
-  const legacyProof = permit2Proof(paymentChallenge({
-    token: "USDC",
-    accepted: { amount: "210000000000000000" },
-  }));
-  persistPendingCreate(pendingPath, createPendingRecord(legacyProof, request));
-  let submittedProof = "";
-  try {
-    const result = await runStartup({
-      endpoint: ENDPOINT,
-      receiptPath,
-      pendingPath,
-      env: {
-        X402_PAYMENT_TOKEN: "invalid-after-signing",
-        BSC_RPC_URL: "not a URL",
-      },
-      dependencies: {
-        loadContext: async () => {
-          throw new Error("legacy recovery must not load context");
-        },
-        loadWallet: async () => {
-          throw new Error("legacy recovery must not decrypt");
-        },
-        createPermit2AllowanceReader: () => {
-          throw new Error("legacy recovery must not preflight");
-        },
-        buildPaymentProof: async () => {
-          throw new Error("legacy recovery must not sign");
-        },
-        fetch: async (_input, init) => {
-          submittedProof = new Headers(init?.headers).get("PAYMENT-SIGNATURE") ?? "";
-          return json(receipt(), { status: 202 });
-        },
-        log: () => undefined,
-      },
-    });
-    assert.equal(result.receipt.jobId, JOB_ID);
-    assert.equal(submittedProof, legacyProof);
+    assert.equal(fetchCalls, 0);
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }
@@ -1314,39 +1262,24 @@ test("pending-create recovery retains the paid-only access summary", async () =>
   }
 });
 
-test("legacy paid pending records normalize false promotional markers and reject promotional state", async () => {
-  const directory = mkdtempSync(join(tmpdir(), "x402-paid-pending-compat-"));
+test("paid pending records reject every promotional marker", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "x402-paid-pending-marker-"));
   const pendingPath = join(directory, "pending.json");
-  const receiptPath = join(directory, "receipt.json");
   const now = Date.now();
   const request = { symbols: ["AAPL"] };
   const paidProof = eip3009Proof(paymentChallenge({ token: "U" }));
   const pending = createPendingRecord(paidProof, request, now);
   try {
-    writeFileSync(pendingPath, JSON.stringify({ ...pending, promotional: false }));
-    const recovered = loadPendingCreate(pendingPath);
-    assert.equal((recovered as unknown as Record<string, unknown>)["promotional"], undefined);
-    let submittedProof = "";
-    await createReceiptFromPending(
-      ENDPOINT,
-      recovered,
-      pendingPath,
-      receiptPath,
-      async (_input, init) => {
-        submittedProof = new Headers(init?.headers).get("PAYMENT-SIGNATURE") ?? "";
-        return json(receipt(), { status: 202 });
-      },
-      { now: () => now, maxAttempts: 1 },
-    );
-    assert.equal(submittedProof, paidProof);
-
-    assert.throws(
-      () => persistPendingCreate(pendingPath, {
-        ...pending,
-        promotional: true,
-      } as unknown as Parameters<typeof persistPendingCreate>[1]),
-      /Stored pending x402 request is invalid/,
-    );
+    for (const promotional of [false, true]) {
+      writeFileSync(
+        pendingPath,
+        JSON.stringify({ ...pending, promotional }),
+      );
+      assert.throws(
+        () => loadPendingCreate(pendingPath),
+        /Stored pending x402 request is invalid/,
+      );
+    }
     assert.throws(
       () => persistPendingCreate(
         pendingPath,
@@ -1614,7 +1547,7 @@ test("buildPaymentProof signs with the selected token contract and domain", asyn
   assert.equal(recovered, wallet.address);
 });
 
-test("all token challenges require exactly 0.1 and reject promotional or legacy amounts", async () => {
+test("all token challenges require exactly 0.1 and reject other amounts", async () => {
   const paidWithoutSigner = paymentChallenge();
   delete (paidWithoutSigner.accepted.extra as { signerAddress?: string }).signerAddress;
   const invalid: Array<[string, PaidPaymentChallenge, PaymentTokenSymbol]> = [
@@ -1635,7 +1568,7 @@ test("all token challenges require exactly 0.1 and reject promotional or legacy 
     );
     assert.equal(selected.accepted.amount, PAID_AMOUNT);
     assert.equal("promotional" in selected, false);
-    for (const amount of ["0", "210000000000000000", "100000000000000001"]) {
+    for (const amount of ["0", "100000000000000001"]) {
       invalid.push([
         `${token} amount ${amount}`,
         paymentChallenge({ token, accepted: { amount } }),
@@ -1671,10 +1604,10 @@ test("all token challenges require exactly 0.1 and reject promotional or legacy 
   }
 });
 
-test("EIP-3009 signing refuses zero and legacy paid amounts", async () => {
+test("EIP-3009 signing refuses zero and non-current paid amounts", async () => {
   const wallet = new Wallet(Wallet.createRandom().privateKey);
   for (const token of ["U", "USD1"] as const) {
-    for (const amount of ["0", "210000000000000000"]) {
+    for (const amount of ["0", "100000000000000001"]) {
       await assert.rejects(
         buildPaymentProof(wallet, paymentChallenge({ token, accepted: { amount } }), 300),
         /exact paid amount/,
@@ -4384,7 +4317,7 @@ test("authoritative wallet 429 replaces proof with a private durable cooldown", 
     const serialized = readFileSync(pendingPath, "utf8");
     assert.doesNotMatch(
       serialized,
-      /paymentProof|signature|nonce|private|jobToken|AAPL|210000000000000000/i,
+      /paymentProof|signature|nonce|private|jobToken|AAPL/i,
     );
     assert.equal(statSync(pendingPath).mode & 0o777, 0o600);
     const state = JSON.parse(serialized) as Record<string, unknown>;

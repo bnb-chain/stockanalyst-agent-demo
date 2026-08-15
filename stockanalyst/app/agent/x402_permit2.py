@@ -189,7 +189,6 @@ def verify_permit2_exact(
     expected_requirement: Mapping[str, Any] | None,
     now: int,
     allow_expired: bool,
-    required_amount: int | None = None,
 ) -> tuple[Any | None, str]:
     """Verify one exact Permit2 proof without consuming its nonce."""
     try:
@@ -202,12 +201,10 @@ def verify_permit2_exact(
             VerifiedPayment,
             build_payment_requirement,
         )
-    if required_amount is None:
-        try:
-            from .x402_verify import PRICE_WEI
-        except ImportError:
-            from x402_verify import PRICE_WEI
-        required_amount = PRICE_WEI
+    try:
+        from .x402_verify import PRICE_WEI
+    except ImportError:
+        from x402_verify import PRICE_WEI
 
     accepted = proof.get("accepted")
     if not isinstance(accepted, dict):
@@ -233,7 +230,7 @@ def verify_permit2_exact(
     canonical = build_payment_requirement(
         token,
         expected_extra,
-        amount=required_amount,
+        amount=PRICE_WEI,
     )
     if (
         expected_requirement is not None
@@ -289,7 +286,7 @@ def verify_permit2_exact(
     accepted_extra_dict = dict(accepted_extra)
     if (
         permitted_token != token.address.lower()
-        or amount != required_amount
+        or amount != PRICE_WEI
         or amount != canonical_uint256(accepted.get("amount"))
         or spender != str(accepted_extra_dict["spenderAddress"]).lower()
         or recipient != str(accepted["payTo"]).lower()

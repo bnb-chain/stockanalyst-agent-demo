@@ -367,40 +367,6 @@ class VerifiedPaymentTests(unittest.TestCase):
         self.assertIsNone(payment)
         self.assertTrue(reason)
 
-    def test_legacy_paid_validator_accepts_only_real_former_eip3009_amount(
-        self,
-    ) -> None:
-        legacy_amount = 210_000_000_000_000_000
-        proof = signed_proof(
-            value=legacy_amount,
-            accepted_overrides={"amount": str(legacy_amount)},
-        )
-
-        canonical, _reason = verify.validate_payment_proof(proof, now=NOW)
-        recovered, reason = verify.validate_legacy_paid_payment_proof(
-            proof,
-            now=NOW,
-        )
-
-        self.assertIsNone(canonical)
-        self.assertEqual(reason, "")
-        self.assertIsNotNone(recovered)
-        assert recovered is not None
-        self.assertEqual(recovered.value, legacy_amount)
-        self.assertEqual(recovered.transfer_method, "eip3009")
-
-        for amount in (0, verify.PRICE_WEI, legacy_amount + 1):
-            with self.subTest(amount=amount):
-                invalid = signed_proof(
-                    value=amount,
-                    accepted_overrides={"amount": str(amount)},
-                )
-                payment, _ = verify.validate_legacy_paid_payment_proof(
-                    invalid,
-                    now=NOW,
-                )
-                self.assertIsNone(payment)
-
     def test_usd1_signature_uses_usd1_verifying_contract(self) -> None:
         payment, reason = verify.validate_payment_proof(
             signed_proof(token=USD1_TOKEN),

@@ -177,7 +177,6 @@ B402_PAY_TO_ADDRESS = _resolve_b402_pay_to_address()
 SELLER_WALLET = B402_PAY_TO_ADDRESS  # compatibility alias
 U_TOKEN_ADDRESS = U_TOKEN.address
 PRICE_WEI = 100_000_000_000_000_000
-LEGACY_PAID_AMOUNT_FOR_RECOVERY = 210_000_000_000_000_000
 CHAIN_ID = _resolve_x402_chain_id()
 
 
@@ -321,38 +320,20 @@ def validate_payment_proof(
     bypasses the wall-clock expiry rejection but preserves every other
     semantic, domain, and cryptographic check.
     """
-    return _validate_payment_proof_amount(
+    return _validate_current_payment_proof(
         proof_header,
         expected_requirement=expected_requirement,
         now=now,
         allow_expired=allow_expired,
-        required_amount=PRICE_WEI,
     )
 
 
-def validate_legacy_paid_payment_proof(
-    proof_header: str,
-    *,
-    now: int | None = None,
-    allow_expired: bool = True,
-) -> tuple[VerifiedPayment | None, str]:
-    """Locally authenticate one former-0.21 proof for durable lookup only."""
-    return _validate_payment_proof_amount(
-        proof_header,
-        expected_requirement=None,
-        now=now,
-        allow_expired=allow_expired,
-        required_amount=LEGACY_PAID_AMOUNT_FOR_RECOVERY,
-    )
-
-
-def _validate_payment_proof_amount(
+def _validate_current_payment_proof(
     proof_header: str,
     *,
     expected_requirement: Mapping[str, Any] | None,
     now: int | None,
     allow_expired: bool,
-    required_amount: int,
 ) -> tuple[VerifiedPayment | None, str]:
     proof = decode_payment_signature(proof_header)
     if proof is None:
@@ -379,11 +360,6 @@ def _validate_payment_proof_amount(
             if expected_requirement is not None
             else "payment requirement is missing or invalid"
         )
-    if (
-        required_amount == LEGACY_PAID_AMOUNT_FOR_RECOVERY
-        and token.symbol == "USDC"
-    ):
-        return None, "payment requirement is missing or invalid"
     if token.transfer_method == "permit2-exact":
         try:
             from .x402_permit2 import verify_permit2_exact
@@ -395,7 +371,6 @@ def _validate_payment_proof_amount(
             expected_requirement=expected_requirement,
             now=int(time.time()) if now is None else int(now),
             allow_expired=allow_expired,
-            required_amount=required_amount,
         )
     extra = accepted.get("extra")
     if (
@@ -432,7 +407,7 @@ def _validate_payment_proof_amount(
     canonical = build_payment_requirement(
         token,
         canonical_extra,
-        amount=required_amount,
+        amount=PRICE_WEI,
     )
     if (
         expected_requirement is not None

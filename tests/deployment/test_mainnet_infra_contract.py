@@ -359,7 +359,6 @@ class MainnetInfrastructureContractTests(unittest.TestCase):
         self.assertIsNotNone(permit2_requirement)
         assert permit2_requirement is not None
         self.assertIn('"amount": "100000000000000000"', permit2_requirement.group())
-        self.assertNotIn("210000000000000000", permit2_requirement.group())
 
         affirmative_proof = re.search(
             r"(?s)^def _payment_header\(\) -> str:.*?^\s*return ",
@@ -369,7 +368,6 @@ class MainnetInfrastructureContractTests(unittest.TestCase):
         self.assertIsNotNone(affirmative_proof)
         assert affirmative_proof is not None
         self.assertIn('"amount": "100000000000000000"', affirmative_proof.group())
-        self.assertNotIn("210000000000000000", affirmative_proof.group())
 
     def test_large_guides_preserve_unrelated_pre_task5_material(self) -> None:
         preservation_contracts = {

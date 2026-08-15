@@ -189,10 +189,10 @@ test("buildPermit2PaymentProof emits the exact local Permit2 wire proof", async 
   );
 });
 
-test("Permit2 signing refuses zero and legacy paid amounts", async () => {
+test("Permit2 signing refuses zero and non-current paid amounts", async () => {
   const wallet = new Wallet(PRIVATE_KEY);
   for (const token of ["USDC", "USDT"] as const) {
-    for (const amount of ["0", "210000000000000000"]) {
+    for (const amount of ["0", "100000000000000001"]) {
       const challenge = permit2Challenge(token);
       challenge.accepted.amount = amount;
       await assert.rejects(

@@ -92,7 +92,6 @@ const PENDING_RECOVERY_MILLISECONDS = 7 * 24 * 60 * 60 * 1_000;
 const MAX_CREATE_ATTEMPTS = 3;
 const CREATE_RETRY_MILLISECONDS = 1_000;
 const MAX_CREATE_RETRY_MILLISECONDS = 8_000;
-const LEGACY_PAID_AMOUNT_FOR_RECOVERY = "210000000000000000";
 const ERC20_ALLOWANCE_ABI = [
   "function allowance(address owner, address spender) view returns (uint256)",
 ] as const;
@@ -909,14 +908,14 @@ function parsePendingCreate(value: unknown): PendingCreateRecord {
   const recoveryExpiresAt = value["recoveryExpiresAt"];
   const jobId = value["jobId"];
   const binding = value["binding"];
-  const legacyPromotional = value["promotional"];
+  const promotional = value["promotional"];
   if (
     value["version"] !== 1
     || typeof paymentProof !== "string"
     || paymentProof.length === 0
     || paymentProof.length > 128 * 1024
-    || (legacyPromotional !== undefined && legacyPromotional !== false)
-    || paymentProofContainsPromotionalAmount(paymentProof)
+    || promotional !== undefined
+    || !paymentProofHasCurrentPaidAccess(paymentProof)
     || !isRecord(request)
     || !Array.isArray(symbols)
     || symbols.length === 0
@@ -968,12 +967,10 @@ function parsePendingCreate(value: unknown): PendingCreateRecord {
   };
 }
 
-function paymentProofContainsPromotionalAmount(paymentProof: string): boolean {
+function paymentProofHasCurrentPaidAccess(paymentProof: string): boolean {
   try {
-    const proof = JSON.parse(Buffer.from(paymentProof, "base64").toString("utf8"));
-    return isRecord(proof)
-      && isRecord(proof["accepted"])
-      && proof["accepted"]["amount"] === "0";
+    paymentAccessFromProof(paymentProof);
+    return true;
   } catch {
     return false;
   }
@@ -994,27 +991,11 @@ function paymentAccessFromProof(paymentProof: string): X402PaymentAccess {
 export function pendingAccessSummary(pending: PendingCreateRecord): string {
   const canonical = parsePendingCreate(pending);
   try {
-    return formatX402AccessSummary(paymentAccessFromProof(canonical.paymentProof));
+    return formatX402AccessSummary(
+      paymentAccessFromProof(canonical.paymentProof),
+    );
   } catch {
-    if (isLegacyPaidProofForRecovery(canonical.paymentProof)) {
-      return "Payment: legacy paid request (submitted)";
-    }
     throw new Error("Pending x402 access metadata is invalid");
-  }
-}
-
-function isLegacyPaidProofForRecovery(paymentProof: string): boolean {
-  try {
-    const proof = JSON.parse(
-      Buffer.from(paymentProof, "base64").toString("utf8"),
-    ) as unknown;
-    if (!isRecord(proof) || !isRecord(proof["accepted"])) return false;
-    const accepted = proof["accepted"];
-    if (accepted["amount"] !== LEGACY_PAID_AMOUNT_FOR_RECOVERY) return false;
-    paymentAccessFromAccepted({ ...accepted, amount: PAID_AMOUNT });
-    return true;
-  } catch {
-    return false;
   }
 }
 
