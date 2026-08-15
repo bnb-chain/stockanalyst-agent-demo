@@ -86,6 +86,8 @@ const CLI_LOCK_PATH = resolve(
 );
 const MAX_RECEIPT_BYTES = 16 * 1024;
 const MAX_PENDING_BYTES = 256 * 1024;
+const MAX_COOLDOWN_BYTES = 1_024;
+const MAX_WALLET_COOLDOWN_MILLISECONDS = 3_600_000;
 const PENDING_RECOVERY_MILLISECONDS = 7 * 24 * 60 * 60 * 1_000;
 const MAX_CREATE_ATTEMPTS = 3;
 const CREATE_RETRY_MILLISECONDS = 1_000;
@@ -123,7 +125,8 @@ const SAFE_ASYNC_JOB_CLIENT_ERROR_CODES = new Set([
   "pending_create_mismatch",
   "pending_job_mismatch",
   "poll_timeout",
-  "promo_rate_limited",
+  "wallet_rate_limited",
+  "wallet_rate_limit_unavailable",
   "report_not_ready",
   "report_too_large",
   "request_too_large",
@@ -137,8 +140,8 @@ const SAFE_ASYNC_CLI_ERROR_MESSAGES = new Set([
   "KEYSTORE_PATH is required to create a paid job",
   "Permit2 preflight failed; verify BSC_RPC_URL, BSC mainnet chain ID 56, and the USDC allowance",
   "Permit2 preflight failed; verify BSC_RPC_URL, BSC mainnet chain ID 56, and the USDT allowance",
-  "Permit2 allowance is below 0.21; run npm run x402:approve -- USDC",
-  "Permit2 allowance is below 0.21; run npm run x402:approve -- USDT",
+  "Permit2 allowance is below 0.1; run npm run x402:approve -- USDC",
+  "Permit2 allowance is below 0.1; run npm run x402:approve -- USDT",
   "Permit2 allowance exceeds 50; reset it to 50 or revoke it",
   "Pending x402 access metadata is invalid",
   "Payment access metadata is invalid",
@@ -179,22 +182,17 @@ export function formatX402AccessSummary(
   access: X402PaymentAccess,
 ): string {
   const canonical = parseX402PaymentAccess(access);
-  if (canonical.promotional) {
-    return `Promotional access: 0 ${canonical.token} (wallet signature only; no settlement)`;
-  }
-  return `Payment: 0.21 ${canonical.token} → ${canonical.payTo}`;
+  return `Payment: 0.1 ${canonical.token} (submitted)`;
 }
 
 export interface X402PaymentAccess {
   token: PaymentTokenSymbol;
-  promotional: boolean;
   payTo: string;
 }
 
 function parseX402PaymentAccess(value: unknown): X402PaymentAccess {
   if (!isRecord(value)) throw new Error("Pending x402 access metadata is invalid");
   const token = value["token"];
-  const promotional = value["promotional"];
   const payTo = value["payTo"];
   if (
     (
@@ -203,27 +201,22 @@ function parseX402PaymentAccess(value: unknown): X402PaymentAccess {
       && token !== "USDC"
       && token !== "USDT"
     )
-    || typeof promotional !== "boolean"
     || typeof payTo !== "string"
     || !/^0x[0-9a-f]{40}$/.test(payTo)
   ) {
     throw new Error("Pending x402 access metadata is invalid");
   }
-  return { token, promotional, payTo };
+  return { token, payTo };
 }
 
 export function paymentAccessFromChallenge(
   challenge: PaidPaymentChallenge,
 ): X402PaymentAccess {
-  return paymentAccessFromAccepted(
-    challenge.accepted,
-    challenge.promotional,
-  );
+  return paymentAccessFromAccepted(challenge.accepted);
 }
 
 function paymentAccessFromAccepted(
   accepted: unknown,
-  expectedPromotional?: boolean,
 ): X402PaymentAccess {
   if (!isRecord(accepted) || !isRecord(accepted["extra"])) {
     throw new Error("Payment access metadata is invalid");
@@ -240,7 +233,6 @@ function paymentAccessFromAccepted(
   )?.[0]) as PaymentTokenSymbol | undefined;
   if (symbol === undefined) throw new Error("Payment access metadata is invalid");
   const token = PAYMENT_TOKENS[symbol];
-  const promotional = amount === "0";
   const signerAddress = extra["signerAddress"];
   const spenderAddress = extra["spenderAddress"];
   const signerPresent = Object.prototype.hasOwnProperty.call(
@@ -253,23 +245,15 @@ function paymentAccessFromAccepted(
   );
   const transferMethod = token.transferMethod;
   if (
-    (expectedPromotional !== undefined && expectedPromotional !== promotional)
-    || (!promotional && amount !== PAID_AMOUNT)
-    || (promotional && transferMethod !== "eip3009")
+    amount !== PAID_AMOUNT
     || typeof payTo !== "string"
     || !/^0x[0-9a-fA-F]{40}$/.test(payTo)
     || extra["name"] !== token.name
     || extra["version"] !== token.version
     || extra["assetTransferMethod"] !== transferMethod
-    || (
-      promotional
-        ? signerPresent
-        : (
-          !signerPresent
-          || typeof signerAddress !== "string"
-          || !/^0x[0-9a-fA-F]{40}$/.test(signerAddress)
-        )
-    )
+    || !signerPresent
+    || typeof signerAddress !== "string"
+    || !/^0x[0-9a-fA-F]{40}$/.test(signerAddress)
     || (
       transferMethod === "permit2-exact"
       && (
@@ -283,7 +267,6 @@ function paymentAccessFromAccepted(
   }
   return {
     token: symbol,
-    promotional,
     payTo: payTo.toLowerCase(),
   };
 }
@@ -351,12 +334,20 @@ export interface AsyncStartupOptions {
   receiptPath: string;
   pendingPath: string;
   env?: Readonly<Record<string, string | undefined>>;
+  now?: () => number;
   dependencies?: Partial<AsyncStartupDependencies>;
 }
 
 export interface AsyncStartupResult {
   receipt: AsyncJobReceipt;
   symbols: string[];
+}
+
+interface WalletRateLimitCooldown {
+  version: 1;
+  kind: "wallet-rate-limit-cooldown";
+  notBefore: number;
+  mac: string;
 }
 
 export interface AsyncCliProcess {
@@ -630,6 +621,108 @@ function atomicPrivateJson(
   }
 }
 
+function cooldownSecretPath(pendingPath: string): string {
+  return `${pendingPath}.cooldown-key`;
+}
+
+function loadOrCreateCooldownSecret(pendingPath: string): Buffer {
+  const path = cooldownSecretPath(pendingPath);
+  if (!existsSync(path)) {
+    atomicPrivateJson(path, {
+      version: 1,
+      secret: randomBytes(32).toString("base64url"),
+    }, 256);
+  }
+  try {
+    if (statSync(path).size > 256) throw new Error("oversized");
+    const value = JSON.parse(readFileSync(path, "utf8")) as unknown;
+    if (
+      !isRecord(value)
+      || Object.keys(value).sort().join(",") !== "secret,version"
+      || value["version"] !== 1
+      || typeof value["secret"] !== "string"
+      || !/^[A-Za-z0-9_-]{43}$/.test(value["secret"])
+    ) {
+      throw new Error("invalid secret");
+    }
+    const secret = Buffer.from(value["secret"], "base64url");
+    if (secret.byteLength !== 32) throw new Error("invalid secret");
+    return secret;
+  } catch {
+    throw new AsyncJobClientError("pending_binding_invalid");
+  }
+}
+
+function cooldownMac(secret: Buffer, notBefore: number): Buffer {
+  return createHmac("sha256", secret)
+    .update("stockanalyst:x402-wallet-rate-limit-cooldown:v1\n", "utf8")
+    .update(String(notBefore), "utf8")
+    .digest();
+}
+
+function persistWalletRateLimitCooldown(
+  pendingPath: string,
+  notBefore: number,
+): void {
+  if (!Number.isSafeInteger(notBefore) || notBefore <= 0) {
+    throw new AsyncJobClientError("pending_binding_invalid");
+  }
+  const secret = loadOrCreateCooldownSecret(pendingPath);
+  const record: WalletRateLimitCooldown = {
+    version: 1,
+    kind: "wallet-rate-limit-cooldown",
+    notBefore,
+    mac: cooldownMac(secret, notBefore).toString("base64url"),
+  };
+  atomicPrivateJson(pendingPath, record, MAX_COOLDOWN_BYTES);
+}
+
+function loadWalletRateLimitCooldown(
+  pendingPath: string,
+): WalletRateLimitCooldown | undefined {
+  let value: unknown;
+  try {
+    if (statSync(pendingPath).size > MAX_PENDING_BYTES) {
+      throw new Error("oversized");
+    }
+    value = JSON.parse(readFileSync(pendingPath, "utf8")) as unknown;
+  } catch {
+    throw new AsyncJobClientError("pending_binding_invalid");
+  }
+  if (!isRecord(value) || value["kind"] === undefined) return undefined;
+  const notBefore = value["notBefore"];
+  const mac = value["mac"];
+  if (
+    Object.keys(value).sort().join(",") !== "kind,mac,notBefore,version"
+    || value["version"] !== 1
+    || value["kind"] !== "wallet-rate-limit-cooldown"
+    || typeof notBefore !== "number"
+    || !Number.isSafeInteger(notBefore)
+    || notBefore <= 0
+    || typeof mac !== "string"
+    || !/^[A-Za-z0-9_-]{43}$/.test(mac)
+  ) {
+    throw new AsyncJobClientError("pending_binding_invalid");
+  }
+  const supplied = Buffer.from(mac, "base64url");
+  const expected = cooldownMac(
+    loadOrCreateCooldownSecret(pendingPath),
+    notBefore,
+  );
+  if (
+    supplied.byteLength !== expected.byteLength
+    || !timingSafeEqual(supplied, expected)
+  ) {
+    throw new AsyncJobClientError("pending_binding_invalid");
+  }
+  return {
+    version: 1,
+    kind: "wallet-rate-limit-cooldown",
+    notBefore,
+    mac,
+  };
+}
+
 export function cleanupPrivateStateTemps(
   directory: string,
   fileNames: string[],
@@ -815,11 +908,14 @@ function parsePendingCreate(value: unknown): PendingCreateRecord {
   const recoveryExpiresAt = value["recoveryExpiresAt"];
   const jobId = value["jobId"];
   const binding = value["binding"];
+  const promotional = value["promotional"];
   if (
     value["version"] !== 1
     || typeof paymentProof !== "string"
     || paymentProof.length === 0
     || paymentProof.length > 128 * 1024
+    || promotional !== undefined
+    || !paymentProofHasCurrentPaidAccess(paymentProof)
     || !isRecord(request)
     || !Array.isArray(symbols)
     || symbols.length === 0
@@ -871,6 +967,15 @@ function parsePendingCreate(value: unknown): PendingCreateRecord {
   };
 }
 
+function paymentProofHasCurrentPaidAccess(paymentProof: string): boolean {
+  try {
+    paymentAccessFromProof(paymentProof);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function paymentAccessFromProof(paymentProof: string): X402PaymentAccess {
   try {
     const proof = JSON.parse(
@@ -885,7 +990,13 @@ function paymentAccessFromProof(paymentProof: string): X402PaymentAccess {
 
 export function pendingAccessSummary(pending: PendingCreateRecord): string {
   const canonical = parsePendingCreate(pending);
-  return formatX402AccessSummary(paymentAccessFromProof(canonical.paymentProof));
+  try {
+    return formatX402AccessSummary(
+      paymentAccessFromProof(canonical.paymentProof),
+    );
+  } catch {
+    throw new Error("Pending x402 access metadata is invalid");
+  }
 }
 
 export function persistPendingCreate(
@@ -1093,6 +1204,26 @@ export async function createReceiptFromPending(
       return receipt;
     } catch (error) {
       if (
+        error instanceof AsyncJobClientError
+        && error.httpStatus === 429
+      ) {
+        const delay = error.retryAfterMilliseconds
+          ?? MAX_WALLET_COOLDOWN_MILLISECONDS;
+        const current = now();
+        if (!Number.isSafeInteger(current) || current <= 0) {
+          throw new AsyncJobClientError("pending_binding_invalid");
+        }
+        persistWalletRateLimitCooldown(
+          pendingPath,
+          current + delay,
+        );
+        throw new AsyncJobClientError("wallet_rate_limited", {
+          httpStatus: 429,
+          retryable: true,
+          retryAfterMilliseconds: delay,
+        });
+      }
+      if (
         !(error instanceof AsyncJobClientError)
         || !error.retryable
         || attempt + 1 >= attempts
@@ -1287,8 +1418,30 @@ export async function runAsyncStartup(
     ...DEFAULT_ASYNC_STARTUP_DEPENDENCIES,
     ...options.dependencies,
   };
+  const now = options.now ?? Date.now;
   let receipt: AsyncJobReceipt | undefined;
   let symbols: string[];
+
+  if (existsSync(options.pendingPath)) {
+    const cooldown = loadWalletRateLimitCooldown(options.pendingPath);
+    if (cooldown !== undefined) {
+      if (existsSync(options.receiptPath)) {
+        throw new AsyncJobClientError("pending_binding_invalid");
+      }
+      const current = now();
+      if (!Number.isSafeInteger(current) || current <= 0) {
+        throw new AsyncJobClientError("pending_binding_invalid");
+      }
+      if (current < cooldown.notBefore) {
+        throw new AsyncJobClientError("wallet_rate_limited", {
+          httpStatus: 429,
+          retryable: true,
+          retryAfterMilliseconds: cooldown.notBefore - current,
+        });
+      }
+      durableUnlink(options.pendingPath);
+    }
+  }
 
   if (existsSync(options.receiptPath)) {
     receipt = loadAsyncJobReceipt(options.receiptPath);
@@ -1352,28 +1505,21 @@ export async function runAsyncStartup(
       dependencies.fetch,
       paymentToken,
     );
-    if (initial.kind === "created") {
-      receipt = initial.receipt;
-      persistAsyncJobReceipt(options.receiptPath, receipt);
-      dependencies.log(`Created asynchronous job ${receipt.jobId}`);
-      dependencies.log("Promotional access: free (no wallet or payment)");
-    } else {
-      wallet ??= await dependencies.loadWallet(env);
-      dependencies.log(
-        initial.challenge.accepted.extra.assetTransferMethod === "permit2-exact"
-          ? "Signing one exact Permit2 payment authorization..."
-          : "Signing one x402 EIP-3009 payment authorization...",
-      );
-      pending = await buildPaidPendingCreate(
-        wallet,
-        initial.challenge,
-        paymentToken,
-        request,
-        dependencies,
-      );
-      // The proof must be durable before any POST that carries it.
-      persistPendingCreate(options.pendingPath, pending);
-    }
+    wallet ??= await dependencies.loadWallet(env);
+    dependencies.log(
+      initial.challenge.accepted.extra.assetTransferMethod === "permit2-exact"
+        ? "Signing one exact Permit2 payment authorization..."
+        : "Signing one x402 EIP-3009 payment authorization...",
+    );
+    pending = await buildPaidPendingCreate(
+      wallet,
+      initial.challenge,
+      paymentToken,
+      request,
+      dependencies,
+    );
+    // The proof must be durable before any POST that carries it.
+    persistPendingCreate(options.pendingPath, pending);
   }
 
   if (pending !== undefined) {

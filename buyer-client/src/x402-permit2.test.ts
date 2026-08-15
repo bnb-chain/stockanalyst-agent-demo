@@ -97,7 +97,6 @@ function permit2Challenge(
         spenderAddress: SPENDER,
       },
     },
-    promotional: false,
   };
 }
 
@@ -188,6 +187,20 @@ test("buildPermit2PaymentProof emits the exact local Permit2 wire proof", async 
     ),
     wallet.address,
   );
+});
+
+test("Permit2 signing refuses zero and non-current paid amounts", async () => {
+  const wallet = new Wallet(PRIVATE_KEY);
+  for (const token of ["USDC", "USDT"] as const) {
+    for (const amount of ["0", "100000000000000001"]) {
+      const challenge = permit2Challenge(token);
+      challenge.accepted.amount = amount;
+      await assert.rejects(
+        buildPermit2PaymentProof(wallet, challenge, TTL_SECONDS, () => NOW),
+        /Permit2 payment challenge is invalid/,
+      );
+    }
+  }
 });
 
 test("Permit2 signing canonicalizes a mixed-case spender without changing accepted extra", async () => {
@@ -385,14 +398,14 @@ function fakeAllowanceRuntime(options: {
   };
 }
 
-test("Permit2 allowance policy uses exact 0.21 minimum and 50-token target", () => {
-  assert.equal(PERMIT2_PAYMENT_MINIMUM, 210000000000000000n);
+test("Permit2 allowance policy uses exact 0.1 minimum and 50-token target", () => {
+  assert.equal(PERMIT2_PAYMENT_MINIMUM, 100000000000000000n);
   assert.equal(PERMIT2_ALLOWANCE_TARGET, 50000000000000000000n);
   for (const token of ["USDC", "USDT"] as const) {
     assert.throws(
       () => assertPermit2PaymentReady(PERMIT2_PAYMENT_MINIMUM - 1n, token),
       {
-        message: `Permit2 allowance is below 0.21; run npm run x402:approve -- ${token}`,
+        message: `Permit2 allowance is below 0.1; run npm run x402:approve -- ${token}`,
       },
     );
     assert.doesNotThrow(() => assertPermit2PaymentReady(
@@ -549,6 +562,7 @@ test("revoke prints the complete zero-target summary and sends only zero", async
     `Canonical Permit2: ${PERMIT2_ADDRESS}`,
     `Current allowance: ${PERMIT2_ALLOWANCE_TARGET}`,
     "Target allowance: 0",
+    "Paid-call guidance: up to 500 exact 0.1 USDC calls at the 50-token cap",
     "Transaction count: 1",
   ]);
 });
@@ -633,7 +647,7 @@ test("CLI main redacts unknown provider and transaction errors and exits nonzero
 
 test("CLI main safely preserves exact selected-token approve guidance", async () => {
   for (const token of ["USDC", "USDT"] as const) {
-    const expected = `Permit2 allowance is below 0.21; run npm run x402:approve -- ${token}`;
+    const expected = `Permit2 allowance is below 0.1; run npm run x402:approve -- ${token}`;
     const stderr: string[] = [];
     const exitCodes: number[] = [];
 

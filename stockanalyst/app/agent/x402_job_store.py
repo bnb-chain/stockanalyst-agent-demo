@@ -13,12 +13,16 @@ from botocore.exceptions import ClientError
 
 _JOB_ID_RE = re.compile(r"x402_[0-9a-f]{32}\Z")
 _REPORT_ID_RE = re.compile(r"[0-9a-f]{32}\Z")
+_WALLET_DIGEST_RE = re.compile(r"[0-9a-f]{64}\Z")
 _BUCKET_RE = re.compile(r"[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]\Z")
 _PREFIX_SEGMENT_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,199}\Z")
 _MAX_JOB_BYTES = 256 * 1024
 _MAX_REPORT_BYTES = 2 * 1024 * 1024
 _MAX_ACCOUNTING_MARKER_BYTES = 1024
 _MAX_ACCOUNTING_EVENT_ID_LENGTH = 512
+_MAX_WALLET_RATE_LIMIT_BYTES = 16 * 1024
+_MAX_WALLET_RATE_LIMIT_ENTRIES = 30
+_MAX_TIMESTAMP_MILLISECONDS = 9_999_999_999_999
 
 
 class X402JobStoreError(RuntimeError):
@@ -49,6 +53,12 @@ class X402JobStoreConfig:
 
 @dataclass(frozen=True)
 class StoredJob:
+    record: dict[str, Any]
+    etag: str
+
+
+@dataclass(frozen=True)
+class StoredWalletRateLimit:
     record: dict[str, Any]
     etag: str
 
@@ -96,6 +106,14 @@ class X402JobStore:
             "competition-reported.json"
         )
 
+    def _wallet_rate_limit_key(self, wallet_digest: str) -> str:
+        if not _WALLET_DIGEST_RE.fullmatch(wallet_digest):
+            raise X402JobStoreError("invalid wallet digest")
+        return (
+            f"{self.config.prefix}/rate-limits/v1/"
+            f"{wallet_digest}.json"
+        )
+
     @staticmethod
     def _encode(record: dict[str, Any]) -> bytes:
         if not isinstance(record, dict):
@@ -109,6 +127,67 @@ class X402JobStore:
         if len(body) > _MAX_JOB_BYTES:
             raise X402JobStoreError("job record exceeds 256 KiB")
         return body
+
+    @staticmethod
+    def _encode_wallet_rate_limit(record: dict[str, Any]) -> bytes:
+        if (
+            not isinstance(record, dict)
+            or set(record) != {"version", "entries"}
+            or type(record.get("version")) is not int
+            or record.get("version") != 1
+        ):
+            raise X402JobStoreError("invalid wallet rate-limit record")
+        entries = record.get("entries")
+        if (
+            not isinstance(entries, list)
+            or len(entries) > _MAX_WALLET_RATE_LIMIT_ENTRIES
+        ):
+            raise X402JobStoreError("invalid wallet rate-limit entries")
+        reservation_ids: set[str] = set()
+        for entry in entries:
+            if not isinstance(entry, dict) or set(entry) != {
+                "reservationId",
+                "reservedAt",
+                "state",
+            }:
+                raise X402JobStoreError("invalid wallet rate-limit entry")
+            reservation_id = entry.get("reservationId")
+            reserved_at = entry.get("reservedAt")
+            if (
+                not isinstance(reservation_id, str)
+                or not _JOB_ID_RE.fullmatch(reservation_id)
+                or reservation_id in reservation_ids
+                or type(reserved_at) is not int
+                or not 1 <= reserved_at <= _MAX_TIMESTAMP_MILLISECONDS
+                or entry.get("state") not in {"reserved", "committed"}
+            ):
+                raise X402JobStoreError("invalid wallet rate-limit entry")
+            reservation_ids.add(reservation_id)
+        try:
+            body = json.dumps(
+                record,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            ).encode()
+        except (TypeError, ValueError) as exc:
+            raise X402JobStoreError(
+                "wallet rate-limit record must be finite JSON"
+            ) from exc
+        if len(body) > _MAX_WALLET_RATE_LIMIT_BYTES:
+            raise X402JobStoreError(
+                "wallet rate-limit record exceeds 16 KiB"
+            )
+        return body
+
+    @staticmethod
+    def _copy_wallet_rate_limit_record(
+        record: dict[str, Any],
+    ) -> dict[str, Any]:
+        return {
+            "version": 1,
+            "entries": [dict(entry) for entry in record["entries"]],
+        }
 
     async def _conditional_put(self, **kwargs: Any) -> dict[str, Any]:
         for attempt in range(2):
@@ -140,6 +219,103 @@ class X402JobStore:
                 return None
             raise
         return StoredJob(record=dict(record), etag=str(response["ETag"]))
+
+    async def create_wallet_rate_limit(
+        self,
+        wallet_digest: str,
+        record: dict[str, Any],
+    ) -> StoredWalletRateLimit | None:
+        body = self._encode_wallet_rate_limit(record)
+        try:
+            response = await self._conditional_put(
+                Bucket=self.config.bucket,
+                Key=self._wallet_rate_limit_key(wallet_digest),
+                Body=body,
+                ContentType="application/json",
+                CacheControl="private,no-store",
+                IfNoneMatch="*",
+            )
+        except ClientError as exc:
+            if str(exc.response.get("Error", {}).get("Code")) in {
+                "412",
+                "PreconditionFailed",
+            }:
+                return None
+            raise
+        return StoredWalletRateLimit(
+            record=self._copy_wallet_rate_limit_record(record),
+            etag=str(response["ETag"]),
+        )
+
+    async def read_wallet_rate_limit(
+        self,
+        wallet_digest: str,
+    ) -> StoredWalletRateLimit | None:
+        try:
+            response = await asyncio.to_thread(
+                self._s3.get_object,
+                Bucket=self.config.bucket,
+                Key=self._wallet_rate_limit_key(wallet_digest),
+            )
+        except ClientError as exc:
+            if str(exc.response.get("Error", {}).get("Code")) in {
+                "404",
+                "NoSuchKey",
+            }:
+                return None
+            raise
+        body = await asyncio.to_thread(
+            response["Body"].read,
+            _MAX_WALLET_RATE_LIMIT_BYTES + 1,
+        )
+        if len(body) > _MAX_WALLET_RATE_LIMIT_BYTES:
+            raise X402JobStoreError(
+                "wallet rate-limit record exceeds 16 KiB"
+            )
+        try:
+            record = json.loads(
+                body.decode(),
+                parse_constant=lambda value: (
+                    (_ for _ in ()).throw(ValueError(value))
+                ),
+            )
+        except (AttributeError, TypeError, UnicodeDecodeError, ValueError) as exc:
+            raise X402JobStoreError("invalid wallet rate-limit record") from exc
+        self._encode_wallet_rate_limit(record)
+        return StoredWalletRateLimit(
+            record=self._copy_wallet_rate_limit_record(record),
+            etag=str(response["ETag"]),
+        )
+
+    async def replace_wallet_rate_limit(
+        self,
+        wallet_digest: str,
+        stored: StoredWalletRateLimit,
+        record: dict[str, Any],
+    ) -> StoredWalletRateLimit:
+        if not isinstance(stored, StoredWalletRateLimit):
+            raise X402JobStoreError("invalid stored wallet rate-limit record")
+        body = self._encode_wallet_rate_limit(record)
+        try:
+            response = await self._conditional_put(
+                Bucket=self.config.bucket,
+                Key=self._wallet_rate_limit_key(wallet_digest),
+                Body=body,
+                ContentType="application/json",
+                CacheControl="private,no-store",
+                IfMatch=stored.etag,
+            )
+        except ClientError as exc:
+            if str(exc.response.get("Error", {}).get("Code")) in {
+                "412",
+                "PreconditionFailed",
+            }:
+                raise JobConflict("wallet rate limit changed concurrently") from exc
+            raise
+        return StoredWalletRateLimit(
+            record=self._copy_wallet_rate_limit_record(record),
+            etag=str(response["ETag"]),
+        )
 
     async def read(self, job_id: str) -> StoredJob | None:
         try:

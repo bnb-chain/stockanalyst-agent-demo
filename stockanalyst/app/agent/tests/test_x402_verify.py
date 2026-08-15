@@ -10,8 +10,11 @@ from eth_account import Account
 from eth_utils import keccak, to_checksum_address
 from stockanalyst.app.agent import x402_verify as verify
 from stockanalyst.app.agent.x402_tokens import (
+    TOKENS,
     U_TOKEN,
     USD1_TOKEN,
+    USDC_TOKEN,
+    USDT_TOKEN,
     PaymentToken,
 )
 
@@ -20,7 +23,7 @@ RESOURCE_URL = "https://api.example.test/testnet/x402/analyze/async"
 MAINNET_U = "0xcE24439F2D9C6a2289F741120FE202248B666666"
 B402_PAY_TO = "0x15958aad30b758dAbfbB9788Da69dfcd56e89078"
 LEGACY_SELLER = "0xd10BdDC20E4DC42A1a19a9653e994991e25b8153"
-PAID_PRICE_WEI = 210_000_000_000_000_000
+PAID_PRICE_WEI = 100_000_000_000_000_000
 U_EXTRA = {
     "name": U_TOKEN.domain_name,
     "version": "1",
@@ -72,13 +75,11 @@ class B402PayToConfigurationTests(unittest.TestCase):
                 self.assertIn(key, str(raised.exception))
                 self.assertNotIn(invalid, str(raised.exception))
 
-    def test_paid_and_free_requirements_use_dedicated_address(self) -> None:
+    def test_paid_requirement_uses_dedicated_address(self) -> None:
         with patch.object(verify, "B402_PAY_TO_ADDRESS", B402_PAY_TO):
             paid = verify.build_payment_requirement(U_TOKEN, SUPPORTED_EXTRA)
-            free = verify.build_free_payment_challenge("AAPL")
         expected = B402_PAY_TO.lower()
         self.assertEqual(paid["payTo"], expected)
-        self.assertEqual(free["accepts"][0]["payTo"], expected)
 
 
 class NetworkConfigurationTests(unittest.TestCase):
@@ -155,18 +156,13 @@ def signed_proof(
     value: object | None = None,
     *,
     token: PaymentToken = U_TOKEN,
-    promotional: bool = False,
     valid_before: int = NOW + 600,
     accepted_overrides: dict[str, object] | None = None,
     to_address: str | None = None,
 ) -> str:
     account = Account.from_key("0x" + "11" * 32)
     nonce = bytes.fromhex("22" * 32)
-    authorization_value = (
-        str(0 if promotional else PAID_PRICE_WEI)
-        if value is None
-        else value
-    )
+    authorization_value = str(PAID_PRICE_WEI) if value is None else value
     authorization = {
         "from": account.address.lower(),
         "to": (to_address or verify.B402_PAY_TO_ADDRESS).lower(),
@@ -198,8 +194,6 @@ def signed_proof(
     accepted = verify.build_payment_requirement(
         token,
         extra,
-        amount=0 if promotional else None,
-        promotional=promotional,
     )
     accepted.update(accepted_overrides or {})
     proof = {
@@ -218,46 +212,12 @@ def signed_proof(
     return base64.b64encode(json.dumps(proof).encode()).decode()
 
 
-def signed_free_proof(to_address: str) -> str:
-    account = Account.from_key("0x" + "11" * 32)
-    nonce = bytes.fromhex("66" * 32)
-    authorization = {
-        "from": account.address.lower(),
-        "to": to_address.lower(),
-        "value": "0",
-        "validAfter": "0",
-        "validBefore": str(NOW + 600),
-        "nonce": "0x" + nonce.hex(),
-    }
-    digest = verify._eip712_digest(
-        authorization["from"],
-        authorization["to"],
-        0,
-        0,
-        NOW + 600,
-        nonce,
-        token=U_TOKEN,
-    )
-    signature = Account._sign_hash(
-        digest, private_key="0x" + "11" * 32
-    ).signature.hex()
-    if not signature.startswith("0x"):
-        signature = "0x" + signature
-    return base64.b64encode(json.dumps({
-        "x402Version": 2,
-        "scheme": "exact",
-        "network": f"eip155:{verify.CHAIN_ID}",
-        "payload": {
-            "signature": signature,
-            "authorization": authorization,
-        },
-    }).encode()).decode()
+def signed_free_proof(_to_address: str) -> str:
+    """Legacy fixture retained only for skipped retired-route tests."""
+    return signed_proof(value=0)
 
 
 class VerifiedPaymentTests(unittest.TestCase):
-    def setUp(self) -> None:
-        verify._used_nonces.clear()
-
     def test_payment_signature_decoder_is_strict_and_returns_only_objects(
         self,
     ) -> None:
@@ -298,41 +258,19 @@ class VerifiedPaymentTests(unittest.TestCase):
         )
         self.assertIsNone(verify.decode_payment_signature(over_limit))
 
-    def test_paid_and_free_paths_stably_reject_non_object_roots(self) -> None:
+    def test_paid_path_stably_rejects_non_object_roots(self) -> None:
         marker = "private-proof-marker"
         for raw in (b"[]", json.dumps(marker).encode()):
             encoded = base64.b64encode(raw).decode()
             payment, reason = verify.validate_payment_proof(encoded, now=NOW)
-            free_ok, free_reason, free_address = (
-                verify.verify_free_payment_proof(encoded)
-            )
-
             self.assertIsNone(payment)
             self.assertEqual(
                 reason,
                 "Payment-Signature is not valid base64 JSON",
             )
-            self.assertFalse(free_ok)
-            self.assertEqual(free_reason, reason)
-            self.assertEqual(free_address, "")
             self.assertNotIn(marker, reason)
 
-    def test_free_version_rejection_never_reflects_untrusted_input(
-        self,
-    ) -> None:
-        marker = "free-attacker-version-marker"
-        proof = json.loads(base64.b64decode(signed_free_proof(B402_PAY_TO)))
-        proof["x402Version"] = marker
-        encoded = base64.b64encode(json.dumps(proof).encode()).decode()
-
-        ok, reason, from_address = verify.verify_free_payment_proof(encoded)
-
-        self.assertFalse(ok)
-        self.assertEqual(reason, "unsupported x402Version (expected 2)")
-        self.assertEqual(from_address, "")
-        self.assertNotIn(marker, reason)
-
-    def test_paid_and_free_paths_stably_reject_malformed_nested_values(
+    def test_paid_path_stably_rejects_malformed_nested_values(
         self,
     ) -> None:
         rejection = "Payment-Signature is not valid base64 JSON"
@@ -365,70 +303,6 @@ class VerifiedPaymentTests(unittest.TestCase):
             self.assertIsNone(payment, name)
             self.assertEqual(reason, rejection, name)
 
-        free_cases: list[tuple[str, object, object | None]] = [
-            ("payload list", [], None),
-            ("payload scalar", 1, None),
-            ("authorization list", {}, []),
-            ("authorization scalar", {}, "authorization"),
-        ]
-        for name, payload, authorization in free_cases:
-            proof = json.loads(base64.b64decode(signed_free_proof(B402_PAY_TO)))
-            if authorization is None:
-                proof["payload"] = payload
-            else:
-                proof["payload"] = {
-                    **payload,
-                    "authorization": authorization,
-                }
-            encoded = base64.b64encode(
-                json.dumps(proof, separators=(",", ":")).encode()
-            ).decode()
-            try:
-                ok, reason, address = verify.verify_free_payment_proof(encoded)
-            except Exception as exc:
-                self.fail(f"free {name} raised {type(exc).__name__}")
-            self.assertFalse(ok, name)
-            self.assertEqual(reason, rejection, name)
-            self.assertEqual(address, "", name)
-
-        free_numeric = json.loads(
-            base64.b64decode(signed_free_proof(B402_PAY_TO))
-        )
-        free_numeric["payload"]["authorization"]["validAfter"] = []
-        encoded_numeric = base64.b64encode(
-            json.dumps(free_numeric, separators=(",", ":")).encode()
-        ).decode()
-        try:
-            numeric_result = verify.verify_free_payment_proof(encoded_numeric)
-        except Exception as exc:
-            self.fail(f"free numeric value raised {type(exc).__name__}")
-        self.assertEqual(numeric_result, (False, rejection, ""))
-
-    def test_free_path_stably_rejects_a_thousand_digit_value(self) -> None:
-        proof = json.loads(base64.b64decode(signed_free_proof(B402_PAY_TO)))
-        proof["payload"]["authorization"]["value"] = "9" * 1_000
-        encoded = base64.b64encode(
-            json.dumps(proof, separators=(",", ":")).encode()
-        ).decode()
-        rejection = (
-            "free tier requires value=0; "
-            "use /x402/analyze/async for paid analysis"
-        )
-
-        try:
-            with patch.object(verify, "B402_PAY_TO_ADDRESS", B402_PAY_TO):
-                result = verify.verify_free_payment_proof(encoded)
-        except Exception as exc:
-            self.fail(f"thousand-digit value raised {type(exc).__name__}")
-        self.assertEqual(
-            result,
-            (
-                False,
-                rejection,
-                Account.from_key("0x" + "11" * 32).address.lower(),
-            ),
-        )
-
     def test_payment_signature_decoder_rejects_recursive_json_stably(
         self,
     ) -> None:
@@ -457,33 +331,41 @@ class VerifiedPaymentTests(unittest.TestCase):
         self.assertEqual(U_TOKEN.amount, 10**18)
         self.assertEqual(verify.PRICE_WEI, PAID_PRICE_WEI)
 
-    def test_paid_requirements_use_eighteen_decimals_for_both_tokens(
+    def test_all_trusted_requirements_use_the_paid_price(
         self,
     ) -> None:
         for token, extra in (
             (U_TOKEN, U_EXTRA),
             (USD1_TOKEN, USD1_EXTRA),
+            (USDC_TOKEN, {
+                "name": USDC_TOKEN.domain_name,
+                "version": USDC_TOKEN.domain_version,
+                "assetTransferMethod": USDC_TOKEN.transfer_method,
+                "signerAddress": "0x" + "11" * 20,
+                "spenderAddress": "0x" + "22" * 20,
+            }),
+            (USDT_TOKEN, {
+                "name": USDT_TOKEN.domain_name,
+                "version": USDT_TOKEN.domain_version,
+                "assetTransferMethod": USDT_TOKEN.transfer_method,
+                "signerAddress": "0x" + "11" * 20,
+                "spenderAddress": "0x" + "22" * 20,
+            }),
         ):
             with self.subTest(token=token.symbol):
                 requirement = verify.build_payment_requirement(token, extra)
                 self.assertEqual(requirement["asset"], token.address)
                 self.assertEqual(requirement["amount"], str(PAID_PRICE_WEI))
 
-    def test_promotional_requirement_is_zero_and_has_no_b402_signer(
-        self,
-    ) -> None:
-        requirement = verify.build_payment_requirement(
-            USD1_TOKEN,
-            {
-                "name": USD1_TOKEN.domain_name,
-                "version": "1",
-                "assetTransferMethod": "eip3009",
-            },
-            amount=0,
-            promotional=True,
+        self.assertEqual([token.symbol for token in TOKENS], ["U", "USD1", "USDC", "USDT"])
+
+    def test_paid_verifier_rejects_zero_value_eip3009_proof(self) -> None:
+        payment, reason = verify.validate_payment_proof(
+            signed_proof(value=0), now=NOW
         )
-        self.assertEqual(requirement["amount"], "0")
-        self.assertNotIn("signerAddress", requirement["extra"])
+
+        self.assertIsNone(payment)
+        self.assertTrue(reason)
 
     def test_usd1_signature_uses_usd1_verifying_contract(self) -> None:
         payment, reason = verify.validate_payment_proof(
@@ -495,21 +377,6 @@ class VerifiedPaymentTests(unittest.TestCase):
         self.assertEqual(payment.asset, USD1_TOKEN.address.lower())
         self.assertEqual(payment.token_symbol, "USD1")
 
-    def test_paid_and_promotional_requirements_cannot_cross_modes(self) -> None:
-        self.assertIsNone(
-            verify.validate_payment_proof(
-                signed_proof(token=U_TOKEN, promotional=True),
-                now=NOW,
-            )[0]
-        )
-        self.assertIsNone(
-            verify.validate_payment_proof(
-                signed_proof(token=U_TOKEN),
-                now=NOW,
-                promotional=True,
-            )[0]
-        )
-
     def test_rejects_invalid_token_requirements_and_authorizations(
         self,
     ) -> None:
@@ -517,12 +384,6 @@ class VerifiedPaymentTests(unittest.TestCase):
             key: value
             for key, value in U_EXTRA.items()
             if key != "signerAddress"
-        }
-        promotional_with_signer = {
-            "name": U_TOKEN.domain_name,
-            "version": U_TOKEN.domain_version,
-            "assetTransferMethod": U_TOKEN.transfer_method,
-            "signerAddress": "0x" + "11" * 20,
         }
         cases = (
             (
@@ -592,23 +453,13 @@ class VerifiedPaymentTests(unittest.TestCase):
                 ),
                 False,
             ),
-            (
-                "promotional signer present",
-                signed_proof(
-                    token=U_TOKEN,
-                    promotional=True,
-                    accepted_overrides={"extra": promotional_with_signer},
-                ),
-                True,
-            ),
         )
 
-        for label, proof, promotional in cases:
+        for label, proof, _ in cases:
             with self.subTest(case=label):
                 payment, reason = verify.validate_payment_proof(
                     proof,
                     now=NOW,
-                    promotional=promotional,
                 )
                 self.assertIsNone(payment)
                 self.assertTrue(reason)
@@ -709,53 +560,6 @@ class VerifiedPaymentTests(unittest.TestCase):
         self.assertEqual(payment.proof["accepted"]["extra"], SUPPORTED_EXTRA)
         self.assertNotIn("scheme", payment.proof)
 
-    def test_paid_expected_requirement_cannot_override_canonical_amount(
-        self,
-    ) -> None:
-        zero_requirement = verify.build_payment_requirement(
-            U_TOKEN,
-            U_EXTRA,
-            amount=0,
-        )
-
-        payment, reason = verify.validate_payment_proof(
-            signed_proof(value=0, accepted_overrides={"amount": "0"}),
-            expected_requirement=zero_requirement,
-            now=NOW,
-        )
-
-        self.assertIsNone(payment)
-        self.assertEqual(reason, "payment requirement mismatch")
-
-    def test_promotional_expected_requirement_cannot_override_zero_amount(
-        self,
-    ) -> None:
-        promotional_extra = {
-            "name": U_TOKEN.domain_name,
-            "version": U_TOKEN.domain_version,
-            "assetTransferMethod": U_TOKEN.transfer_method,
-        }
-        nonzero_requirement = verify.build_payment_requirement(
-            U_TOKEN,
-            promotional_extra,
-            amount=U_TOKEN.amount,
-            promotional=True,
-        )
-
-        payment, reason = verify.validate_payment_proof(
-            signed_proof(
-                value=U_TOKEN.amount,
-                promotional=True,
-                accepted_overrides={"amount": str(U_TOKEN.amount)},
-            ),
-            expected_requirement=nonzero_requirement,
-            now=NOW,
-            promotional=True,
-        )
-
-        self.assertIsNone(payment)
-        self.assertEqual(reason, "payment requirement mismatch")
-
     def test_pure_validation_rejects_infinite_value_without_raising(self) -> None:
         encoded_proof = signed_proof()
         proof = json.loads(base64.b64decode(encoded_proof))
@@ -827,32 +631,6 @@ class VerifiedPaymentTests(unittest.TestCase):
         self.assertEqual(accepted_reason, "")
         self.assertIsNone(rejected)
         self.assertIn("wrong recipient", rejected_reason)
-
-    def test_free_proof_enforces_dedicated_recipient(self) -> None:
-        with (
-            patch.object(verify, "B402_PAY_TO_ADDRESS", B402_PAY_TO),
-            patch.object(verify.time, "time", return_value=NOW),
-            self.assertLogs(
-                "seller-agent.x402.verify",
-                level="INFO",
-            ) as captured,
-        ):
-            accepted, accepted_reason, _ = verify.verify_free_payment_proof(
-                signed_free_proof(B402_PAY_TO)
-            )
-            rejected, rejected_reason, _ = verify.verify_free_payment_proof(
-                signed_free_proof("0x" + "44" * 20)
-            )
-        self.assertTrue(accepted)
-        self.assertIn("uses remaining", accepted_reason)
-        self.assertFalse(rejected)
-        self.assertIn("wrong recipient", rejected_reason)
-        rendered = "\n".join(captured.output)
-        self.assertNotIn(
-            Account.from_key("0x" + "11" * 32).address.lower(),
-            rendered,
-        )
-        self.assertNotIn("0x" + "66" * 32, rendered)
 
     def test_expired_recovery_still_rejects_an_invalid_signature(self) -> None:
         proof = json.loads(

@@ -2,57 +2,26 @@
 
 TypeScript buyer client for the [Stock Analysis Agent](../stockanalyst/README.md). Supports these flows:
 
-## BSC Mainnet x402 payment contract
+## Paid x402 contract
+
+x402 payments use **BSC Mainnet (chain ID 56)**. The EIP-3009 domain names are United Stables for U and World Liberty Financial USD for USD1. Every accepted analysis costs exactly `100000000000000000` atomic units (0.1 of the selected 18-decimal token).
 
 | Token | BSC address | Method | Price |
 | --- | --- | --- | --- |
-| U | `0xcE24439F2D9C6a2289F741120FE202248B666666` | `eip3009` | 0.21 U |
-| USD1 | `0x8d0D000Ee44948FC98c9B98A4FA4921476f08B0d` | `eip3009` | 0.21 USD1 |
-| USDC | `0x8AC76a51cc950d9822D68b83fE1Ad97B32Cd580d` | `permit2-exact` | 0.21 USDC |
-| USDT | `0x55d398326f99059fF775485246999027B3197955` | `permit2-exact` | 0.21 USDT |
+| U | `0xcE24439F2D9C6a2289F741120FE202248B666666` | `eip3009` | 0.1 U |
+| USD1 | `0x8d0D000Ee44948FC98c9B98A4FA4921476f08B0d` | `eip3009` | 0.1 USD1 |
+| USDC | `0x8AC76a51cc950d9822D68b83fE1Ad97B32Cd580d` | `permit2-exact` | 0.1 USDC |
+| USDT | `0x55d398326f99059fF775485246999027B3197955` | `permit2-exact` | 0.1 USDT |
 
-B402 capabilities may be partial. The client validates the live supported
-subset and fails closed if the selected token is absent. `extra.signerAddress`
-is facilitator EOA metadata; it is not the Permit2 spender and is not part of
-`permit2-exact` typed data. `extra.spenderAddress` is the live B402 proxy and
-the `permit2-exact` typed-data spender; the ERC-20 approval target remains
-canonical Permit2 `0x000000000022D473030F116dDEE9F6B43aC78BA3`.
+B402 capabilities may be partial; choose one live supported requirement. U and USD1 use EIP-3009; USDC and USDT use `permit2-exact`. `extra.signerAddress` is facilitator EOA metadata; it is not the Permit2 spender and is not part of `permit2-exact` typed data. `extra.spenderAddress` is the live B402 proxy and the `permit2-exact` typed-data spender; the ERC-20 approval target remains canonical Permit2 `0x000000000022D473030F116dDEE9F6B43aC78BA3`.
 
-Use the explicit `npm run x402:allowance`, `npm run x402:approve`, and
-`npm run x402:revoke` commands with `-- USDC` or `-- USDT`. Both approve and
-revoke require confirmation; `--yes` is an explicit noninteractive bypass.
-Approval resets a differing nonzero allowance to zero and then sets exactly 50
-tokens. Revoke sets zero. A 50-token allowance covers 238 complete 0.21
-payments and leaves 0.02 token. `BSC_RPC_URL` is used only for USDC/USDT allowance reads,
-approval/revoke, and paid preflight; U/USD1 and local signing do not use it.
-`npm run x402:async` never approves or revokes; it only checks that the
-existing allowance is within the inclusive 0.21-to-50 safety range.
+`BSC_RPC_URL` is used only for USDC/USDT allowance reads, approval/revoke, and paid preflight. Use `npm run x402:allowance`, `npm run x402:approve`, and `npm run x402:revoke`; both approve and revoke require confirmation and `--yes` is an explicit noninteractive bypass. `npm run x402:async` never approves or revokes. Only a freshly created Permit2 reservation in the same request uses verify-and-settle. Every pre-existing stale Permit2 reservation is recovered settle-only with the identical persisted proof, regardless of `pendingSettlementReference` or deadline; recovery does not call `/verify`.
 
-In promotional mode, `paymentRequired=false` and the active `accepts=[]`;
-`supportedAssets` may still list all four tokens as registry metadata and is
-not an active payment requirement. There is no USDC/USDT promotional proof,
-B402 verify/settle, or automatic approval. On a genuinely new CLI run with
-`X402_PAYMENT_TOKEN=USDC` or `USDT`, the zero-POST safety policy may perform a
-read-only Permit2 preflight before discovering the proofless promotional
-response; it still performs no approval. Only a freshly created Permit2
-reservation in the same request uses verify-and-settle. Every pre-existing
-stale Permit2 reservation is recovered settle-only with the identical
-persisted proof, regardless of `pendingSettlementReference` or deadline;
-recovery does not call `/verify`. Recovery creates no new signature, nonce, or
-approval. See
-[`docs/x402-api-usage.md`](../docs/x402-api-usage.md) for the complete API flow.
+After local cryptographic payment-proof verification identifies the wallet, admission allows 30 accepted new jobs per rolling hour. The 31st request returns HTTP 429 and `Retry-After` before B402 verification or settlement. An exact retry does not consume another slot or settle twice. Competition reporting occurs once after terminal settlement or queued state using `settledAt`.
 
-| Tier | Command | Cost | Settlement | Report | Speed |
-|------|---------|------|------------|--------|-------|
-| **x402 Free (legacy)** | `npm run x402:free` | 0 U | none | retired public endpoint | — |
-| **x402 Paid Async** | `npm run x402:async` | 0.21 U, USD1, USDC, or USDT | Binance Pay facilitator | private polling + download | create returns quickly |
-| **ERC-8183** (on-chain escrow) | `npm run dev` | 0.21 U | trustless escrow | full analysis | 5–15 min |
+ERC-8183 is a separate on-chain escrow flow, not x402; its fixed price remains 0.21 U and its settlement and delivery behavior are unchanged.
 
-x402 payments use **BSC Mainnet (chain ID 56)** and accept the live supported
-subset of **U, USD1, USDC, and USDT**. The legacy free client proves wallet
-identity with the mainnet U EIP-712 domain, but its public endpoint is retired.
-Both full-analysis flows read the buyer's portfolio from a local **UOMP Memory
-Guard** and produce the same HTML + PDF report.
+Both full-analysis channels read the buyer's portfolio from a local **UOMP Memory Guard** and produce the same HTML + PDF report.
 
 ---
 
@@ -201,9 +170,6 @@ UOMP_GUARD_TOKEN=your_guard_jwt_token
 > never the raw AgentCore invocation URL. Append `/x402/price`,
 > `/x402/analyze/async`, or private job paths; the base contains neither
 > `/mainnet` nor a trailing `/x402`. The old execute-api endpoint remains enabled during certificate/DNS/custom-domain validation and is disabled only after successful final cutover verification. Local development may instead use `http://localhost:9000`.
-> The current public gateway exposes price, paid create, private job status, and
-> private resume routes. `/x402/free` remains retired and is not present in the
-> public OpenAPI routes.
 
 ### AWS AgentCore runtime
 
@@ -236,58 +202,6 @@ managed-platform and local flows. Set `DELIVERY_MODE=ipfs` whenever the seller
 uses the AWS S3/CloudFront delivery path.
 
 ---
-
-## Legacy x402 free client (retired public endpoint)
-
-The source remains for compatibility testing against a matching local server.
-It uses the mainnet U domain on chain 56, calls `yfinance` directly, and returns
-a markdown price table. Do not use it against the current public x402 gateway;
-that gateway no longer exposes `/x402/free`.
-
-```bash
-# Terminal 1 — start agent
-cd ../stockanalyst/app/agent
-python main.py    # or: bag dev --agent-only
-
-# Terminal 2 — free quote
-cd buyer-client
-SYMBOL=AAPL npm run x402:free
-# or pass the symbol as an argument:
-npm run x402:free NVDA
-```
-
-Expected output:
-```
-════════════════════════════════════════════════════════════
-  x402 Free Tier — Quick Quote
-  Wallet:   0x1FF0…Fb67
-  Symbol:   AAPL
-  Payment:  0 U (wallet identity proof only)
-  Limit:    10 requests / 24 h per wallet
-════════════════════════════════════════════════════════════
-
-  ✓ EIP-712 proof signed (value = 0 U)
-  →  Fetching market data for AAPL...
-  ✓ Report received
-
-│ ## AAPL — Apple Inc.  |  Quick Quote  2026-07-24
-│
-│ | Metric         | Value                       |
-│ |----------------|-----------------------------|
-│ | Price          | USD 321.66                  |
-│ | Change         | -1.30%                      |
-│ | Market Cap     | 4.72T USD                   |
-│ | PE (TTM)       | 38.9x                       |
-│ | Forward PE     | 33.4x                       |
-│ | Analyst Target | USD 318.25 (-1.1% upside)   |
-│ | Consensus      | Buy                         |
-│ | Beta           | 1.10                        |
-│ | 52W Range      | USD 201.50 – USD 334.99     |
-│
-│ > Full analysis → Paid tier (0.21 U) via POST /x402/analyze/async
-
-  ✓ FREE TIER COMPLETE — 0 U · 1 signature · ~1s
-```
 
 ## Quick start — x402 paid async
 
@@ -388,8 +302,7 @@ bag erc8183 settle <job_id>
 
 ```
 src/
-├── x402free.ts     — legacy mainnet-U free client for a matching local server
-├── x402-async.ts   — proofless-promo or durable paid buyer (npm run x402:async) — private job polling
+├── x402-async.ts   — durable paid buyer (npm run x402:async) — private job polling
 ├── x402-async-client.ts — typed async create/poll/resume/download client
 ├── x402-payment.ts — shared side-effect-free EIP-3009 proof builder
 ├── index.ts        — ERC-8183 buyer    (npm run dev)        — 0.21 U, on-chain escrow
@@ -405,24 +318,7 @@ src/
 
 ## Payment channels explained
 
-### Legacy x402 free tier — wallet identity proof (0 U)
-
-This flow uses the BSC Mainnet U domain, but the current public endpoint is
-retired. The diagram documents the retained local compatibility client.
-
-```
-Buyer                              Matching local legacy gateway
-  │                                        │
-  │  POST /x402/free                       │
-  │  {"symbol": "AAPL"}                    │
-  │  PAYMENT-SIGNATURE: base64(0-U proof) ▶│
-  │                                        │  verify_free_payment_proof()
-  │                                        │  value must = 0, rate limit 10/24h
-  │                                        │  fetch_quote("AAPL")  — no LLM
-  │◀── 200 JSON {content, format} ─────────│  markdown price table
-```
-
-### x402 async — paid or promotional analysis
+### x402 async — paid analysis
 
 ```
 Buyer                              Agent (localhost:9000)
@@ -430,13 +326,9 @@ Buyer                              Agent (localhost:9000)
   │  POST /x402/analyze/async              │
   │  {"symbols": ["AAPL","NVDA"], ...}     │
   │  (without PAYMENT-SIGNATURE) ─────────▶│
-  │                                        ├─ promo=1: IP limit, create job
-  │◀── 202 jobId + private jobToken ───────│
-  │                                        │
-  │  paid mode only:                       ├─ promo=0: B402 /supported
-  │◀── 402 live supported subset + resource ─│  amount 210000000000000000
+  │◀── 402 live supported subset + resource│  amount 100000000000000000
   │  sign exact returned requirement       │
-  │  PAYMENT-SIGNATURE: base64(selected proof) ▶│  validate → B402 verify/settle
+  │  PAYMENT-SIGNATURE: base64(selected proof) ▶ validate → B402 verify/settle
   │◀── 202 jobId + private jobToken ───────│
   │  GET /x402/jobs/{jobId} ──────────────▶│  background analysis
   │◀── queued / running / succeeded ───────│
@@ -450,48 +342,17 @@ Paid requirements may select these exact tokens:
 
 | Symbol | Method | Domain name/version | Decimals | Exact paid amount | Mainnet contract |
 |--------|--------|---------------------|----------|-------------------|------------------|
-| U | `eip3009` | United Stables / 1 | 18 | `210000000000000000` (`0.21 × 10^18`) | `0xcE24439F2D9C6a2289F741120FE202248B666666` |
-| USD1 | `eip3009` | World Liberty Financial USD / 1 | 18 | `210000000000000000` (`0.21 × 10^18`) | `0x8d0D000Ee44948FC98c9B98A4FA4921476f08B0d` |
-| USDC | `permit2-exact` | USD Coin / 2 | 18 | `210000000000000000` (`0.21 × 10^18`) | `0x8AC76a51cc950d9822D68b83fE1Ad97B32Cd580d` |
-| USDT | `permit2-exact` | Tether USD / 1 | 18 | `210000000000000000` (`0.21 × 10^18`) | `0x55d398326f99059fF775485246999027B3197955` |
+| U | `eip3009` | United Stables / 1 | 18 | `100000000000000000` (`0.1 × 10^18`) | `0xcE24439F2D9C6a2289F741120FE202248B666666` |
+| USD1 | `eip3009` | World Liberty Financial USD / 1 | 18 | `100000000000000000` (`0.1 × 10^18`) | `0x8d0D000Ee44948FC98c9B98A4FA4921476f08B0d` |
+| USDC | `permit2-exact` | USD Coin / 1 | 18 | `100000000000000000` (`0.1 × 10^18`) | `0x8AC76a51cc950d9822D68b83fE1Ad97B32Cd580d` |
+| USDT | `permit2-exact` | Tether USD / 1 | 18 | `100000000000000000` (`0.1 × 10^18`) | `0x55d398326f99059fF775485246999027B3197955` |
 
 Set `X402_PAYMENT_TOKEN` to exactly `U`, `USD1`, `USDC`, or `USDT`; the default
 is U and any other spelling is rejected. The seller's fixed registry controls
 these assets. Legacy `X402_TOKEN_ADDRESS` and U-domain environment settings are
 compatibility inputs only and cannot replace or override the registry.
 
-When `X402_PROMO_FREE_MODE=1`, callers POST directly without a wallet or
-`Payment-Signature`. Promotional access is free. The same full async analysis runs, but the request does not enter
-x402 proof validation, B402 verify/settle, authorization-used RPC, or any
-blockchain RPC. From `buyer-client/`, update the existing Runtime manually with:
-
-```bash
-cd ../stockanalyst/app/agent
-bag env set X402_PROMO_FREE_MODE 1
-# Later, disable it explicitly with:
-bag env set X402_PROMO_FREE_MODE 0
-```
-
-The existing Runtime must be restarted or deployed again for the change to take effect.
-These commands only update configuration; run the repository's reviewed deploy
-procedure separately when an operator intends to roll out the change.
-The CLI reports only a safe mode summary; it never prints a proof, signature,
-job token, or private report URL:
-
-```text
-Promotional access: free (no wallet or payment)
-Payment: 0.21 USD1 → <public pay-to address>
-```
-
-Every accepted POST creates a new job and consumes one of the 30 requests per
-trusted IP in the rolling 24-hour window, including an identical retry. The
-limiter is process-local: a restart clears it and replicas do not share
-counters. In the public deployment, the trusted source IP comes from API
-Gateway request context, never a caller-supplied forwarding header. Setting
-`X402_PROMO_FREE_MODE=0` restores the four-token paid HTTP 402 flow. The
-EIP-3009 subset costs 0.21 U or 0.21 USD1; Permit2 costs 0.21 USDC or 0.21
-USDT when supported live. The old
-`/x402/free` route remains retired.
+Every paid create first verifies the wallet signature locally, then applies the durable per-wallet rolling-hour admission limit before B402 verification or settlement. A wallet receives at most 30 accepted new jobs per rolling hour across replicas and restarts; exact retry reuses the existing reservation and does not settle twice.
 
 For the U/USD1 EIP-3009 method, the client signs the following structured typed
 data; no `eth_sign` / `personal_sign` is involved. Permit2 uses the separate
@@ -506,7 +367,7 @@ const sig = await wallet.signTypedData(
   { TransferWithAuthorization: [
       { name: "from",        type: "address" },
       { name: "to",          type: "address" },
-      { name: "value",       type: "uint256" },  // exactly 210000000000000000 in paid mode
+      { name: "value",       type: "uint256" },  // exactly 100000000000000000
       { name: "validAfter",  type: "uint256" },
       { name: "validBefore", type: "uint256" },
       { name: "nonce",       type: "bytes32" },
@@ -525,9 +386,8 @@ const proof = {
 
 In paid mode, the agent verifies that the EIP-712 signature recovers to `from`, the selected
 asset/domain pair is registered, `to` is the seller wallet, the paid value is
-exactly 0.21 token (`210000000000000000` atomic units), the proof is unexpired, and the nonce
-has not been reused. Promotional mode publishes no payment challenge and does
-not inspect a supplied `Payment-Signature` header.
+exactly 0.1 token (`100000000000000000` atomic units), the proof is unexpired, and the nonce
+has not been reused.
 
 The V2 wire exchange is:
 
@@ -547,7 +407,7 @@ does not send a payment signature and never verifies or settles payment again.
 # Get price / challenge
 curl "$X402_ENDPOINT/x402/price"
 
-# Promotional mode: create directly without a wallet or Payment-Signature
+# First request: receive HTTP 402 and the live supported requirements
 curl -X POST "$X402_ENDPOINT/x402/analyze/async" \
   -H "Content-Type: application/json" \
   -d '{"symbols": ["AAPL", "NVDA"]}'
@@ -558,11 +418,6 @@ curl -X POST "$X402_ENDPOINT/x402/analyze/async" \
   -H "Payment-Signature: <base64-proof>" \
   -d '{"symbols": ["AAPL", "NVDA"]}'
 
-# Legacy free quick quote against a matching local server only
-curl -X POST "http://localhost:9000/x402/free" \
-  -H "Content-Type: application/json" \
-  -H "Payment-Signature: <base64-0u-proof>" \
-  -d '{"symbol": "AAPL"}'
 ```
 
 ### ERC-8183 — on-chain trustless escrow
@@ -574,7 +429,7 @@ Buyer                      BSC Testnet contracts         Agent (cloud)
   ├── registerJob ───────────────▶│                           │
   ├── setBudget  ────────────────▶│                           │
   ├── approve (U token) ─────────▶│                           │
-  ├── fund (lock 0.21 U in escrow) ─▶│                           │
+  ├── ERC-8183 fund (lock 0.21 U in escrow) ▶│                    │
   │                               │                           │
   ├── notify_funded ──────────────┼──────────────────────────▶│
   │                               │      LLM analysis (40–120s)│
@@ -592,21 +447,18 @@ To call the agent from your own code, here are the minimal integration points:
 
 ### x402 async (simplest — any language/framework)
 
-1. **POST** `/x402/analyze/async` without `Payment-Signature`.
-2. If the response is HTTP 202, promotional mode created the job directly;
-   persist its `jobId`, `jobToken`, status path, and expiry. Do not sign or send
-   a payment proof.
-3. If the response is HTTP 402, validate every advertised `accepts[]` entry
+1. **POST** `/x402/analyze/async` without `Payment-Signature` and require HTTP 402.
+2. Validate every advertised `accepts[]` entry
    against the four-token mainnet registry, reject duplicates or unknown
    assets, and explicitly select one live-supported token. The paid amount must be exactly
-   `210000000000000000` and
+   `100000000000000000` and
    include method-appropriate B402 metadata.
-4. Copy the complete `resource`, selected requirement, and `extra`. Sign the
+3. Copy the complete `resource`, selected requirement, and `extra`. Sign the
    EIP-3009 authorization for U/USD1 or the exact Permit2 authorization for
    USDC/USDT, then repeat the POST with the V2 proof in `Payment-Signature`.
-5. Persist the returned private job receipt.
-6. Poll the status path with `X-Job-Token`; resume when instructed.
-7. Download the report from the returned private presigned URL.
+4. Persist the returned private job receipt.
+5. Poll the status path with `X-Job-Token`; resume when instructed.
+6. Download the report from the returned private presigned URL.
 
 ### ERC-8183 (TypeScript SDK)
 

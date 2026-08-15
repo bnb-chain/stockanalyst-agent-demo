@@ -3,10 +3,10 @@ from __future__ import annotations
 import base64
 import json
 import unittest
-from unittest.mock import ANY, AsyncMock, Mock, patch
+from unittest.mock import AsyncMock, patch
 
 from stockanalyst.app.agent import x402_handler as handler_module
-from stockanalyst.app.agent.x402_handler import X402Handler, _payment_identity
+from stockanalyst.app.agent.x402_handler import X402Handler
 from stockanalyst.app.agent.x402_job_service import (
     CreateJobResult,
     SettlementIndeterminate,
@@ -23,7 +23,7 @@ def _payment_header() -> str:
         "accepted": {
             "scheme": "exact",
             "network": "eip155:56",
-            "amount": "210000000000000000",
+            "amount": "100000000000000000",
             "asset": "0xc70B8741B8B07A6d61E54fd4B20f22Fa648E5565",
             "payTo": "0xd10bddc20e4dc42a1a19a9653e994991e25b8153",
             "maxTimeoutSeconds": 600,
@@ -93,70 +93,7 @@ class _FakeHttpClient:
         return self._response
 
 
-class X402PaymentIdentityTests(unittest.TestCase):
-    def test_extracts_normalized_address_and_nonce_from_verified_proof(self) -> None:
-        proof = {
-            "payload": {
-                "authorization": {
-                    "from": "0x1111111111111111111111111111111111111111",
-                    "nonce": "0xABCDEF",
-                }
-            }
-        }
-        encoded = base64.b64encode(json.dumps(proof).encode()).decode()
-
-        self.assertEqual(
-            _payment_identity(encoded),
-            (
-                "0x1111111111111111111111111111111111111111",
-                f"0x{'0' * 58}abcdef",
-            ),
-        )
-
-
 class X402CompetitionReportingTests(unittest.IsolatedAsyncioTestCase):
-    def handler(self) -> X402Handler:
-        return X402Handler(
-            None,
-            free_work=Mock(),
-        )
-
-    async def test_zero_value_free_payment_reports_before_quote_generation(self) -> None:
-        handler = self.handler()
-        async def free_work(_symbol: str):
-            yield "report", {"content": "report", "format": "markdown"}
-        handler._free_work = free_work
-        report = AsyncMock(return_value=True)
-        with (
-            patch.object(
-                handler_module,
-                "verify_free_payment_proof",
-                return_value=(True, "9 uses remaining today", ADDRESS),
-            ),
-            patch.object(
-                handler_module,
-                "report_competition_call",
-                report,
-                create=True,
-            ),
-            self.assertLogs("seller-agent.x402", level="INFO") as captured,
-        ):
-            await handler._handle_free(
-                {"headers": [(b"payment-signature", _payment_header().encode())]},
-                _receive_json({"symbol": "AAPL"}),
-                AsyncMock(),
-            )
-
-        report.assert_awaited_once_with(
-            event_id=f"b402-free:56:{ADDRESS}:{NONCE}",
-            address=ADDRESS,
-            called_at=ANY,
-        )
-        rendered = "\n".join(captured.output)
-        self.assertNotIn(ADDRESS, rendered)
-        self.assertNotIn(NONCE, rendered)
-        self.assertNotIn(_payment_header(), rendered)
-
     async def test_b402_unknown_outcome_is_indeterminate_not_rejection(
         self,
     ) -> None:
@@ -362,6 +299,7 @@ class X402CompetitionReportingTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_async_create_delegates_accounting_to_job_service(self) -> None:
         job_service = AsyncMock()
+        b402_client = AsyncMock()
         job_service.create_job.return_value = CreateJobResult(
             job_id="x402_" + "a" * 32,
             job_token="token",
@@ -370,37 +308,32 @@ class X402CompetitionReportingTests(unittest.IsolatedAsyncioTestCase):
         )
         handler = X402Handler(
             None,
-            free_work=Mock(),
             job_service=job_service,
+            b402_client=b402_client,
         )
         sent: list[dict] = []
 
         async def send(message: dict) -> None:
             sent.append(message)
 
-        with patch.object(
-            handler_module,
-            "report_competition_call",
-            new=AsyncMock(),
-        ) as report:
-            await handler(
-                {
-                    "type": "http",
-                    "method": "POST",
-                    "path": "/x402/analyze/async",
-                    "query_string": b"",
-                    "headers": [(b"payment-signature", b"proof")],
-                },
-                _receive_json({"symbols": ["AAPL"]}),
-                send,
-            )
+        await handler(
+            {
+                "type": "http",
+                "method": "POST",
+                "path": "/x402/analyze/async",
+                "query_string": b"",
+                "headers": [(b"payment-signature", b"proof")],
+            },
+            _receive_json({"symbols": ["AAPL"]}),
+            send,
+        )
 
         self.assertEqual(sent[0]["status"], 202)
         job_service.create_job.assert_awaited_once_with(
             "proof",
             {"symbols": ["AAPL"]},
         )
-        report.assert_not_awaited()
+        b402_client.assert_not_called()
 
 
 if __name__ == "__main__":

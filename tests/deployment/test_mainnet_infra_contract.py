@@ -1,13 +1,13 @@
 import ast
 import hashlib
 import json
-from pathlib import Path
 import re
-from tempfile import TemporaryDirectory
-import tomllib
 import unittest
-import yaml
+from pathlib import Path
+from tempfile import TemporaryDirectory
 
+import tomllib
+import yaml
 
 ROOT = Path(__file__).resolve().parents[2]
 ROOT_README = ROOT / "README.md"
@@ -23,6 +23,7 @@ CUSTOM_DOMAIN_CUTOVER_STATE = (
 )
 STUDIO = ROOT / "stockanalyst" / "app" / "agent" / "studio.toml"
 TOKENS = ROOT / "stockanalyst" / "app" / "agent" / "x402_tokens.py"
+BUYER_PAYMENT_TOKENS = ROOT / "buyer-client" / "src" / "x402-payment.ts"
 VERIFIER = ROOT / "stockanalyst" / "app" / "agent" / "x402_verify.py"
 RUNTIME_X402_SOURCE_ROOT = ROOT / "stockanalyst" / "app" / "agent"
 GATEWAY_X402_SOURCE_ROOT = ROOT / "gateway" / "x402_lambda" / "src"
@@ -31,6 +32,10 @@ RUNTIME_X402_HANDLER = RUNTIME_X402_SOURCE_ROOT / "x402_handler.py"
 GATEWAY_X402_ENVELOPE = GATEWAY_X402_SOURCE_ROOT / "envelope.py"
 GATEWAY_X402_CLIENT = GATEWAY_X402_SOURCE_ROOT / "agentcore_client.py"
 BUYER_X402_ASYNC_CLIENT = BUYER_X402_SOURCE_ROOT / "x402-async-client.ts"
+B402_CLIENT_TESTS = RUNTIME_X402_SOURCE_ROOT / "tests" / "test_b402_client.py"
+COMPETITION_REPORTING_TESTS = (
+    RUNTIME_X402_SOURCE_ROOT / "tests" / "test_x402_competition_reporting.py"
+)
 PUBLIC_FOUR_TOKEN_DOCUMENTS = (
     ROOT_README,
     STOCKANALYST_README,
@@ -45,10 +50,10 @@ TRACKED_X402_GUIDANCE = (
 )
 PAID_TOKEN_TABLE = """| Token | BSC address | Method | Price |
 | --- | --- | --- | --- |
-| U | `0xcE24439F2D9C6a2289F741120FE202248B666666` | `eip3009` | 0.21 U |
-| USD1 | `0x8d0D000Ee44948FC98c9B98A4FA4921476f08B0d` | `eip3009` | 0.21 USD1 |
-| USDC | `0x8AC76a51cc950d9822D68b83fE1Ad97B32Cd580d` | `permit2-exact` | 0.21 USDC |
-| USDT | `0x55d398326f99059fF775485246999027B3197955` | `permit2-exact` | 0.21 USDT |"""
+| U | `0xcE24439F2D9C6a2289F741120FE202248B666666` | `eip3009` | 0.1 U |
+| USD1 | `0x8d0D000Ee44948FC98c9B98A4FA4921476f08B0d` | `eip3009` | 0.1 USD1 |
+| USDC | `0x8AC76a51cc950d9822D68b83fE1Ad97B32Cd580d` | `permit2-exact` | 0.1 USDC |
+| USDT | `0x55d398326f99059fF775485246999027B3197955` | `permit2-exact` | 0.1 USDT |"""
 CANONICAL_PERMIT2 = "0x000000000022D473030F116dDEE9F6B43aC78BA3"
 EXPECTED_RUNTIME_SECRET_NAMES = frozenset(
     {
@@ -76,7 +81,6 @@ EXPECTED_RUNTIME_SECRET_NAMES = frozenset(
         "X402_JOB_S3_BUCKET",
         "X402_JOB_S3_PREFIX",
         "X402_JOB_TOKEN_SECRET",
-        "X402_PROMO_FREE_MODE",
         "X402_TOKEN_ADDRESS",
     }
 )
@@ -255,7 +259,7 @@ CloudFormationLoader.add_multi_constructor("!", _construct_cloudformation_tag)
 def load_cloudformation(path: Path) -> dict[str, object]:
     document = yaml.load(path.read_text(encoding="utf-8"), Loader=CloudFormationLoader)
     if not isinstance(document, dict):
-        raise AssertionError(f"CloudFormation document is not a mapping: {path}")
+        raise TypeError(f"CloudFormation document is not a mapping: {path}")
     return document
 
 
@@ -286,7 +290,171 @@ def affirmative_payment_guidance_violations(documentation: str) -> list[str]:
 
 
 class MainnetInfrastructureContractTests(unittest.TestCase):
-    def test_public_docs_describe_the_complete_four_token_contract(self) -> None:
+    def test_seller_and_buyer_payment_registries_match(self) -> None:
+        seller_tree = ast.parse(TOKENS.read_text())
+        seller: dict[str, dict[str, object]] = {}
+        for node in seller_tree.body:
+            if not isinstance(node, ast.Assign) or len(node.targets) != 1:
+                continue
+            target = node.targets[0]
+            if (
+                not isinstance(target, ast.Name)
+                or not target.id.endswith("_TOKEN")
+                or not isinstance(node.value, ast.Call)
+            ):
+                continue
+            fields = {
+                keyword.arg: ast.literal_eval(keyword.value)
+                for keyword in node.value.keywords
+                if keyword.arg is not None
+            }
+            seller[str(fields["symbol"])] = {
+                "asset": fields["address"],
+                "name": fields["domain_name"],
+                "version": fields["domain_version"],
+                "transferMethod": fields.get("transfer_method", "eip3009"),
+            }
+
+        source = BUYER_PAYMENT_TOKENS.read_text()
+        buyer: dict[str, dict[str, str]] = {}
+        for symbol, block in re.findall(
+            r"^  (U|USD1|USDC|USDT): \{(.*?)^  \},$",
+            source,
+            flags=re.MULTILINE | re.DOTALL,
+        ):
+            buyer[symbol] = dict(
+                re.findall(
+                    r'^    (asset|name|version|transferMethod): "([^"]+)",$',
+                    block,
+                    flags=re.MULTILINE,
+                )
+            )
+
+        self.assertEqual(set(seller), {"U", "USD1", "USDC", "USDT"})
+        self.assertEqual(buyer, seller)
+
+    def test_retired_free_buyer_artifacts_are_absent(self) -> None:
+        self.assertFalse((BUYER_X402_SOURCE_ROOT / "x402-free-client.ts").exists())
+        self.assertFalse(
+            (BUYER_X402_SOURCE_ROOT / "x402-free-client.test.ts").exists()
+        )
+
+    def test_paid_runtime_has_no_zero_settlement_demo_bypass(self) -> None:
+        handler = RUNTIME_X402_HANDLER.read_text(encoding="utf-8")
+        studio = STUDIO.read_text(encoding="utf-8")
+
+        for source in (handler, studio):
+            self.assertNotIn("X402_DEMO_MODE", source)
+        self.assertNotIn('transaction="demo"', handler)
+        self.assertNotIn("no on-chain transfer", handler.lower())
+
+    def test_affirmative_x402_fixtures_use_the_exact_point_1_price(self) -> None:
+        b402_tests = B402_CLIENT_TESTS.read_text(encoding="utf-8")
+        competition_tests = COMPETITION_REPORTING_TESTS.read_text(encoding="utf-8")
+
+        permit2_requirement = re.search(
+            r"(?s)PERMIT2_PAYMENT_REQUIREMENT\s*=\s*\{.*?\n\}",
+            b402_tests,
+        )
+        self.assertIsNotNone(permit2_requirement)
+        assert permit2_requirement is not None
+        self.assertIn('"amount": "100000000000000000"', permit2_requirement.group())
+
+        affirmative_proof = re.search(
+            r"(?s)^def _payment_header\(\) -> str:.*?^\s*return ",
+            competition_tests,
+            re.MULTILINE,
+        )
+        self.assertIsNotNone(affirmative_proof)
+        assert affirmative_proof is not None
+        self.assertIn('"amount": "100000000000000000"', affirmative_proof.group())
+
+    def test_large_guides_preserve_unrelated_pre_task5_material(self) -> None:
+        preservation_contracts = {
+            ROOT_README: (
+                240,
+                (
+                    "## Architecture",
+                    "## Payment channel comparison",
+                    "## Quick start",
+                    "## ERC-8183 E2E test flow",
+                    "## Authenticated delivery notification",
+                    "## Repository Structure",
+                    "## BSC Testnet Contracts (chain 97)",
+                ),
+            ),
+            BUYER_README: (
+                500,
+                (
+                    "## Architecture",
+                    "## Prerequisites",
+                    "## Authenticated `notify_funded`",
+                    "## Authenticated payload delivery",
+                    "## Setup",
+                    "## Quick start — x402 paid async",
+                    "## ERC-8183 flow (cloud seller, on-chain escrow)",
+                    "## Source files",
+                    "## Payment channels explained",
+                    "## Building your own buyer client",
+                    "## ERC-8183-only BSC Testnet contract addresses",
+                    "## UOMP — user-owned portfolio context",
+                    "## Resources",
+                ),
+            ),
+            STOCKANALYST_README: (
+                1000,
+                (
+                    "## Why a Blockchain-Settled Stock Analyst?",
+                    "## 1. Analysis Engine",
+                    "## 2. Protocol Architecture",
+                    "## 3. System Architecture",
+                    "## 4. E2E Testing",
+                    "## Pricing",
+                    "# 中文",
+                    "## 为什么要用区块链结算的股票分析 Agent？",
+                    "## 1. 分析引擎",
+                    "## 2. 协议架构",
+                    "## 3. 系统架构",
+                    "## 4. 端到端测试",
+                    "## 定价",
+                    "## CI 自动测试",
+                ),
+            ),
+        }
+
+        for path, (minimum_lines, anchors) in preservation_contracts.items():
+            with self.subTest(path=path.relative_to(ROOT)):
+                documentation = path.read_text(encoding="utf-8")
+                self.assertGreaterEqual(len(documentation.splitlines()), minimum_lines)
+                for anchor in anchors:
+                    self.assertIn(anchor, documentation)
+
+    def test_task_authored_curl_examples_use_portable_line_continuations(self) -> None:
+        buyer_readme = BUYER_README.read_text(encoding="utf-8")
+        curl_examples = tuple(
+            block
+            for block in re.findall(r"(?s)```bash\n(.*?)\n```", buyer_readme)
+            if re.search(r"(?m)^curl ", block)
+        )
+
+        self.assertTrue(curl_examples)
+        for example in curl_examples:
+            self.assertNotRegex(example, r"(?m)^.*\\\\$")
+
+    def test_agent_runtime_guide_preserves_operational_reference_material(self) -> None:
+        documentation = AGENT_README.read_text(encoding="utf-8")
+
+        for anchor in (
+            "## Key files",
+            "| `main.py` | Entrypoint:",
+            "| `x402_handler.py` | x402 routes:",
+            "## Run locally",
+            "python main.py",
+            "Deployed platform uses `X402_PORT=9001`",
+        ):
+            self.assertIn(anchor, documentation)
+
+    def test_public_docs_describe_the_paid_wallet_limited_four_token_contract(self) -> None:
         for path in PUBLIC_FOUR_TOKEN_DOCUMENTS:
             with self.subTest(path=path.relative_to(ROOT)):
                 self.assertTrue(path.is_file(), f"missing public guide: {path}")
@@ -295,7 +463,6 @@ class MainnetInfrastructureContractTests(unittest.TestCase):
                 self.assertIn(PAID_TOKEN_TABLE, documentation)
                 for required in (
                     f"canonical Permit2 `{CANONICAL_PERMIT2}`",
-                    "A 50-token allowance covers 238 complete 0.21 payments and leaves 0.02 token.",
                     "`npm run x402:allowance`",
                     "`npm run x402:approve`",
                     "`npm run x402:revoke`",
@@ -306,11 +473,28 @@ class MainnetInfrastructureContractTests(unittest.TestCase):
                     f"`extra.spenderAddress` is the live B402 proxy and the `permit2-exact` typed-data spender; the ERC-20 approval target remains canonical Permit2 `{CANONICAL_PERMIT2}`.",
                     "Only a freshly created Permit2 reservation in the same request uses verify-and-settle.",
                     "Every pre-existing stale Permit2 reservation is recovered settle-only with the identical persisted proof, regardless of `pendingSettlementReference` or deadline; recovery does not call `/verify`.",
-                    "Both approve and revoke require confirmation; `--yes` is an explicit noninteractive bypass.",
-                    "In promotional mode, `paymentRequired=false` and the active `accepts=[]`; `supportedAssets` may still list all four tokens as registry metadata and is not an active payment requirement.",
-                    "There is no USDC/USDT promotional proof, B402 verify/settle, or automatic approval.",
+                    "approve and revoke require confirmation",
+                    "`--yes` is an explicit noninteractive bypass",
+                    "30 accepted new jobs per rolling hour",
+                    "before B402 verification or settlement",
+                    "An exact retry does not consume another slot",
+                    "terminal settlement or queued state using `settledAt`",
                 ):
                     self.assertIn(required, normalized)
+                for forbidden in (
+                    "X402_PROMO_FREE_MODE",
+                    "/x402/free",
+                    "Wallet-Signature",
+                    "x402:free",
+                    "promoFree",
+                    "promotional",
+                    "proofless",
+                    "zero-value payment",
+                ):
+                    self.assertNotIn(forbidden, documentation)
+                for line in documentation.splitlines():
+                    if "0.21" in line:
+                        self.assertIn("ERC-8183", line)
 
     def test_tracked_guidance_rejects_stale_or_unsafe_payment_advice(self) -> None:
         for path in TRACKED_X402_GUIDANCE:
@@ -340,6 +524,34 @@ class MainnetInfrastructureContractTests(unittest.TestCase):
         self.assertIn(
             "The legacy `signingScheme` describes the highest-priority active "
             "accept.",
+            normalized,
+        )
+        self.assertIn(
+            "U and USD1 use EIP-712 `TransferWithAuthorization` typed data; "
+            "never use `eth_sign` or `personal_sign`.",
+            normalized,
+        )
+        self.assertIn(
+            "The EIP-3009 domain is copied from the selected requirement: "
+            "`name` and `version` from `accepted.extra`, chain ID 56, and "
+            "`verifyingContract` equal to `accepted.asset`.",
+            normalized,
+        )
+        self.assertIn(
+            "The authorization binds `from`, `to`, exact `value` "
+            "100000000000000000, `validAfter`, `validBefore`, and a fresh "
+            "32-byte `nonce`.",
+            normalized,
+        )
+        self.assertIn(
+            "Copy the selected `accepted` requirement unchanged into the V2 "
+            "proof and send its base64-encoded JSON only in `Payment-Signature`.",
+            normalized,
+        )
+        self.assertIn(
+            "The client must recover the signer locally, require the configured "
+            "payer and pay-to addresses, reject expired windows or reused "
+            "nonces, and never log the signature or private key.",
             normalized,
         )
         self.assertIn(
@@ -373,7 +585,7 @@ Witness(address to, uint256 validAfter)
   "permit2Authorization": {
     "permitted": {
       "token": "<accepted.asset>",
-      "amount": "210000000000000000"
+      "amount": "100000000000000000"
     },
     "from": "<payer wallet>",
     "spender": "<lowercase accepted.extra.spenderAddress>",
@@ -431,10 +643,10 @@ Witness(address to, uint256 validAfter)
                     affirmative_payment_guidance_violations(guidance), []
                 )
 
-    def test_runtime_secret_name_contract_remains_the_existing_26_names(self) -> None:
+    def test_runtime_secret_name_contract_has_25_paid_only_names(self) -> None:
         declared = declared_runtime_secret_names(STUDIO.read_text(encoding="utf-8"))
 
-        self.assertEqual(len(declared), 26)
+        self.assertEqual(len(declared), 25)
         self.assertEqual(len(declared), len(set(declared)))
         self.assertEqual(frozenset(declared), EXPECTED_RUNTIME_SECRET_NAMES)
         self.assertNotIn("BSC_RPC_URL", declared)
@@ -594,90 +806,49 @@ Witness(address to, uint256 validAfter)
         for header in ("payment-required", "payment-response"):
             self.assertRegex(gateway_client, rf"(?i){re.escape(header)}")
 
-    def test_mainnet_paid_analysis_prices_are_exactly_point_21(self) -> None:
+    def test_mainnet_paid_analysis_prices_are_exactly_point_1(self) -> None:
         config = tomllib.loads(STUDIO.read_text(encoding="utf-8"))
         erc8183 = config["payments"]["erc8183"]
         x402 = config["payments"]["x402"]["seller"]
         self.assertEqual(erc8183["price"], "210000000000000000")
         self.assertEqual(erc8183["min_price"], "210000000000000000")
         self.assertEqual(erc8183["max_price"], "5000000000000000000")
-        self.assertEqual(x402["price_wei"], "210000000000000000")
-        self.assertEqual(x402["min_price_wei"], "210000000000000000")
+        self.assertEqual(x402["price_wei"], "100000000000000000")
+        self.assertEqual(x402["min_price_wei"], "100000000000000000")
 
         buyer_readme = BUYER_README.read_text(encoding="utf-8")
         stock_readme = STOCKANALYST_README.read_text(encoding="utf-8")
         agent_readme = (ROOT / "stockanalyst" / "app" / "agent" / "README.md").read_text(
             encoding="utf-8"
         )
-        main_source = AGENT_MAIN.read_text(encoding="utf-8")
-
         for documentation in (buyer_readme, stock_readme, agent_readme):
             self.assertIn(PAID_TOKEN_TABLE, documentation)
-        self.assertIn("Paid tier (0.21 U)", main_source)
 
-    def test_root_readme_describes_current_point_21_prices(self) -> None:
-        root_readme = ROOT_README.read_text(encoding="utf-8")
-
-        for current_guidance in (
-            PAID_TOKEN_TABLE,
-            "sign exact 0.21-token proof",
-            "sign quote → 0.21 U",
-            "| **Paid** full analysis via x402 | `npm run x402:async` | 0.21 U, USD1, USDC, or USDT |",
-            "signed quote 0.21 U",
-            "+ ≥ 0.21 U (for ERC-8183)",
-            "# paid: exact 0.21 selected token",
-            "# paid: 0.21 U, full analysis, ERC-8183 trustless",
-        ):
-            self.assertIn(current_guidance, root_readme)
-
-    def test_mainnet_x402_examples_and_manual_promo_runbook_are_consistent(self) -> None:
+    def test_mainnet_x402_examples_are_paid_only_and_keep_erc8183_distinct(self) -> None:
         documents = (
             ROOT_README.read_text(encoding="utf-8"),
             BUYER_ENV.read_text(encoding="utf-8"),
             BUYER_README.read_text(encoding="utf-8"),
-            STOCKANALYST_README.read_text(encoding="utf-8"),
         )
         for documentation in documents:
-            self.assertIn(
-                "X402_ENDPOINT=https://stock-agent.bnbchain.org", documentation
-            )
-            self.assertIn(CUSTOM_DOMAIN_CUTOVER_STATE, documentation)
+            self.assertIn("https://stock-agent.bnbchain.org", documentation)
             self.assertNotIn("xolw2dzbw2.execute-api", documentation)
             self.assertNotIn(
                 "X402_ENDPOINT=https://<api-id>.execute-api.us-east-1.amazonaws.com/mainnet",
                 documentation,
             )
+        self.assertIn("X402_ENDPOINT=https://stock-agent.bnbchain.org", documents[1])
+        self.assertIn(CUSTOM_DOMAIN_CUTOVER_STATE, documents[1])
         studio = STUDIO.read_text(encoding="utf-8")
         self.assertIn(
             "X402_GATEWAY_PUBLIC_BASE_URL=https://stock-agent.bnbchain.org",
             studio,
         )
         self.assertNotIn("xolw2dzbw2.execute-api", studio)
-        self.assertIn("bag env set X402_PROMO_FREE_MODE 1", documents[2])
-        self.assertIn("bag env set X402_PROMO_FREE_MODE 0", documents[2])
-
-    def test_async_promotional_runbook_is_proofless_and_ip_limited(self) -> None:
-        buyer = BUYER_README.read_text(encoding="utf-8")
-        seller = STOCKANALYST_README.read_text(encoding="utf-8")
-        expected = (
-            "When `X402_PROMO_FREE_MODE=1`, callers POST directly without a "
-            "wallet or `Payment-Signature`."
+        self.assertEqual(
+            tomllib.loads(studio)["payments"]["erc8183"]["price"],
+            "210000000000000000",
         )
-        quota = (
-            "Every accepted POST creates a new job and consumes one of the "
-            "30 requests per trusted IP in the rolling 24-hour window, "
-            "including an identical retry."
-        )
-        rollback = (
-            "Setting `X402_PROMO_FREE_MODE=0` restores the four-token paid "
-            "HTTP 402 flow."
-        )
-
-        for document in (buyer, seller):
-            normalized = " ".join(document.split())
-            self.assertIn(expected, normalized)
-            self.assertIn(quota, normalized)
-            self.assertIn(rollback, normalized)
 
     def test_runtime_configuration_is_mainnet_only(self) -> None:
         studio = STUDIO.read_text(encoding="utf-8")
@@ -710,7 +881,7 @@ Witness(address to, uint256 validAfter)
             studio,
         )
 
-    def test_mainnet_x402_registry_and_promotional_controls_are_explicit(self) -> None:
+    def test_mainnet_x402_registry_is_paid_only(self) -> None:
         studio = STUDIO.read_text(encoding="utf-8")
         tokens = TOKENS.read_text(encoding="utf-8")
         verifier = VERIFIER.read_text(encoding="utf-8")
@@ -731,13 +902,8 @@ Witness(address to, uint256 validAfter)
         ):
             self.assertIn(value, tokens)
         self.assertEqual(tokens.count("decimals=18"), 4)
-        self.assertIn("bag env set X402_PROMO_FREE_MODE 1", studio)
-        self.assertIn("bag env set X402_PROMO_FREE_MODE 0", studio)
-        self.assertIn(
-            "Promotional access is proofless: paymentRequired=false, accepts=[],",
-            studio,
-        )
-        self.assertIn("and no payment proof is required", studio)
+        self.assertNotIn("X402_PROMO_FREE_MODE", studio)
+        self.assertNotIn("promotional", studio.lower())
         self.assertNotIn("still require an EIP-3009 wallet signature", studio)
         self.assertNotIn("MIN_PRICE_WEI", verifier)
         self.assertIn("U_TOKEN_ADDRESS = U_TOKEN.address", verifier)

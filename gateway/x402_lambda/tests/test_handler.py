@@ -10,7 +10,6 @@ import handler
 from agentcore_client import AgentInvocationTimeout, InvalidAgentResponse
 from oauth_client import OAuthUnavailable
 
-
 PUBLIC_BASE = "https://a1b2c3d4e5.execute-api.us-east-1.amazonaws.com/testnet"
 CUSTOM_DOMAIN = "stock-agent.bnbchain.org"
 CUSTOM_PUBLIC_BASE = f"https://{CUSTOM_DOMAIN}"
@@ -234,7 +233,7 @@ class HandlerTests(unittest.TestCase):
         self.assertTrue(body["retryable"])
         self.assertNotIn("proof", result["body"].lower())
 
-    def test_free_gateway_request_is_forwarded(self):
+    def test_retired_free_gateway_request_is_rejected(self):
         event = {
             **EVENT,
             "path": "/testnet/x402/free",
@@ -245,9 +244,12 @@ class HandlerTests(unittest.TestCase):
         app = handler.GatewayApplication(FakeOAuth(), agentcore)
         with patch.object(handler, "_application", app):
             result = handler.lambda_handler(event, CONTEXT)
-        self.assertEqual(result["statusCode"], 402)
-        self.assertEqual(agentcore.calls[0]["envelope"]["path"], "/x402/free")
-        self.assertEqual(agentcore.calls[0]["envelope"]["queryString"], "symbol=AAPL")
+        self.assertEqual(result["statusCode"], 400)
+        self.assertEqual(
+            json.loads(result["body"])["errorCode"],
+            "route_not_allowed",
+        )
+        self.assertEqual(agentcore.calls, [])
 
     def test_missing_configuration_returns_safe_503(self):
         with patch.object(handler, "_application", None), patch.dict(os.environ, {}, clear=True):

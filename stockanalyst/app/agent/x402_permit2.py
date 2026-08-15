@@ -101,7 +101,10 @@ def _wire_uint256(value: object) -> int | None:
     return canonical_uint256(value)
 
 
-def _valid_extra(extra: object, token: PaymentToken) -> bool:
+def _valid_extra(
+    extra: object,
+    token: PaymentToken,
+) -> bool:
     return bool(
         isinstance(extra, Mapping)
         and _EXTRA_KEYS.issubset(extra.keys())
@@ -190,22 +193,27 @@ def verify_permit2_exact(
     """Verify one exact Permit2 proof without consuming its nonce."""
     try:
         from .x402_verify import (
-            PRICE_WEI,
             VerifiedPayment,
             build_payment_requirement,
         )
     except ImportError:  # Direct imports from stockanalyst/app/agent.
         from x402_verify import (  # type: ignore[no-redef]
-            PRICE_WEI,
             VerifiedPayment,
             build_payment_requirement,
         )
+    try:
+        from .x402_verify import PRICE_WEI
+    except ImportError:
+        from x402_verify import PRICE_WEI
 
     accepted = proof.get("accepted")
     if not isinstance(accepted, dict):
         return None, _REQUIREMENT_REJECTION
     accepted_extra = accepted.get("extra")
-    if not _valid_extra(accepted_extra, token):
+    if not _valid_extra(
+        accepted_extra,
+        token,
+    ):
         return None, _REQUIREMENT_REJECTION
 
     expected_extra: object = accepted_extra
@@ -213,10 +221,17 @@ def verify_permit2_exact(
         if not isinstance(expected_requirement, Mapping):
             return None, _REQUIREMENT_REJECTION
         expected_extra = expected_requirement.get("extra")
-    if not _valid_extra(expected_extra, token):
+    if not _valid_extra(
+        expected_extra,
+        token,
+    ):
         return None, _REQUIREMENT_REJECTION
 
-    canonical = build_payment_requirement(token, expected_extra)
+    canonical = build_payment_requirement(
+        token,
+        expected_extra,
+        amount=PRICE_WEI,
+    )
     if (
         expected_requirement is not None
         and dict(expected_requirement) != canonical
@@ -316,7 +331,6 @@ def verify_permit2_exact(
             asset=token.address.lower(),
             token_symbol=token.symbol,
             transfer_method=token.transfer_method,
-            promotional=False,
         ),
         "",
     )

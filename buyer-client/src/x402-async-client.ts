@@ -34,9 +34,10 @@ export interface AsyncJobReceipt {
   expiresAt: number;
 }
 
-export type BeginAsyncAnalysisResult =
-  | { kind: "created"; receipt: AsyncJobReceipt }
-  | { kind: "payment_required"; challenge: PaidPaymentChallenge };
+export interface BeginAsyncAnalysisResult {
+  kind: "payment_required";
+  challenge: PaidPaymentChallenge;
+}
 
 export interface AsyncJobStatus {
   jobId: string;
@@ -78,16 +79,22 @@ export class AsyncJobClientError extends Error {
   readonly code: string;
   readonly httpStatus?: number;
   readonly retryable: boolean;
+  readonly retryAfterMilliseconds?: number;
 
   constructor(
     code: string,
-    options: { httpStatus?: number; retryable?: boolean } = {},
+    options: {
+      httpStatus?: number;
+      retryable?: boolean;
+      retryAfterMilliseconds?: number;
+    } = {},
   ) {
     super(`x402 asynchronous job failed: ${code}`);
     this.name = "AsyncJobClientError";
     this.code = code;
     this.httpStatus = options.httpStatus;
     this.retryable = options.retryable ?? false;
+    this.retryAfterMilliseconds = options.retryAfterMilliseconds;
   }
 }
 
@@ -150,7 +157,8 @@ const SAFE_SERVER_ERROR_CODES = new Set([
   "payment_backend_unavailable",
   "payment_rejected",
   "payment_unavailable",
-  "promo_rate_limited",
+  "wallet_rate_limited",
+  "wallet_rate_limit_unavailable",
   "request_too_large",
   "settlement_pending",
 ]);
@@ -365,10 +373,7 @@ function parsePaymentChallenge(
     || !Object.prototype.hasOwnProperty.call(PAYMENT_TOKENS, preferredToken)
   ) invalidPaymentChallenge();
 
-  const acceptedBySymbol = new Map<PaymentTokenSymbol, {
-    accepted: B402PaymentRequirement;
-    promotional: boolean;
-  }>();
+  const acceptedBySymbol = new Map<PaymentTokenSymbol, B402PaymentRequirement>();
   for (const acceptedValue of paymentRequired["accepts"]) {
     if (!isRecord(acceptedValue)) invalidPaymentChallenge();
     const extraValue = acceptedValue["extra"];
@@ -385,7 +390,6 @@ function parsePaymentChallenge(
     const payTo = acceptedValue["payTo"];
     const timeout = acceptedValue["maxTimeoutSeconds"];
     const amount = acceptedValue["amount"];
-    const promotional = amount === "0";
     const signerAddress = extraValue["signerAddress"];
     const spenderAddress = extraValue["spenderAddress"];
     const hasSignerAddress = Object.prototype.hasOwnProperty.call(
@@ -400,23 +404,16 @@ function parsePaymentChallenge(
     if (
       acceptedValue["scheme"] !== "exact"
       || acceptedValue["network"] !== BSC_MAINNET_NETWORK
-      || (!promotional && amount !== PAID_AMOUNT)
-      || (promotional && transferMethod !== "eip3009")
+      || amount !== PAID_AMOUNT
       || typeof payTo !== "string"
       || payTo.toLowerCase() !== seller
       || timeout !== PAYMENT_TIMEOUT_SECONDS
       || extraValue["name"] !== token.name
       || extraValue["version"] !== token.version
       || extraValue["assetTransferMethod"] !== transferMethod
-      || (
-        promotional
-          ? hasSignerAddress
-          : (
-            !hasSignerAddress
-            || typeof signerAddress !== "string"
-            || !EVM_ADDRESS_PATTERN.test(signerAddress)
-          )
-      )
+      || !hasSignerAddress
+      || typeof signerAddress !== "string"
+      || !EVM_ADDRESS_PATTERN.test(signerAddress)
       || (
         transferMethod === "permit2-exact"
         && (
@@ -434,21 +431,18 @@ function parsePaymentChallenge(
       version: token.version,
       assetTransferMethod: transferMethod,
     };
-    if (!promotional) extra.signerAddress = signerAddress as string;
+    extra.signerAddress = signerAddress as string;
     if (transferMethod === "permit2-exact") {
       extra.spenderAddress = spenderAddress as string;
     }
     acceptedBySymbol.set(symbol, {
-      promotional,
-      accepted: {
-        scheme: "exact",
-        network: BSC_MAINNET_NETWORK,
-        amount: amount as string,
-        asset: token.asset,
-        payTo: payTo.toLowerCase(),
-        maxTimeoutSeconds: timeout as number,
-        extra,
-      },
+      scheme: "exact",
+      network: BSC_MAINNET_NETWORK,
+      amount: amount as string,
+      asset: token.asset,
+      payTo: payTo.toLowerCase(),
+      maxTimeoutSeconds: timeout as number,
+      extra,
     });
   }
   const selected = acceptedBySymbol.get(preferredToken);
@@ -463,8 +457,7 @@ function parsePaymentChallenge(
   return {
     x402Version: 2,
     resource,
-    accepted: selected.accepted,
-    promotional: selected.promotional,
+    accepted: selected,
   };
 }
 
@@ -728,7 +721,19 @@ async function responseError(response: Response): Promise<AsyncJobClientError> {
   return new AsyncJobClientError(code, {
     httpStatus: response.status,
     retryable,
+    retryAfterMilliseconds: strictWalletRetryAfterMilliseconds(response),
   });
+}
+
+function strictWalletRetryAfterMilliseconds(
+  response: Response,
+): number | undefined {
+  if (response.status !== 429) return undefined;
+  const raw = response.headers.get("Retry-After");
+  if (raw === null || !/^[1-9][0-9]{0,3}$/.test(raw)) return undefined;
+  const seconds = Number(raw);
+  if (!Number.isSafeInteger(seconds) || seconds > 3_600) return undefined;
+  return seconds * 1_000;
 }
 
 function tokenHeaders(token: string): HeadersInit {
@@ -895,12 +900,7 @@ export async function beginAsyncAnalysis(
       redirect: "error",
     },
   );
-  if (response.status === 202) {
-    return {
-      kind: "created",
-      receipt: parseReceipt(endpoint, await readJson(response)),
-    };
-  }
+  if (response.status === 202) throw new AsyncJobClientError("invalid_response");
   if (response.status !== 402) throw await responseError(response);
   try {
     return {

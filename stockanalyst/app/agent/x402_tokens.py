@@ -57,7 +57,6 @@ TOKENS: tuple[PaymentToken, ...] = (
     USDC_TOKEN,
     USDT_TOKEN,
 )
-PROMOTIONAL_TOKENS: tuple[PaymentToken, ...] = (U_TOKEN, USD1_TOKEN)
 _BY_ASSET = {token.address.lower(): token for token in TOKENS}
 
 

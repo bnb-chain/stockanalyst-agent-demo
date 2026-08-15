@@ -91,6 +91,7 @@ def permit2_proof(
     extra_fields: dict[str, Any] | None = None,
     accepted_spender: str = SPENDER,
     authorization_spender: str | None = None,
+    amount: str | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     extra = {
         "name": token.domain_name,
@@ -102,6 +103,8 @@ def permit2_proof(
     if extra_fields is not None:
         extra.update(copy.deepcopy(extra_fields))
     accepted = verify.build_payment_requirement(token, extra)
+    if amount is not None:
+        accepted["amount"] = amount
     authorization = {
         "permitted": {
             "token": token.address,
@@ -172,7 +175,7 @@ def test_real_permit2_signatures_recover_both_registered_payers(token) -> None:
     assert payment.nonce_bytes == (12345678901234567890).to_bytes(32, "big")
     assert payment.valid_after == NOW - 60
     assert payment.valid_before == NOW + 600
-    assert payment.promotional is False
+    assert not hasattr(payment, "promotional")
 
 
 def test_nested_additive_extra_survives_challenge_proof_and_verification() -> None:
@@ -489,7 +492,7 @@ def test_signature_from_a_different_signer_is_rejected() -> None:
         (("permitted", "amount"), str(2**256)),
         (("permitted", "amount"), True),
         (("permitted", "amount"), float(verify.PRICE_WEI)),
-        (("permitted", "amount"), "0210000000000000000"),
+        (("permitted", "amount"), "0100000000000000000"),
         (("nonce",), "-1"),
         (("nonce",), str(2**256)),
         (("nonce",), False),
@@ -710,20 +713,6 @@ def test_missing_required_wire_fields_are_rejected(path: tuple[str, ...]) -> Non
 
     assert payment is None
     assert reason == SAFE_PROOF_REJECTION
-
-
-def test_permit2_promotional_dispatch_is_forbidden() -> None:
-    proof, expected = permit2_proof()
-
-    payment, reason = verify.validate_payment_proof(
-        encoded_proof(proof),
-        expected_requirement=expected,
-        now=NOW,
-        promotional=True,
-    )
-
-    assert payment is None
-    assert reason == "payment requirement is missing or invalid"
 
 
 def test_permit2_version_rejection_never_reflects_untrusted_input() -> None:

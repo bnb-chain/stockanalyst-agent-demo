@@ -9,49 +9,24 @@
 
 ---
 
-## BSC Mainnet x402 payment contract
+## Paid x402 contract
 
-The public paid asynchronous API charges exactly 0.21 of the selected
-18-decimal token:
+x402 payments use **BSC Mainnet (chain ID 56)**. Every accepted analysis costs exactly `100000000000000000` atomic units (0.1 of the selected 18-decimal token).
 
 | Token | BSC address | Method | Price |
 | --- | --- | --- | --- |
-| U | `0xcE24439F2D9C6a2289F741120FE202248B666666` | `eip3009` | 0.21 U |
-| USD1 | `0x8d0D000Ee44948FC98c9B98A4FA4921476f08B0d` | `eip3009` | 0.21 USD1 |
-| USDC | `0x8AC76a51cc950d9822D68b83fE1Ad97B32Cd580d` | `permit2-exact` | 0.21 USDC |
-| USDT | `0x55d398326f99059fF775485246999027B3197955` | `permit2-exact` | 0.21 USDT |
+| U | `0xcE24439F2D9C6a2289F741120FE202248B666666` | `eip3009` | 0.1 U |
+| USD1 | `0x8d0D000Ee44948FC98c9B98A4FA4921476f08B0d` | `eip3009` | 0.1 USD1 |
+| USDC | `0x8AC76a51cc950d9822D68b83fE1Ad97B32Cd580d` | `permit2-exact` | 0.1 USDC |
+| USDT | `0x55d398326f99059fF775485246999027B3197955` | `permit2-exact` | 0.1 USDT |
 
-B402 capabilities may be partial, so a paid challenge contains only the live
-supported subset. `extra.signerAddress` is facilitator EOA metadata; it is not
-the Permit2 spender and is not part of `permit2-exact` typed data.
-`extra.spenderAddress` is the live B402 proxy and the `permit2-exact`
-typed-data spender; the ERC-20 approval target remains canonical Permit2
-`0x000000000022D473030F116dDEE9F6B43aC78BA3`.
+B402 capabilities may be partial; choose one live supported requirement. U and USD1 use EIP-3009; USDC and USDT use `permit2-exact`. `extra.signerAddress` is facilitator EOA metadata; it is not the Permit2 spender and is not part of `permit2-exact` typed data. `extra.spenderAddress` is the live B402 proxy and the `permit2-exact` typed-data spender; the ERC-20 approval target remains canonical Permit2 `0x000000000022D473030F116dDEE9F6B43aC78BA3`.
 
-The explicit buyer commands are `npm run x402:allowance`,
-`npm run x402:approve`, and `npm run x402:revoke`, with `-- USDC` or
-`-- USDT`. Both approve and revoke require confirmation; `--yes` is an explicit
-noninteractive bypass. Approval sets an exact 50-token cap and revoke sets
-zero. A 50-token allowance covers 238 complete 0.21 payments and leaves 0.02
-token.
-`BSC_RPC_URL` is used only for USDC/USDT allowance reads, approval/revoke, and
-paid preflight; U/USD1 and local signing do not use it.
-`npm run x402:async` never approves or revokes; it checks the existing
-allowance before starting a new Permit2 payment.
+`BSC_RPC_URL` is used only for USDC/USDT allowance reads, approval/revoke, and paid preflight. Use `npm run x402:allowance`, `npm run x402:approve`, and `npm run x402:revoke`; both approve and revoke require confirmation and `--yes` is an explicit noninteractive bypass. `npm run x402:async` never approves or revokes. Only a freshly created Permit2 reservation in the same request uses verify-and-settle. Every pre-existing stale Permit2 reservation is recovered settle-only with the identical persisted proof, regardless of `pendingSettlementReference` or deadline; recovery does not call `/verify`.
 
-In promotional mode, `paymentRequired=false` and the active `accepts=[]`;
-`supportedAssets` may still list all four tokens as registry metadata and is
-not an active payment requirement. There is no USDC/USDT promotional proof,
-B402 verify/settle, or automatic approval. On a genuinely new CLI run with
-`X402_PAYMENT_TOKEN=USDC` or `USDT`, the zero-POST safety policy may perform a
-read-only Permit2 preflight before discovering the proofless promotional
-response; it still performs no approval. Only a freshly created Permit2
-reservation in the same request uses verify-and-settle. Every pre-existing
-stale Permit2 reservation is recovered settle-only with the identical
-persisted proof, regardless of `pendingSettlementReference` or deadline;
-recovery does not call `/verify`. Recovery creates no new signature, nonce, or
-approval. The complete buyer
-and HTTP runbook is in [`docs/x402-api-usage.md`](../docs/x402-api-usage.md).
+After local cryptographic payment-proof verification identifies the wallet, admission allows 30 accepted new jobs per rolling hour. The 31st request returns HTTP 429 and `Retry-After` before B402 verification or settlement. An exact retry does not consume another slot or settle twice. Competition reporting occurs once after terminal settlement or queued state using `settledAt`.
+
+ERC-8183 is a separate on-chain escrow flow, not x402; its fixed price remains 0.21 U and its settlement and delivery behavior are unchanged.
 
 ---
 
@@ -179,13 +154,13 @@ Every report is a structured Markdown document with these sections:
 
 ### ERC-8183: Trustless Payment Settlement
 
-The buyer's 0.21 U payment is locked in a smart contract escrow. The agent receives it only after submitting a verifiable deliverable URL on-chain and the 24-hour dispute window passes without a challenge.
+The buyer's ERC-8183 0.21 U payment is locked in a smart contract escrow. The agent receives it only after submitting a verifiable deliverable URL on-chain and the 24-hour dispute window passes without a challenge.
 
 ```
 Buyer                        Chain (BSC Testnet)              Seller Agent
   │                               │                               │
   ├── negotiate (A2A) ────────────────────────────────────────── │
-  │◄─ signed quote (0.21 U) ──────────────────────────────────── │
+  │◄─ ERC-8183 signed quote (0.21 U) ─────────────────────────── │
   │                               │                               │
   ├── createJob ─────────────────►│                               │
   ├── registerJob ───────────────►│                               │
@@ -282,8 +257,7 @@ Append `/x402/price`, `/x402/analyze/async`, or private job paths to that base;
 it contains neither `/mainnet` nor a trailing `/x402`. The old execute-api endpoint remains enabled during certificate/DNS/custom-domain validation and is disabled only after successful final cutover verification. Four x402 method/path pairs
 are public through that gateway:
 `GET /x402/price`, `POST /x402/analyze/async`, `GET /x402/jobs/{jobId}`, and
-`POST /x402/jobs/{jobId}/resume`. `/x402/free` remains retired and is absent
-from the OpenAPI routes. The gateway
+`POST /x402/jobs/{jobId}/resume`. The gateway
 uses its Lambda `live` alias and trusted API Gateway request context; it does
 not expose the AgentCore invocation URL. See
 [`docs/x402-lambda-gateway.md`](../docs/x402-lambda-gateway.md) for operation
@@ -293,41 +267,18 @@ The fixed BSC Mainnet (chain ID 56) paid registry is:
 
 | Symbol | Method | Domain name/version | Decimals | Exact paid amount | Contract |
 |--------|--------|---------------------|----------|-------------------|----------|
-| U | `eip3009` | United Stables / 1 | 18 | `210000000000000000` (`0.21 × 10^18`) | `0xcE24439F2D9C6a2289F741120FE202248B666666` |
-| USD1 | `eip3009` | World Liberty Financial USD / 1 | 18 | `210000000000000000` (`0.21 × 10^18`) | `0x8d0D000Ee44948FC98c9B98A4FA4921476f08B0d` |
-| USDC | `permit2-exact` | USD Coin / 2 | 18 | `210000000000000000` (`0.21 × 10^18`) | `0x8AC76a51cc950d9822D68b83fE1Ad97B32Cd580d` |
-| USDT | `permit2-exact` | Tether USD / 1 | 18 | `210000000000000000` (`0.21 × 10^18`) | `0x55d398326f99059fF775485246999027B3197955` |
+| U | `eip3009` | United Stables / 1 | 18 | `100000000000000000` (`0.1 × 10^18`) | `0xcE24439F2D9C6a2289F741120FE202248B666666` |
+| USD1 | `eip3009` | World Liberty Financial USD / 1 | 18 | `100000000000000000` (`0.1 × 10^18`) | `0x8d0D000Ee44948FC98c9B98A4FA4921476f08B0d` |
+| USDC | `permit2-exact` | USD Coin / 1 | 18 | `100000000000000000` (`0.1 × 10^18`) | `0x8AC76a51cc950d9822D68b83fE1Ad97B32Cd580d` |
+| USDT | `permit2-exact` | Tether USD / 1 | 18 | `100000000000000000` (`0.1 × 10^18`) | `0x55d398326f99059fF775485246999027B3197955` |
 
 `X402_TOKEN_ADDRESS`, `U_TOKEN_DOMAIN_NAME`, and
 `U_TOKEN_DOMAIN_VERSION` are legacy compatibility settings; they cannot add,
 replace, or override this registry.
 
-`GET /x402/price` exposes the ordered four-token registry in `supportedAssets`.
-This field is capability metadata only. Paid `accepts` entries are the partial
-live B402-supported subset. In promotional mode, `paymentRequired` remains
-`false` and `accepts` remains empty for every token, so clients must not
-interpret `supportedAssets` as a payment request or try to sign it.
+`GET /x402/price` exposes the ordered four-token registry in `supportedAssets`. Paid `accepts` entries are the partial live B402-supported subset and every active requirement costs exactly 0.1 of its selected token.
 
-Promotional mode uses the same async route but sits outside the payment
-protocol. When `X402_PROMO_FREE_MODE=1`, callers POST directly without a wallet
-or `Payment-Signature`. Promotional access is free. The Runtime does not parse an incoming payment header or call
-B402 verify, settlement, authorization-used RPC, or any blockchain RPC. Enable
-and disable it manually, then redeploy:
-
-```bash
-bag env set X402_PROMO_FREE_MODE 1
-bag env set X402_PROMO_FREE_MODE 0
-```
-
-Every accepted POST creates a new job and consumes one of the 30 requests per
-trusted IP in the rolling 24-hour window, including an identical retry. The
-limiter is process-local, so restarts clear counters and multiple replicas do
-not share state. Only API Gateway `requestContext` is trusted for the source
-IP; forwarding headers supplied by callers are ignored. This is an explicitly
-limited promotional control, not a durable distributed quota. Setting
-`X402_PROMO_FREE_MODE=0` restores the four-token paid HTTP 402 flow. Its
-EIP-3009 options cost 0.21 U or 0.21 USD1, and its Permit2 options cost 0.21
-USDC or 0.21 USDT when the live B402 capability is available.
+Wallet identity is recovered by local cryptographic proof verification before admission. The durable limiter permits at most 30 accepted new jobs per wallet in a rolling hour across replicas and restarts. The 31st request returns HTTP 429 with `Retry-After` before B402 verification or settlement; exact retry reuses the existing reservation and never settles twice.
 
 The paid V2 exchange is `402 PAYMENT-REQUIRED: base64(PaymentRequired)`, then
 a retry with `PAYMENT-SIGNATURE: base64(PaymentPayload)`, followed by
@@ -362,7 +313,7 @@ exposing provider details or credentials:
 ### Prerequisites
 
 - Node.js 18+, [cloudflared](https://github.com/cloudflare/cloudflared) installed
-- Buyer wallet: ≥ 0.01 tBNB (gas) + ≥ 0.21 U (escrow)
+- ERC-8183 buyer wallet: ≥ 0.01 tBNB (gas) + ≥ 0.21 U (escrow)
 - Seller deployed to BNB Chain platform (see below)
 
 ### Deploy the seller
@@ -615,7 +566,7 @@ npm run dev
 | Step | Action | Detail |
 |------|--------|--------|
 | 1 | Load UOMP context | Guard → AAPL ×50 @ $185, NVDA ×20 @ $420, risk=moderate |
-| 2 | `negotiate` | OAuth2 token → A2A → signed quote 0.21 U |
+| 2 | ERC-8183 `negotiate` | OAuth2 token → A2A → signed quote 0.21 U |
 | 3 | On-chain buy | createJob → registerJob → setBudget → approve → fund |
 | 4 | `notify_funded` | Job-client EIP-712 authorization over exact gateway + portfolio context → seller ACK |
 | 5 | Seller works | Stage 1: data collection → Stage 2: kimi-k2.6 extended thinking + report (~5–15 min) |
@@ -795,13 +746,13 @@ Agent 使用 **Kimi K2.6**（`kimi-k2.6`，256k 上下文窗口）通过 `api.mo
 
 ### ERC-8183：无需信任的付款结算
 
-买家的 0.21 U 付款锁在智能合约托管中。Agent 只有在将可验证的交付物 URL 提交到链上、且 24 小时争议窗口期过去后，才能收款。
+买家的 ERC-8183 0.21 U 付款锁在智能合约托管中。Agent 只有在将可验证的交付物 URL 提交到链上、且 24 小时争议窗口期过去后，才能收款。
 
 ```
 买家                         链上合约（BSC 测试网）              卖家 Agent
   │                               │                               │
   ├── negotiate（A2A）────────────────────────────────────────── │
-  │◄─ 签名报价（0.21 U）─────────────────────────────────────── │
+  │◄─ ERC-8183 签名报价（0.21 U）────────────────────────────── │
   │                               │                               │
   ├── createJob ─────────────────►│                               │
   ├── registerJob ───────────────►│                               │
@@ -883,7 +834,7 @@ Agent 使用 **Kimi K2.6**（`kimi-k2.6`，256k 上下文窗口）通过 `api.mo
 ### 前置条件
 
 - Node.js 18+，已安装 [cloudflared](https://github.com/cloudflare/cloudflared)
-- 买家钱包：≥ 0.01 tBNB（Gas）+ ≥ 0.21 U（托管）
+- ERC-8183 买家钱包：≥ 0.01 tBNB（Gas）+ ≥ 0.21 U（托管）
 - 卖家已部署到 BNB Chain 平台（见下文）
 
 ### 部署卖家
@@ -899,43 +850,11 @@ bag deploy agent --force-deploy-broken-storage
 
 部署完成后，`studio.toml` 记录 `[deploy.platform]`，包含 `agent_id` 和 `invoke_url`。从平台控制台创建 OAuth2 客户端，获取 `client_id` 和 `client_secret`。
 
-### 主网 x402 促销模式
+### 主网 x402 付费流程
 
-公网 API Gateway 只发布 price、async create、私有 job status 和 resume 四个
-路由；`/x402/free` 仍已退役。买家可以用 `X402_PAYMENT_TOKEN=U`（默认）、
-`X402_PAYMENT_TOKEN=USD1`、`X402_PAYMENT_TOKEN=USDC` 或
-`X402_PAYMENT_TOKEN=USDT` 严格选择 token。U 的主网合约为
-`0xcE24439F2D9C6a2289F741120FE202248B666666`，EIP-712 domain 名为
-`United Stables`；USD1 为 `0x8d0D000Ee44948FC98c9B98A4FA4921476f08B0d`，
-domain 名为 `World Liberty Financial USD`。两者 version 均为 `1`、均为 18 位
-小数，付费数量必须精确为 `210000000000000000` (`0.21 × 10^18`)。USDC 为
-`0x8AC76a51cc950d9822D68b83fE1Ad97B32Cd580d`，USDT 为
-`0x55d398326f99059fF775485246999027B3197955`；两者使用
-`permit2-exact`。`spenderAddress` 来自实时 B402 能力，而 ERC-20 allowance
-始终授权 canonical Permit2 `0x000000000022D473030F116dDEE9F6B43aC78BA3`。
-旧的 `X402_TOKEN_ADDRESS` 和 U domain 环境变量只用于兼容，不能覆盖固定 registry。
+公网 API Gateway 只发布 price、async create、私有 job status 和 resume 四个路由。买家可以用 `X402_PAYMENT_TOKEN=U`（默认）、`USD1`、`USDC` 或 `USDT` 选择实时 B402 能力支持的 token。四种 token 都必须精确支付 `100000000000000000` 个原子单位（0.1 token）。U 和 USD1 使用 EIP-3009；USDC 和 USDT 使用 `permit2-exact`，ERC-20 allowance 始终授权 canonical Permit2 `0x000000000022D473030F116dDEE9F6B43aC78BA3`。
 
-`GET /x402/price` 始终通过 `supportedAssets` 按 U、USD1、USDC、USDT 顺序公布
-能力元数据。该字段只表示服务支持哪些资产，不是付款要求；实时 B402
-`accepts` 可以只包含其中一部分。促销模式不发布任何 active accepts，
-`paymentRequired=false` 且 `accepts=[]` 保持不变，客户端不得把
-`supportedAssets` 当作支付结构或尝试签名。
-
-`X402_PROMO_FREE_MODE=1` 时，调用方免费直接 POST，不需要钱包或
-`Payment-Signature`；服务端不解析付款证明，也不调用 B402 verify/settle、RPC 或链上
-接口。手动开启/关闭命令为：
-
-```bash
-bag env set X402_PROMO_FREE_MODE 1
-bag env set X402_PROMO_FREE_MODE 0
-```
-
-每次成功 POST 都创建新任务并消耗一次额度，相同请求的重试也不去重。限额是
-单 IP 滚动 24 小时内 30 次，且只保存在当前进程：重启会清空，多副本不共享。
-可信 IP 只来自 API Gateway `requestContext`，不接受请求头伪造的来源地址。
-促销模式对所有 token 都不发布付款要求或证明；`supportedAssets` 仍列出四 token，
-但只作为 registry 能力元数据。设回 `X402_PROMO_FREE_MODE=0` 后恢复四 token 的
-HTTP 402 付费流程；每次价格严格为所选 token 的 0.21。
+服务端先通过本地密码学验证恢复钱包身份，再执行跨副本、跨重启的每钱包滚动一小时限额。每个钱包最多接受 30 个新任务；第 31 个请求在 B402 verify/settle 之前返回 HTTP 429 和 `Retry-After`。完全相同的重试复用已有额度，不会重复占位或重复结算。Competition 只在终态 settlement 或 queued 后用 `settledAt` 上报一次，而不是在分析完成时上报。
 
 ### 为异步 x402 任务配置私有存储
 
@@ -1173,7 +1092,7 @@ npm run dev
 | 步骤 | 操作 | 说明 |
 |------|------|------|
 | 1 | 加载 UOMP 上下文 | Guard → AAPL ×50 @ $185、NVDA ×20 @ $420，risk=moderate |
-| 2 | `negotiate`（A2A） | OAuth2 Token → A2A → 签名报价 0.21 U |
+| 2 | ERC-8183 `negotiate`（A2A） | OAuth2 Token → A2A → 签名报价 0.21 U |
 | 3 | 链上买入 | createJob → registerJob → setBudget → approve → fund |
 | 4 | `notify_funded` | job client 对精确网关 + 持仓上下文的 EIP-712 授权 → 卖家 ACK |
 | 5 | 卖家分析 | 第一阶段：5源数据采集 → 第二阶段：结构化报告撰写 |

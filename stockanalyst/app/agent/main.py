@@ -144,9 +144,9 @@ from x402_job_service import (
     load_job_token_secret,
 )
 from x402_job_store import X402JobStore
-from x402_promo import promo_free_mode
 from x402_tokens import token_by_asset
 from x402_verify import VerifiedPayment
+from x402_wallet_rate_limit import WalletRateLimiter
 
 
 def build_x402_job_service(
@@ -156,7 +156,6 @@ def build_x402_job_service(
     s3_client: Any | None = None,
 ) -> X402JobService | None:
     """Build the optional asynchronous x402 runtime from complete config."""
-    promo_free = promo_free_mode(env)
     bucket = env.get("X402_JOB_S3_BUCKET", "").strip()
     secret = env.get("X402_JOB_TOKEN_SECRET", "")
     if not bucket and not secret:
@@ -206,15 +205,19 @@ def build_x402_job_service(
             )
         )
 
+    token_secret = load_job_token_secret(env)
     return X402JobService(
         store=store,
-        token_secret=load_job_token_secret(env),
+        token_secret=token_secret,
+        rate_limiter=WalletRateLimiter(
+            store=store,
+            token_secret=token_secret,
+        ),
         settle=_settle_via_facilitator,
         authorization_used=authorization_used,
         report=report_competition_call,
         stream_work=stream_work,
         accept_new_jobs=accept_new_jobs,
-        promo_free=promo_free,
     )
 
 # --- Paymaster patch -----------------------------------------------------------
@@ -224,7 +227,6 @@ def build_x402_job_service(
 # (which imported resolve_network at module level), then clear the LRU cache so
 # get_8183_client() rebuilds with use_paymaster=False.
 import dataclasses as _dc
-from datetime import UTC
 
 import bnbagent.config as _bnbagent_cfg
 import bnbagent.erc8183.client as _bnb_erc8183_client
@@ -512,83 +514,6 @@ async def _stream_runner(
     yield "done", {}
 
 
-# --- Free-tier quick-quote (no LLM, no ADK) -----------------------------------
-
-def _format_free_report(symbol: str, quote: dict) -> str:
-    """Format a simple markdown table from a fetch_quote result dict."""
-    from datetime import datetime
-
-    today = datetime.now(tz=UTC).date().isoformat()
-    name = quote.get("name", symbol)
-    cur = quote.get("currency", "USD")
-
-    def fp(v):   return f"{cur} {v:,.2f}" if v is not None else "N/A"
-    def fpct(v): return f"{v:+.2f}%" if v is not None else "N/A"
-    def fx(v):   return f"{v:.1f}x" if v is not None else "N/A"
-    def fcap(v):
-        if v is None: return "N/A"
-        if v >= 1e12: return f"{v / 1e12:.2f}T {cur}"
-        if v >= 1e9:  return f"{v / 1e9:.2f}B {cur}"
-        return f"{v / 1e6:.2f}M {cur}"
-
-    target  = quote.get("analyst_target")
-    price   = quote.get("price")
-    upside  = (
-        f" ({(target - price) / price * 100:+.1f}% upside)"
-        if target and price else ""
-    )
-
-    rows = [
-        ("Price",           fp(price)),
-        ("Change",          fpct(quote.get("change_pct"))),
-        ("Market Cap",      fcap(quote.get("market_cap"))),
-        ("PE (TTM)",        fx(quote.get("pe_ratio"))),
-        ("Forward PE",      fx(quote.get("forward_pe"))),
-        ("Analyst Target",  fp(target) + upside),
-        ("Consensus",       (quote.get("recommendation") or "N/A").title()),
-        ("Beta",            f"{quote['beta']:.2f}" if quote.get("beta") is not None else "N/A"),
-        ("52W Range",       f"{fp(quote.get('52w_low'))} – {fp(quote.get('52w_high'))}"),
-    ]
-
-    lines = [
-        f"## {symbol} — {name}  |  Quick Quote  {today}",
-        "",
-        "| Metric | Value |",
-        "|--------|-------|",
-        *[f"| {k} | {v} |" for k, v in rows],
-        "",
-        (
-            "> **Full analysis** (RSI / MACD / Bollinger Bands, options sentiment, "
-            "insider activity, portfolio rebalancing) "
-            "→ **Paid tier (0.21 U)** via `POST /x402/analyze/async`"
-        ),
-    ]
-    return "\n".join(lines)
-
-
-async def _free_quote_work(symbol: str) -> AsyncGenerator[tuple[str, dict], None]:
-    """Free-tier generator: fetch_quote only, format as simple markdown table.
-
-    No LLM, no ADK — completes in ~1 s (one yfinance call).
-    """
-    from analysis import fetch_quote
-
-    yield "progress", {
-        "stage": "collecting",
-        "tool": "get_stock_quote",
-        "message": f"Fetching market data for {symbol}...",
-    }
-    try:
-        loop = asyncio.get_running_loop()
-        quote = await loop.run_in_executor(None, fetch_quote, symbol)
-    except Exception as exc:
-        yield "error", {"message": f"Failed to fetch {symbol}: {exc}"}
-        return
-
-    yield "report", {"content": _format_free_report(symbol, quote), "format": "markdown"}
-    yield "done", {}
-
-
 x402_jobs = build_x402_job_service(
     os.environ,
     stream_work=_stream_runner,
@@ -610,7 +535,6 @@ async def _x402_not_found(scope, receive, send):
 
 x402_app = X402Handler(
     _x402_not_found,
-    free_work=_free_quote_work,
     job_service=x402_jobs,
 )
 
