@@ -4111,9 +4111,8 @@ class X402LegacyPaidDurableRecoveryTests(unittest.IsolatedAsyncioTestCase):
         self,
     ) -> None:
         legacy_proof, _accepted = permit2_proof(
-            USDC_TOKEN,
+            USDT_TOKEN,
             amount="210000000000000000",
-            extra_fields={"version": "1"},
         )
         proof = encoded_proof(legacy_proof)
         store = MemoryJobStore()
@@ -4141,6 +4140,39 @@ class X402LegacyPaidDurableRecoveryTests(unittest.IsolatedAsyncioTestCase):
         settle.assert_not_awaited()
         report.assert_not_awaited()
         spawn.assert_not_called()
+
+    async def test_legacy_usdc_is_rejected_without_side_effects(self) -> None:
+        store = MemoryJobStore()
+        limiter = AsyncMock(spec=WalletRateLimiter)
+        settle = AsyncMock()
+        report = AsyncMock()
+        service = make_service(
+            store=store,
+            rate_limiter=limiter,
+            settle=settle,
+            report=report,
+        )
+
+        for version in ("1", "2"):
+            with self.subTest(version=version):
+                legacy_proof, _accepted = permit2_proof(
+                    USDC_TOKEN,
+                    amount="210000000000000000",
+                    extra_fields={"version": version},
+                )
+                proof = encoded_proof(legacy_proof)
+
+                with self.assertRaises(X402JobError) as rejected:
+                    await service.create_job(proof, REQUEST)
+
+                self.assertEqual(rejected.exception.code, "payment_rejected")
+
+        self.assertEqual(store.create_calls, 0)
+        limiter.reserve.assert_not_awaited()
+        limiter.commit.assert_not_awaited()
+        limiter.release.assert_not_awaited()
+        settle.assert_not_awaited()
+        report.assert_not_awaited()
 
     async def test_legacy_recovery_rejects_no_job_tamper_and_request_mismatch(
         self,

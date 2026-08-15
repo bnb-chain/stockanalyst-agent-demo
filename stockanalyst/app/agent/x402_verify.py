@@ -378,7 +378,12 @@ def _validate_payment_proof_amount(
             "payment requirement mismatch"
             if expected_requirement is not None
             else "payment requirement is missing or invalid"
-    )
+        )
+    if (
+        required_amount == LEGACY_PAID_AMOUNT_FOR_RECOVERY
+        and token.symbol == "USDC"
+    ):
+        return None, "payment requirement is missing or invalid"
     if token.transfer_method == "permit2-exact":
         try:
             from .x402_permit2 import verify_permit2_exact
@@ -391,9 +396,6 @@ def _validate_payment_proof_amount(
             now=int(time.time()) if now is None else int(now),
             allow_expired=allow_expired,
             required_amount=required_amount,
-            allow_legacy_usdc_v1=(
-                required_amount == LEGACY_PAID_AMOUNT_FOR_RECOVERY
-            ),
         )
     extra = accepted.get("extra")
     if (

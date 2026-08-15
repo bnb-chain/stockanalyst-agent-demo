@@ -104,22 +104,12 @@ def _wire_uint256(value: object) -> int | None:
 def _valid_extra(
     extra: object,
     token: PaymentToken,
-    *,
-    allow_legacy_usdc_v1: bool = False,
 ) -> bool:
-    version = extra.get("version") if isinstance(extra, Mapping) else None
     return bool(
         isinstance(extra, Mapping)
         and _EXTRA_KEYS.issubset(extra.keys())
         and extra.get("name") == token.domain_name
-        and (
-            version == token.domain_version
-            or (
-                allow_legacy_usdc_v1
-                and token.symbol == "USDC"
-                and version == "1"
-            )
-        )
+        and extra.get("version") == token.domain_version
         and extra.get("assetTransferMethod") == token.transfer_method
         and _address(extra.get("signerAddress")) is not None
         and _address(extra.get("spenderAddress")) is not None
@@ -200,7 +190,6 @@ def verify_permit2_exact(
     now: int,
     allow_expired: bool,
     required_amount: int | None = None,
-    allow_legacy_usdc_v1: bool = False,
 ) -> tuple[Any | None, str]:
     """Verify one exact Permit2 proof without consuming its nonce."""
     try:
@@ -227,7 +216,6 @@ def verify_permit2_exact(
     if not _valid_extra(
         accepted_extra,
         token,
-        allow_legacy_usdc_v1=allow_legacy_usdc_v1,
     ):
         return None, _REQUIREMENT_REJECTION
 
@@ -239,7 +227,6 @@ def verify_permit2_exact(
     if not _valid_extra(
         expected_extra,
         token,
-        allow_legacy_usdc_v1=allow_legacy_usdc_v1,
     ):
         return None, _REQUIREMENT_REJECTION
 
