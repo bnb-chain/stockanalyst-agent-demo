@@ -344,7 +344,7 @@ Paid requirements may select these exact tokens:
 |--------|--------|---------------------|----------|-------------------|------------------|
 | U | `eip3009` | United Stables / 1 | 18 | `100000000000000000` (`0.1 × 10^18`) | `0xcE24439F2D9C6a2289F741120FE202248B666666` |
 | USD1 | `eip3009` | World Liberty Financial USD / 1 | 18 | `100000000000000000` (`0.1 × 10^18`) | `0x8d0D000Ee44948FC98c9B98A4FA4921476f08B0d` |
-| USDC | `permit2-exact` | USD Coin / 2 | 18 | `100000000000000000` (`0.1 × 10^18`) | `0x8AC76a51cc950d9822D68b83fE1Ad97B32Cd580d` |
+| USDC | `permit2-exact` | USD Coin / 1 | 18 | `100000000000000000` (`0.1 × 10^18`) | `0x8AC76a51cc950d9822D68b83fE1Ad97B32Cd580d` |
 | USDT | `permit2-exact` | Tether USD / 1 | 18 | `100000000000000000` (`0.1 × 10^18`) | `0x55d398326f99059fF775485246999027B3197955` |
 
 Set `X402_PAYMENT_TOKEN` to exactly `U`, `USD1`, `USDC`, or `USDT`; the default

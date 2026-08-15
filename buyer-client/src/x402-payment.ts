@@ -21,7 +21,7 @@ export const PAYMENT_TOKENS = {
   USDC: {
     asset: "0x8AC76a51cc950d9822D68b83fE1Ad97B32Cd580d",
     name: "USD Coin",
-    version: "2",
+    version: "1",
     transferMethod: "permit2-exact",
   },
   USDT: {

@@ -364,6 +364,12 @@ test("parses X402_PAYMENT_TOKEN as the exact four-token enum with U default", ()
   }
 });
 
+test("uses the live B402 USDC capability metadata version", () => {
+  assert.equal(PAYMENT_TOKENS.USDC.name, "USD Coin");
+  assert.equal(PAYMENT_TOKENS.USDC.version, "1");
+  assert.equal(PAYMENT_TOKENS.USDC.transferMethod, "permit2-exact");
+});
+
 test("real CLI startup rejects unsafe Permit2 preflight before every fetch and signature", async () => {
   const runStartup = runAsyncStartup();
   const wallet = { address: "0x3333333333333333333333333333333333333333" } as Wallet;
@@ -1891,7 +1897,7 @@ test("fetchPaymentChallenge rejects Permit2 method, domain, address, promo, and 
     })],
     ["USDT wrong version", paymentChallenge({
       token: "USDT",
-      extra: { version: PAYMENT_TOKENS.USDC.version },
+      extra: { version: "2" },
     })],
     ["missing signer", missingSigner],
     ["malformed signer", paymentChallenge({

@@ -177,7 +177,7 @@ public = true
 #       domain "World Liberty Financial USD", version "1", 18 decimals,
 #       exact amount 0.1 USD1
 # USDC: 0x8AC76a51cc950d9822D68b83fE1Ad97B32Cd580d
-#       domain "USD Coin", version "2", 18 decimals, permit2-exact,
+#       domain "USD Coin", version "1", 18 decimals, permit2-exact,
 #       exact amount 0.1 USDC
 # USDT: 0x55d398326f99059fF775485246999027B3197955
 #       domain "Tether USD", version "1", 18 decimals, permit2-exact,
