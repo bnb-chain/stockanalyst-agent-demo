@@ -107,8 +107,8 @@ check_interval_seconds = 60
 # freezes a short-TTL offer, and EIP-191 signs it — pricing is rule-based, the
 # LLM never prices.
 currency = "0xcE24439F2D9C6a2289F741120FE202248B666666"   # $U token address — BSC mainnet
-price = "210000000000000000"                   # wei — 0.21 U per analysis
-min_price = "210000000000000000"               # wei — 0.21 U floor
+price = "100000000000000000"                   # wei — 0.1 U per analysis
+min_price = "100000000000000000"               # wei — 0.1 U floor
 max_price = "5000000000000000000"              # wei — 5.0 U ceiling
 quote_ttl_seconds = 900                        # seconds a signed quote stays valid; SDK caps at 900 (~15min work window)
 default_estimated_completion_seconds = 600

@@ -29,7 +29,7 @@ B402 capabilities may be partial; choose one live supported requirement. U and U
 
 After local cryptographic payment-proof verification identifies the wallet, admission allows 30 accepted new jobs per rolling hour for each payer wallet. Explicit payment rejection releases a new reservation; the 31st request returns HTTP 429 and `Retry-After` before B402 verification or settlement. An exact retry does not consume another slot or settle twice. Payment is settled before analysis and does not guarantee a successful report; a later analysis failure does not automatically refund the settlement, while a retryable failure can resume without another payment. Competition delivery starts from durable settled/queued state, uses a stable hashed `eventId`, and is asynchronous best-effort delivery that the receiver must deduplicate.
 
-ERC-8183 is a separate on-chain escrow flow, not x402; its fixed price remains 0.21 U and its settlement and delivery behavior are unchanged.
+ERC-8183 is a separate on-chain escrow flow, not x402; its fixed price remains 0.1 U and its settlement and delivery behavior are unchanged.
 
 ---
 
@@ -157,13 +157,13 @@ Every report is a structured Markdown document with these sections:
 
 ### ERC-8183: Trustless Payment Settlement
 
-The buyer's ERC-8183 0.21 U payment is locked in a smart contract escrow. The agent receives it only after submitting a verifiable deliverable URL on-chain and the 24-hour dispute window passes without a challenge.
+The buyer's ERC-8183 0.1 U payment is locked in a smart contract escrow. The agent receives it only after submitting a verifiable deliverable URL on-chain and the 24-hour dispute window passes without a challenge.
 
 ```
 Buyer                        Chain (BSC Testnet)              Seller Agent
   │                               │                               │
   ├── negotiate (A2A) ────────────────────────────────────────── │
-  │◄─ ERC-8183 signed quote (0.21 U) ─────────────────────────── │
+  │◄─ ERC-8183 signed quote (0.1 U) ─────────────────────────── │
   │                               │                               │
   ├── createJob ─────────────────►│                               │
   ├── registerJob ───────────────►│                               │
@@ -316,7 +316,7 @@ exposing provider details or credentials:
 ### Prerequisites
 
 - Node.js 18+, [cloudflared](https://github.com/cloudflare/cloudflared) installed
-- ERC-8183 buyer wallet: ≥ 0.01 tBNB (gas) + ≥ 0.21 U (escrow)
+- ERC-8183 buyer wallet: ≥ 0.01 tBNB (gas) + ≥ 0.1 U (escrow)
 - Seller deployed to BNB Chain platform (see below)
 
 ### Deploy the seller
@@ -569,7 +569,7 @@ npm run dev
 | Step | Action | Detail |
 |------|--------|--------|
 | 1 | Load UOMP context | Guard → AAPL ×50 @ $185, NVDA ×20 @ $420, risk=moderate |
-| 2 | ERC-8183 `negotiate` | OAuth2 token → A2A → signed quote 0.21 U |
+| 2 | ERC-8183 `negotiate` | OAuth2 token → A2A → signed quote 0.1 U |
 | 3 | On-chain buy | createJob → registerJob → setBudget → approve → fund |
 | 4 | `notify_funded` | Job-client EIP-712 authorization over exact gateway + portfolio context → seller ACK |
 | 5 | Seller works | Stage 1: data collection → Stage 2: kimi-k2.6 extended thinking + report (~5–15 min) |
@@ -749,13 +749,13 @@ Agent 使用 **Kimi K2.6**（`kimi-k2.6`，256k 上下文窗口）通过 `api.mo
 
 ### ERC-8183：无需信任的付款结算
 
-买家的 ERC-8183 0.21 U 付款锁在智能合约托管中。Agent 只有在将可验证的交付物 URL 提交到链上、且 24 小时争议窗口期过去后，才能收款。
+买家的 ERC-8183 0.1 U 付款锁在智能合约托管中。Agent 只有在将可验证的交付物 URL 提交到链上、且 24 小时争议窗口期过去后，才能收款。
 
 ```
 买家                         链上合约（BSC 测试网）              卖家 Agent
   │                               │                               │
   ├── negotiate（A2A）────────────────────────────────────────── │
-  │◄─ ERC-8183 签名报价（0.21 U）────────────────────────────── │
+  │◄─ ERC-8183 签名报价（0.1 U）────────────────────────────── │
   │                               │                               │
   ├── createJob ─────────────────►│                               │
   ├── registerJob ───────────────►│                               │
@@ -837,7 +837,7 @@ Agent 使用 **Kimi K2.6**（`kimi-k2.6`，256k 上下文窗口）通过 `api.mo
 ### 前置条件
 
 - Node.js 18+，已安装 [cloudflared](https://github.com/cloudflare/cloudflared)
-- ERC-8183 买家钱包：≥ 0.01 tBNB（Gas）+ ≥ 0.21 U（托管）
+- ERC-8183 买家钱包：≥ 0.01 tBNB（Gas）+ ≥ 0.1 U（托管）
 - 卖家已部署到 BNB Chain 平台（见下文）
 
 ### 部署卖家
@@ -1095,7 +1095,7 @@ npm run dev
 | 步骤 | 操作 | 说明 |
 |------|------|------|
 | 1 | 加载 UOMP 上下文 | Guard → AAPL ×50 @ $185、NVDA ×20 @ $420，risk=moderate |
-| 2 | ERC-8183 `negotiate`（A2A） | OAuth2 Token → A2A → 签名报价 0.21 U |
+| 2 | ERC-8183 `negotiate`（A2A） | OAuth2 Token → A2A → 签名报价 0.1 U |
 | 3 | 链上买入 | createJob → registerJob → setBudget → approve → fund |
 | 4 | `notify_funded` | job client 对精确网关 + 持仓上下文的 EIP-712 授权 → 卖家 ACK |
 | 5 | 卖家分析 | 第一阶段：5源数据采集 → 第二阶段：结构化报告撰写 |

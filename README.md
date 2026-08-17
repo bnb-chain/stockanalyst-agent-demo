@@ -34,14 +34,14 @@ B402 capabilities may be partial; choose one live supported requirement. U and U
 
 After local cryptographic payment-proof verification identifies the wallet, admission allows 30 accepted new jobs per rolling hour for each payer wallet. Explicit payment rejection releases a new reservation; the 31st request returns HTTP 429 and `Retry-After` before B402 verification or settlement. An exact retry does not consume another slot or settle twice. Payment is settled before analysis and does not guarantee a successful report; a later analysis failure does not automatically refund the settlement, while a retryable failure can resume without another payment. Competition delivery starts from durable settled/queued state, uses a stable hashed `eventId`, and is asynchronous best-effort delivery that the receiver must deduplicate.
 
-ERC-8183 is a separate on-chain escrow flow, not x402; its fixed price remains 0.21 U and its settlement and delivery behavior are unchanged.
+ERC-8183 is a separate on-chain escrow flow, not x402; its fixed price remains 0.1 U and its settlement and delivery behavior are unchanged.
 
 Two payment channels are available:
 
 | Tier | Command | Cost | Settlement | Speed |
 |------|---------|------|------------|-------|
 | **Paid** full analysis via x402 | `npm run x402:async` | 0.1 U, USD1, USDC, or USDT | Binance Pay facilitator | async job |
-| **Paid** full analysis via ERC-8183 | `npm run dev` | 0.21 U | on-chain escrow (trustless) | 5–15 min |
+| **Paid** full analysis via ERC-8183 | `npm run dev` | 0.1 U | on-chain escrow (trustless) | 5–15 min |
 
 - **Seller** (`stockanalyst/`) — stock analysis agent deployed on BNB Chain platform; serves both x402 (durable private jobs, EIP-3009 or Permit2 exact) and ERC-8183 (on-chain escrow, A2A + Cognito) in parallel. LLM: **kimi-k2.6** with extended thinking.
 - **Buyer** (`buyer-client/`) — TypeScript client that reads the user's portfolio and cost basis from a local UOMP Guard and supports both payment channels.
@@ -68,7 +68,7 @@ Two payment channels are available:
         │    poll status → presigned URL ──► private S3 report
         │
         ├─[2]─ A2A negotiate ─────────────► seller agent (BNB Chain Platform :9000)
-        │      OAuth2 token                  └─ ERC-8183 sign quote → 0.21 U
+        │      OAuth2 token                  └─ ERC-8183 sign quote → 0.1 U
         │◄─────────────────────────────────── signed quote
         │
         ├─[3]─ createJob ─────────────────► BSC Testnet (chain 97)
@@ -95,7 +95,7 @@ Two payment channels are available:
 
 | | x402 Paid | ERC-8183 |
 |---|---|---|
-| Cost | 0.1 U, USD1, USDC, or USDT | ERC-8183: 0.21 U |
+| Cost | 0.1 U, USD1, USDC, or USDT | ERC-8183: 0.1 U |
 | Signing | EIP-3009 or Permit2 exact | EIP-191 quote + on-chain txs |
 | On-chain settlement | Binance Pay facilitator | escrow contract (trustless) |
 | Report | full analysis | full analysis |
@@ -116,7 +116,7 @@ node guard-mock.mjs
 # Terminal 3 — buyer (pick one)
 cd buyer-client
 npm run x402:async               # paid: exact 0.1 selected token, durable async analysis
-npm run dev                      # paid: 0.21 U, full analysis, ERC-8183 trustless
+npm run dev                      # paid: 0.1 U, full analysis, ERC-8183 trustless
 ```
 
 ## ERC-8183 E2E test flow
@@ -124,7 +124,7 @@ npm run dev                      # paid: 0.21 U, full analysis, ERC-8183 trustle
 | Step | Who | Action |
 |------|-----|--------|
 | 1 | Buyer | Read UOMP Guard → AAPL/NVDA holdings + risk profile |
-| 2 | Buyer→Seller | ERC-8183 A2A negotiate (OAuth2) → signed quote 0.21 U |
+| 2 | Buyer→Seller | ERC-8183 A2A negotiate (OAuth2) → signed quote 0.1 U |
 | 3 | Buyer→Chain | createJob → registerJob → setBudget → approve → fund |
 | 4 | Buyer→Seller | `notify_funded` with EIP-712 authorization from the job-client wallet |
 | 5 | Seller | kimi-k2.6 extended thinking + report (~5–15 min) → submit_result → POST to tunnel |
@@ -202,7 +202,7 @@ UOMP_GUARD_URL=http://127.0.0.1:9374
 UOMP_GUARD_TOKEN=demo-guard-token
 ```
 
-Buyer wallet needs: ≥ 0.01 tBNB (gas) + ≥ 0.21 U for ERC-8183. Paid x402 accepts exactly 0.1 U, USD1, USDC, or USDT when its live capability is available.
+Buyer wallet needs: ≥ 0.01 tBNB (gas) + ≥ 0.1 U for ERC-8183. Paid x402 accepts exactly 0.1 U, USD1, USDC, or USDT when its live capability is available.
 
 ### 3. Run
 
@@ -216,7 +216,7 @@ node guard-mock.mjs
 cd buyer-client
 
 npm run x402:async              # paid: exact 0.1 selected token, durable async analysis
-npm run dev                      # paid: 0.21 U, full analysis, ERC-8183 trustless (~5–15min)
+npm run dev                      # paid: 0.1 U, full analysis, ERC-8183 trustless (~5–15min)
 ```
 
 After the 24-hour ERC-8183 dispute window:

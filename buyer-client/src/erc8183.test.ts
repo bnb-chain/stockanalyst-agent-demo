@@ -7,7 +7,7 @@ import {
   resolveRpcUrls,
 } from "./erc8183.js";
 
-const PAID_PRICE_ATOMIC = 210_000_000_000_000_000n;
+const PAID_PRICE_ATOMIC = 100_000_000_000_000_000n;
 
 test("requires an explicit archive RPC URL", () => {
   assert.throws(
@@ -50,13 +50,13 @@ test("compares the U balance to the exact signed atomic quote", () => {
   });
   assert.throws(
     () => assertSufficientUBalance(PAID_PRICE_ATOMIC - 1n, PAID_PRICE_ATOMIC),
-    /Insufficient U balance \(need ≥ 0\.21 U\)/,
+    /Insufficient U balance \(need ≥ 0\.1 U\)/,
   );
 });
 
 test("formats canonical and non-float-safe atomic U quotes exactly", () => {
-  assert.equal(formatUAmount(PAID_PRICE_ATOMIC), "0.21");
-  assert.equal(formatUAmount(PAID_PRICE_ATOMIC + 1n), "0.210000000000000001");
+  assert.equal(formatUAmount(PAID_PRICE_ATOMIC), "0.1");
+  assert.equal(formatUAmount(PAID_PRICE_ATOMIC + 1n), "0.100000000000000001");
 });
 
 test("forwards a non-float-safe signed atomic quote unchanged on chain", async () => {
@@ -98,7 +98,7 @@ test("forwards a non-float-safe signed atomic quote unchanged on chain", async (
   });
 
   assert.deepEqual(forwardedBudgets, [quoteAtomic, quoteAtomic, quoteAtomic]);
-  assert.equal(result.budgetU, "0.210000000000000001");
+  assert.equal(result.budgetU, "0.100000000000000001");
 });
 
 function buyerWithDeliverableUrl(value: unknown): ERC8183Buyer {
