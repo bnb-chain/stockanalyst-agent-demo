@@ -49,7 +49,7 @@ Competition delivery starts from durable settled/queued state, uses a stable
 hashed `eventId`, and is asynchronous best-effort delivery that the receiver
 must deduplicate.
 
-ERC-8183 is a separate escrow channel, not x402; its fixed price remains 0.21
+ERC-8183 is a separate escrow channel, not x402; its fixed price remains 0.1
 U and its behavior is unchanged.
 
 ## Key files

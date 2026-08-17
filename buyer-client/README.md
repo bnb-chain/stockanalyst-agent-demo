@@ -22,7 +22,7 @@ B402 capabilities may be partial; choose one live supported requirement. U and U
 
 After local cryptographic payment-proof verification identifies the wallet, admission allows 30 accepted new jobs per rolling hour for each payer wallet. Explicit payment rejection releases a new reservation; the 31st request returns HTTP 429 and `Retry-After` before B402 verification or settlement. An exact retry does not consume another slot or settle twice. Payment is settled before analysis and does not guarantee a successful report; a later analysis failure does not automatically refund the settlement, while a retryable failure can resume without another payment. Competition delivery starts from durable settled/queued state, uses a stable hashed `eventId`, and is asynchronous best-effort delivery that the receiver must deduplicate.
 
-ERC-8183 is a separate on-chain escrow flow, not x402; its fixed price remains 0.21 U and its settlement and delivery behavior are unchanged.
+ERC-8183 is a separate on-chain escrow flow, not x402; its fixed price remains 0.1 U and its settlement and delivery behavior are unchanged.
 
 Both full-analysis channels read the buyer's portfolio from a local **UOMP Memory Guard** and produce the same HTML + PDF report.
 
@@ -308,7 +308,7 @@ src/
 ├── x402-async.ts   — durable paid buyer (npm run x402:async) — private job polling
 ├── x402-async-client.ts — typed async create/poll/resume/download client
 ├── x402-payment.ts — shared side-effect-free EIP-3009 proof builder
-├── index.ts        — ERC-8183 buyer    (npm run dev)        — 0.21 U, on-chain escrow
+├── index.ts        — ERC-8183 buyer    (npm run dev)        — 0.1 U, on-chain escrow
 ├── erc8183.ts      — on-chain job lifecycle: createJob → fund → settle
 ├── negotiate.ts    — A2A JSON-RPC negotiate with OAuth2 support
 ├── uomp.ts         — UOMP Guard HTTP client + buildTaskFromMemory()
@@ -432,7 +432,7 @@ Buyer                      BSC Testnet contracts         Agent (cloud)
   ├── registerJob ───────────────▶│                           │
   ├── setBudget  ────────────────▶│                           │
   ├── approve (U token) ─────────▶│                           │
-  ├── ERC-8183 fund (lock 0.21 U in escrow) ▶│                    │
+  ├── ERC-8183 fund (lock 0.1 U in escrow) ▶│                    │
   │                               │                           │
   ├── notify_funded ──────────────┼──────────────────────────▶│
   │                               │      LLM analysis (40–120s)│

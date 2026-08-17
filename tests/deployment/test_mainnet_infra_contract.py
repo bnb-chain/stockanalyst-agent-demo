@@ -523,10 +523,6 @@ class MainnetInfrastructureContractTests(unittest.TestCase):
                     STALE_CUSTOM_DOMAIN_CUTOVER_STATE,
                 ):
                     self.assertNotIn(forbidden, documentation)
-                for line in documentation.splitlines():
-                    if "0.21" in line:
-                        self.assertIn("ERC-8183", line)
-
     def test_readmes_link_to_canonical_mainnet_x402_guides(self) -> None:
         expected_links = {
             ROOT_README: (
@@ -922,6 +918,18 @@ Witness(address to, uint256 validAfter)
         self.assertEqual(erc8183["max_price"], "5000000000000000000")
         self.assertEqual(x402["price_wei"], "100000000000000000")
         self.assertEqual(x402["min_price_wei"], "100000000000000000")
+
+        erc8183_guidance = (
+            ROOT_README.read_text(encoding="utf-8"),
+            BUYER_README.read_text(encoding="utf-8"),
+            STOCKANALYST_README.read_text(encoding="utf-8"),
+            AGENT_README.read_text(encoding="utf-8"),
+            X402_API_USAGE.read_text(encoding="utf-8"),
+        )
+        for documentation in erc8183_guidance:
+            normalized = " ".join(documentation.split())
+            self.assertIn("0.1 U", normalized)
+            self.assertNotIn("0.21 U", normalized)
 
         buyer_readme = BUYER_README.read_text(encoding="utf-8")
         stock_readme = STOCKANALYST_README.read_text(encoding="utf-8")
