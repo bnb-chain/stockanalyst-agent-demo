@@ -4,6 +4,9 @@ TypeScript buyer client for the [Stock Analysis Agent](../stockanalyst/README.md
 
 ## Paid x402 contract
 
+- [Mainnet integration quickstart](../docs/x402-mainnet-quickstart.md)
+- [Payment wire and security contract](../docs/x402-api-usage.md)
+
 x402 payments use **BSC Mainnet (chain ID 56)**. The EIP-3009 domain names are United Stables for U and World Liberty Financial USD for USD1. Every accepted analysis costs exactly `100000000000000000` atomic units (0.1 of the selected 18-decimal token).
 
 | Token | BSC address | Method | Price |
@@ -17,7 +20,7 @@ B402 capabilities may be partial; choose one live supported requirement. U and U
 
 `BSC_RPC_URL` is used only for USDC/USDT allowance reads, approval/revoke, and paid preflight. Use `npm run x402:allowance`, `npm run x402:approve`, and `npm run x402:revoke`; both approve and revoke require confirmation and `--yes` is an explicit noninteractive bypass. `npm run x402:async` never approves or revokes. Only a freshly created Permit2 reservation in the same request uses verify-and-settle. Every pre-existing stale Permit2 reservation is recovered settle-only with the identical persisted proof, regardless of `pendingSettlementReference` or deadline; recovery does not call `/verify`.
 
-After local cryptographic payment-proof verification identifies the wallet, admission allows 30 accepted new jobs per rolling hour. The 31st request returns HTTP 429 and `Retry-After` before B402 verification or settlement. An exact retry does not consume another slot or settle twice. Competition reporting occurs once after terminal settlement or queued state using `settledAt`.
+After local cryptographic payment-proof verification identifies the wallet, admission allows 30 accepted new jobs per rolling hour for each payer wallet. Explicit payment rejection releases a new reservation; the 31st request returns HTTP 429 and `Retry-After` before B402 verification or settlement. An exact retry does not consume another slot or settle twice. Payment is settled before analysis and does not guarantee a successful report; a later analysis failure does not automatically refund the settlement, while a retryable failure can resume without another payment. Competition delivery starts from durable settled/queued state, uses a stable hashed `eventId`, and is asynchronous best-effort delivery that the receiver must deduplicate.
 
 ERC-8183 is a separate on-chain escrow flow, not x402; its fixed price remains 0.21 U and its settlement and delivery behavior are unchanged.
 
@@ -153,7 +156,7 @@ PROVIDER_ADDRESS=0x1FF095E1C5Cf4bC72a3DC54be17B6cf85043Fb67
 
 # ── x402 (BSC Mainnet; local agent may use localhost) ─────────────
 X402_ENDPOINT=https://stock-agent.bnbchain.org
-X402_SELLER_WALLET=0xd10BdDC20E4DC42A1a19a9653e994991e25b8153
+X402_SELLER_WALLET=0x15958aad30b758dAbfbB9788Da69dfcd56e89078
 # Optional strict token selector: U (default), USD1, USDC, or USDT.
 X402_PAYMENT_TOKEN=U
 # Optional async-client polling deadline; default is 30 minutes.
@@ -169,7 +172,7 @@ UOMP_GUARD_TOKEN=your_guard_jwt_token
 > `X402_ENDPOINT` is the public base URL for the deployed mainnet x402 gateway,
 > never the raw AgentCore invocation URL. Append `/x402/price`,
 > `/x402/analyze/async`, or private job paths; the base contains neither
-> `/mainnet` nor a trailing `/x402`. The old execute-api endpoint remains enabled during certificate/DNS/custom-domain validation and is disabled only after successful final cutover verification. Local development may instead use `http://localhost:9000`.
+> `/mainnet` nor a trailing `/x402`. Direct execute-api URLs are unsupported for external integration. Local development may instead use `http://localhost:9000`.
 
 ### AWS AgentCore runtime
 
@@ -394,7 +397,7 @@ The V2 wire exchange is:
 ```text
 402: PAYMENT-REQUIRED: base64(PaymentRequired)
 retry: PAYMENT-SIGNATURE: base64(PaymentPayload)
-202: PAYMENT-RESPONSE: base64(SettlementResponse)
+202: job receipt; PAYMENT-RESPONSE is conditional on a validated settlement response
 ```
 
 Provider output is retried automatically twice after an empty result. If all

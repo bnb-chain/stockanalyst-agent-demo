@@ -16,8 +16,9 @@ BUYER_README = ROOT / "buyer-client" / "README.md"
 STOCKANALYST_README = ROOT / "stockanalyst" / "README.md"
 AGENT_README = ROOT / "stockanalyst" / "app" / "agent" / "README.md"
 X402_API_USAGE = ROOT / "docs" / "x402-api-usage.md"
+X402_MAINNET_QUICKSTART = ROOT / "docs" / "x402-mainnet-quickstart.md"
 AGENT_MAIN = ROOT / "stockanalyst" / "app" / "agent" / "main.py"
-CUSTOM_DOMAIN_CUTOVER_STATE = (
+STALE_CUSTOM_DOMAIN_CUTOVER_STATE = (
     "The old execute-api endpoint remains enabled during certificate/DNS/custom-domain "
     "validation and is disabled only after successful final cutover verification."
 )
@@ -55,6 +56,7 @@ PAID_TOKEN_TABLE = """| Token | BSC address | Method | Price |
 | USDC | `0x8AC76a51cc950d9822D68b83fE1Ad97B32Cd580d` | `permit2-exact` | 0.1 USDC |
 | USDT | `0x55d398326f99059fF775485246999027B3197955` | `permit2-exact` | 0.1 USDT |"""
 CANONICAL_PERMIT2 = "0x000000000022D473030F116dDEE9F6B43aC78BA3"
+B402_PAY_TO = "0x15958aad30b758dAbfbB9788Da69dfcd56e89078"
 EXPECTED_RUNTIME_SECRET_NAMES = frozenset(
     {
         "ALPHA_VANTAGE_API_KEY",
@@ -504,7 +506,9 @@ class MainnetInfrastructureContractTests(unittest.TestCase):
                     "30 accepted new jobs per rolling hour",
                     "before B402 verification or settlement",
                     "An exact retry does not consume another slot",
-                    "terminal settlement or queued state using `settledAt`",
+                    "does not guarantee a successful report",
+                    "does not automatically refund",
+                    "best-effort",
                 ):
                     self.assertIn(required, normalized)
                 for forbidden in (
@@ -515,11 +519,89 @@ class MainnetInfrastructureContractTests(unittest.TestCase):
                     "promotional",
                     "proofless",
                     "zero-value payment",
+                    "terminal settlement or queued state using `settledAt`",
+                    STALE_CUSTOM_DOMAIN_CUTOVER_STATE,
                 ):
                     self.assertNotIn(forbidden, documentation)
                 for line in documentation.splitlines():
                     if "0.21" in line:
                         self.assertIn("ERC-8183", line)
+
+    def test_readmes_link_to_canonical_mainnet_x402_guides(self) -> None:
+        expected_links = {
+            ROOT_README: (
+                "docs/x402-mainnet-quickstart.md",
+                "docs/x402-api-usage.md",
+            ),
+            BUYER_README: (
+                "../docs/x402-mainnet-quickstart.md",
+                "../docs/x402-api-usage.md",
+            ),
+            STOCKANALYST_README: (
+                "../docs/x402-mainnet-quickstart.md",
+                "../docs/x402-api-usage.md",
+            ),
+            AGENT_README: (
+                "../../../docs/x402-mainnet-quickstart.md",
+                "../../../docs/x402-api-usage.md",
+            ),
+        }
+
+        for path, links in expected_links.items():
+            with self.subTest(path=path.relative_to(ROOT)):
+                documentation = path.read_text(encoding="utf-8")
+                for link in links:
+                    self.assertIn(link, documentation)
+
+    def test_mainnet_buyer_examples_use_the_b402_pay_to_address(self) -> None:
+        for path in (
+            BUYER_README,
+            STOCKANALYST_README,
+            X402_MAINNET_QUICKSTART,
+        ):
+            with self.subTest(path=path.relative_to(ROOT)):
+                documentation = path.read_text(encoding="utf-8")
+                matches = re.findall(
+                    r"(?m)^X402_SELLER_WALLET=(0x[0-9A-Fa-f]{40})",
+                    documentation,
+                )
+                self.assertTrue(matches)
+                self.assertEqual(set(matches), {B402_PAY_TO})
+
+    def test_repository_readmes_show_mainnet_and_testnet_channels(self) -> None:
+        for path in (ROOT_README, STOCKANALYST_README):
+            with self.subTest(path=path.relative_to(ROOT)):
+                documentation = path.read_text(encoding="utf-8")
+                self.assertIn("Network-BSC%20Mainnet%20%2B%20Testnet", documentation)
+
+    def test_canonical_guides_document_current_runtime_boundaries(self) -> None:
+        quickstart = X402_MAINNET_QUICKSTART.read_text(encoding="utf-8")
+        api_usage = X402_API_USAGE.read_text(encoding="utf-8")
+        normalized_api_usage = " ".join(api_usage.split())
+
+        for required in (
+            "256 KiB",
+            "1–10",
+            "20",
+            "64",
+            "status=succeeded",
+            "request_too_large",
+            "async_jobs_paused",
+            "job_state_unavailable",
+            "job_service_unavailable",
+            "analysis_failed",
+            "analysis_empty_response",
+            "too_many_users",
+        ):
+            self.assertIn(required, quickstart)
+        for required in (
+            "PAYMENT-RESPONSE` is conditional",
+            "does not guarantee a successful report",
+            "does not automatically refund",
+            "deduplicate by `eventId`",
+            "b402:56:sha256(lowercase-wallet:canonical-nonce:lowercase-asset)",
+        ):
+            self.assertIn(required, normalized_api_usage)
 
     def test_tracked_guidance_rejects_stale_or_unsafe_payment_advice(self) -> None:
         for path in TRACKED_X402_GUIDANCE:
@@ -863,7 +945,11 @@ Witness(address to, uint256 validAfter)
                 documentation,
             )
         self.assertIn("X402_ENDPOINT=https://stock-agent.bnbchain.org", documents[1])
-        self.assertIn(CUSTOM_DOMAIN_CUTOVER_STATE, documents[1])
+        for documentation in (
+            *documents,
+            STOCKANALYST_README.read_text(encoding="utf-8"),
+        ):
+            self.assertNotIn(STALE_CUSTOM_DOMAIN_CUTOVER_STATE, documentation)
         studio = STUDIO.read_text(encoding="utf-8")
         self.assertIn(
             "X402_GATEWAY_PUBLIC_BASE_URL=https://stock-agent.bnbchain.org",

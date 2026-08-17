@@ -12,6 +12,10 @@
 - 支付协议：x402 V2
 - 支付请求头：`Payment-Signature`
 
+付款在分析开始前完成持久化结算。付款购买的是一次已受理的执行机会，不保证
+一定生成成功报告；后续分析失败不会自动退回已经完成的结算。只有返回
+`retryable: true` 的失败任务可以 resume，且 resume 不需要再次签名或付款。
+
 主要接口：
 
 | Method | Path | 用途 |
@@ -174,6 +178,13 @@ CLI 自动完成以下流程：
 
 这些文件使用 owner-only 权限。网络中断或进程退出后，直接重新运行 `npm run x402:async`；客户端会优先恢复原任务或重放同一份付款证明，不能通过删除 pending 文件来绕过恢复流程。
 
+服务端在本地验签恢复付款钱包后、调用 B402 verify/settle 之前执行持久化钱包
+限流：每个付款钱包最多接受 30 个新任务/滚动小时。明确拒绝的付款会释放新占位；
+完全相同的 proof 重试复用原任务和占位，不会再次扣费。Competition 记录在付款
+持久化为 settled 且任务离开 `settling`（通常进入 `queued`）后异步触发，不等待
+分析完成；上报采用稳定哈希 eventId 和 best-effort 重试，接收方应按 eventId
+去重。
+
 ## 5. 原始 HTTP 流程
 
 建议优先复用官方 Buyer 的签名和恢复实现。自行实现客户端时，流程如下。
@@ -186,6 +197,11 @@ curl --include --request POST \
   --header 'Content-Type: application/json' \
   --data '{"symbols":["AAPL","NVDA"],"analysis_type":"comprehensive"}'
 ```
+
+请求 body 最大 `256 KiB`。`symbols` 必须包含 `1–10` 个项目，每项最长 `20`
+个字符，只允许字母、数字、`.`、`^` 和 `-`；`analysis_type` 最长 `64` 个字符；
+`portfolio` 必须是 JSON 数组，`risk_profile` 必须是 JSON 对象，并且两者必须可被
+标准 JSON 有限值编码。
 
 服务返回 HTTP 402。支付要求同时出现在 JSON body 的 `paymentRequired` 和 `PAYMENT-REQUIRED` 响应头中。客户端必须验证两者一致，并从 `accepts` 中选择一个完整 requirement。
 
@@ -219,7 +235,10 @@ curl --include --request POST \
 }
 ```
 
-`PAYMENT-RESPONSE` 响应头携带结算结果。不要记录或公开 `Payment-Signature`、`PAYMENT-RESPONSE`、`jobToken` 或最终的私有下载 URL。
+`PAYMENT-RESPONSE` 是条件响应头：只有服务端已有可验证的结算结果时才会返回；
+完全相同的重试如果仍观察到 `settling`，即使返回 202 也可能没有该响应头。不要
+记录或公开 `Payment-Signature`、`PAYMENT-RESPONSE`、`jobToken` 或最终的私有
+下载 URL。
 
 ### 5.3 查询任务
 
@@ -229,7 +248,9 @@ curl --fail-with-body --silent --show-error \
   --header 'X-Job-Token: <jobToken>' | jq
 ```
 
-常见状态为 `settling`、`queued`、`running`、`succeeded` 和 `failed`。成功响应包含短期有效的 `downloadUrl`；它属于私有 URL，不应转发或持久公开。
+常见状态为 `settling`、`queued`、`running`、`succeeded` 和 `failed`。只有
+`status=succeeded` 的响应包含短期有效的 `downloadUrl`；它属于私有 URL，不应
+转发或持久公开。
 
 ### 5.4 恢复可重试任务
 
@@ -251,14 +272,21 @@ Resume 不需要，也不应再次发送 `Payment-Signature`；它不会再次�
 | HTTP | `errorCode` | 含义与处理 |
 | --- | --- | --- |
 | 400 | `invalid_request` | JSON 或请求字段不合法；修正请求后重新开始 |
+| 413 | `request_too_large` | 请求 body 超过 256 KiB；缩小请求后重新获取 challenge |
 | 402 | `payment_rejected` | Proof、金额、Token、签名、有效期或 capability 不匹配；重新获取 challenge，不要修改服务端 requirement |
 | 429 | `wallet_rate_limited` | 付款钱包达到 30 次/滚动小时；遵循 `Retry-After`，不要立即重新签名 |
 | 503 | `wallet_rate_limit_unavailable` | 钱包限流存储暂时不可用；保持本地恢复文件并稍后重试 |
 | 503 | `payment_backend_unavailable` | B402 capability 服务暂时不可用；稍后重新获取 challenge |
 | 503 | `settlement_pending` | 结算结果尚未确定；必须重放原 proof，不能签一个新 proof |
+| 503 | `async_jobs_paused` | 服务暂时停止接收新任务；不要丢失已有任务凭据 |
+| 503 | `job_state_unavailable` | 持久任务或结算状态暂时不可确认；复用原 proof/凭据重试 |
+| 503 | `job_service_unavailable` | 异步任务依赖暂时不可用；按退避策略稍后重试 |
 | 404 | `job_not_found` | Job ID 或 Job Token 无效；服务端不会区分两者 |
 | 409 | `job_conflict` / `attempts_exhausted` | 当前状态不能恢复，或重试次数耗尽 |
 | 410 | `job_expired` | 私有任务已过期 |
+| 200 | `analysis_failed` | 轮询得到的任务失败；仅在 `retryable: true` 时调用 resume |
+| 200 | `analysis_empty_response` | 三次分析均未产生结果；按 `retryable` 决定是否 resume |
+| 200 | `too_many_users` | 上游供应商持续限流；保持任务凭据并在允许时 resume |
 
 如果配置了 `X402_PAYMENT_TOKEN=USDC`，但实时 `accepts` 只有 U、USD1 和 USDT，客户端应返回 `payment_token_unavailable` 并列出实际可用 Token；不能伪造 USDC requirement。
 
@@ -273,3 +301,4 @@ Resume 不需要，也不应再次发送 `Payment-Signature`；它不会再次�
 - 202 后立即安全保存 Job Token，并使用 `X-Job-Token` 查询任务。
 - 相同任务的网络歧义重试必须复用同一 proof，避免重复授权或重复结算。
 - 遵循 429 `Retry-After` 和每钱包 30 次/滚动小时限制。
+- 不把付款成功等同于报告成功；只对 `retryable: true` 的失败调用 resume，且不再次付款。

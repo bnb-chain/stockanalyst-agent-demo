@@ -2,7 +2,7 @@
 
 [![ERC-8183](https://img.shields.io/badge/Protocol-ERC--8183-blue)](https://github.com/bnb-chain/BEPs)
 [![UOMP](https://img.shields.io/badge/Context-UOMP-purple)](https://github.com/0xaicrypto/uomp-core)
-[![Network](https://img.shields.io/badge/Network-BSC%20Testnet-yellow)](https://testnet.bscscan.com)
+[![Network](https://img.shields.io/badge/Network-BSC%20Mainnet%20%2B%20Testnet-blue)](https://www.bnbchain.org)
 [![Python](https://img.shields.io/badge/Python-3.12-3776AB?logo=python)](https://www.python.org)
 
 > [中文](#中文) | English
@@ -10,6 +10,9 @@
 ---
 
 ## Paid x402 contract
+
+- [Mainnet integration quickstart](../docs/x402-mainnet-quickstart.md)
+- [Payment wire and security contract](../docs/x402-api-usage.md)
 
 x402 payments use **BSC Mainnet (chain ID 56)**. Every accepted analysis costs exactly `100000000000000000` atomic units (0.1 of the selected 18-decimal token).
 
@@ -24,7 +27,7 @@ B402 capabilities may be partial; choose one live supported requirement. U and U
 
 `BSC_RPC_URL` is used only for USDC/USDT allowance reads, approval/revoke, and paid preflight. Use `npm run x402:allowance`, `npm run x402:approve`, and `npm run x402:revoke`; both approve and revoke require confirmation and `--yes` is an explicit noninteractive bypass. `npm run x402:async` never approves or revokes. Only a freshly created Permit2 reservation in the same request uses verify-and-settle. Every pre-existing stale Permit2 reservation is recovered settle-only with the identical persisted proof, regardless of `pendingSettlementReference` or deadline; recovery does not call `/verify`.
 
-After local cryptographic payment-proof verification identifies the wallet, admission allows 30 accepted new jobs per rolling hour. The 31st request returns HTTP 429 and `Retry-After` before B402 verification or settlement. An exact retry does not consume another slot or settle twice. Competition reporting occurs once after terminal settlement or queued state using `settledAt`.
+After local cryptographic payment-proof verification identifies the wallet, admission allows 30 accepted new jobs per rolling hour for each payer wallet. Explicit payment rejection releases a new reservation; the 31st request returns HTTP 429 and `Retry-After` before B402 verification or settlement. An exact retry does not consume another slot or settle twice. Payment is settled before analysis and does not guarantee a successful report; a later analysis failure does not automatically refund the settlement, while a retryable failure can resume without another payment. Competition delivery starts from durable settled/queued state, uses a stable hashed `eventId`, and is asynchronous best-effort delivery that the receiver must deduplicate.
 
 ERC-8183 is a separate on-chain escrow flow, not x402; its fixed price remains 0.21 U and its settlement and delivery behavior are unchanged.
 
@@ -249,12 +252,12 @@ rather than the raw AgentCore invocation URL:
 
 ```dotenv
 X402_ENDPOINT=https://stock-agent.bnbchain.org
-X402_SELLER_WALLET=0xd10BdDC20E4DC42A1a19a9653e994991e25b8153
+X402_SELLER_WALLET=0x15958aad30b758dAbfbB9788Da69dfcd56e89078
 X402_PAYMENT_TOKEN=U  # strict U (default), USD1, USDC, or USDT
 ```
 
 Append `/x402/price`, `/x402/analyze/async`, or private job paths to that base;
-it contains neither `/mainnet` nor a trailing `/x402`. The old execute-api endpoint remains enabled during certificate/DNS/custom-domain validation and is disabled only after successful final cutover verification. Four x402 method/path pairs
+it contains neither `/mainnet` nor a trailing `/x402`. Direct execute-api URLs are unsupported for external integration. Four x402 method/path pairs
 are public through that gateway:
 `GET /x402/price`, `POST /x402/analyze/async`, `GET /x402/jobs/{jobId}`, and
 `POST /x402/jobs/{jobId}/resume`. The gateway
@@ -281,8 +284,8 @@ replace, or override this registry.
 Wallet identity is recovered by local cryptographic proof verification before admission. The durable limiter permits at most 30 accepted new jobs per wallet in a rolling hour across replicas and restarts. The 31st request returns HTTP 429 with `Retry-After` before B402 verification or settlement; exact retry reuses the existing reservation and never settles twice.
 
 The paid V2 exchange is `402 PAYMENT-REQUIRED: base64(PaymentRequired)`, then
-a retry with `PAYMENT-SIGNATURE: base64(PaymentPayload)`, followed by
-`202 PAYMENT-RESPONSE: base64(SettlementResponse)`. The settled job performs
+a retry with `PAYMENT-SIGNATURE: base64(PaymentPayload)` and a 202 job receipt.
+`PAYMENT-RESPONSE` is conditional on a validated settlement response. The settled job performs
 two automatic retries when its provider returns empty output. If all three
 attempts are empty, polling returns:
 
@@ -854,7 +857,7 @@ bag deploy agent --force-deploy-broken-storage
 
 公网 API Gateway 只发布 price、async create、私有 job status 和 resume 四个路由。买家可以用 `X402_PAYMENT_TOKEN=U`（默认）、`USD1`、`USDC` 或 `USDT` 选择实时 B402 能力支持的 token。四种 token 都必须精确支付 `100000000000000000` 个原子单位（0.1 token）。U 和 USD1 使用 EIP-3009；USDC 和 USDT 使用 `permit2-exact`，ERC-20 allowance 始终授权 canonical Permit2 `0x000000000022D473030F116dDEE9F6B43aC78BA3`。
 
-服务端先通过本地密码学验证恢复钱包身份，再执行跨副本、跨重启的每钱包滚动一小时限额。每个钱包最多接受 30 个新任务；第 31 个请求在 B402 verify/settle 之前返回 HTTP 429 和 `Retry-After`。完全相同的重试复用已有额度，不会重复占位或重复结算。Competition 只在终态 settlement 或 queued 后用 `settledAt` 上报一次，而不是在分析完成时上报。
+服务端先通过本地密码学验证恢复钱包身份，再执行跨副本、跨重启的每钱包滚动一小时限额。每个钱包最多接受 30 个新任务；明确拒绝付款时释放新占位，第 31 个请求在 B402 verify/settle 之前返回 HTTP 429 和 `Retry-After`。完全相同的重试复用已有额度，不会重复占位或重复结算。付款在分析开始前结算；付款只保证任务被受理，不保证报告一定成功，后续分析失败不会自动退款；`retryable: true` 的任务可在不再次付款的情况下 resume。Competition 在付款持久化为 settled 且任务进入 queued 后异步触发，使用稳定哈希 `eventId` 和 best-effort 重试；接收方必须按 `eventId` 去重，而不是依赖网络层严格一次投递。
 
 ### 为异步 x402 任务配置私有存储
 

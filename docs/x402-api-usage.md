@@ -48,6 +48,11 @@ The authorization binds `from`, `to`, exact `value` 100000000000000000, `validAf
 
 Copy the selected `accepted` requirement unchanged into the V2 proof and send its base64-encoded JSON only in `Payment-Signature`. The client must recover the signer locally, require the configured payer and pay-to addresses, reject expired windows or reused nonces, and never log the signature or private key.
 
+`PAYMENT-RESPONSE` is conditional. The server emits it only when a validated
+settlement response is available. A 202 exact retry that still observes a
+durable job in `settling` may omit the header; clients must use the response
+body and authenticated job polling as the authoritative lifecycle state.
+
 ## Permit2 exact signature contract
 
 ```json
@@ -96,6 +101,28 @@ Every uint256 wire value (`amount`, `nonce`, `deadline`, and `validAfter`) is a 
 
 ## Wallet admission and reporting
 
-After local cryptographic payment-proof verification identifies the wallet, admission allows 30 accepted new jobs per rolling hour. The 31st new request returns HTTP 429 and `Retry-After` before B402 verification or settlement. An exact retry does not consume another slot or settle twice. Competition reporting occurs once after terminal settlement or queued state using `settledAt`.
+After local cryptographic payment-proof verification identifies the wallet,
+admission allows 30 accepted new jobs per rolling hour for each payer wallet
+across Runtime replicas and restarts. The 31st new request returns HTTP 429 and
+`Retry-After` before B402 verification or settlement. Explicit payment
+rejection releases a newly created reservation. An exact retry reuses the
+durable reservation, proof, job identity, and settlement. An exact retry does
+not consume another slot or settle twice.
+
+Payment is durably settled before the job enters `queued` and analysis starts.
+Payment grants an accepted execution attempt; it does not guarantee a
+successful report, and a later analysis failure does not automatically refund
+the completed settlement. A failed job with `retryable: true` can be resumed
+without another `Payment-Signature`, B402 verification, settlement, or charge.
+
+Competition reporting becomes eligible after `paymentStatus=settled` and the
+durable job leaves `settling`, normally when it reaches `queued`; it does not
+wait for analysis completion. `calledAt` is the durable `settledAt` millisecond
+timestamp. The stable identifier is
+`b402:56:sha256(lowercase-wallet:canonical-nonce:lowercase-asset)`. Delivery is
+optional, asynchronous, best-effort, and retried with bounded backoff. A lost
+response can redeliver the same stable identifier, so the receiving API must
+deduplicate by `eventId`; this is not transport-level exactly-once delivery.
+Reporting failure does not fail the paid request or analysis job.
 
 ERC-8183 is separate on-chain escrow, not x402. Its fixed price remains 0.21 U and its behavior is unchanged.

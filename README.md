@@ -3,7 +3,7 @@
 [![ERC-8183](https://img.shields.io/badge/Protocol-ERC--8183-blue)](https://github.com/bnb-chain/BEPs)
 [![x402](https://img.shields.io/badge/Payment-x402%20v2-orange)](buyer-client/src/x402-async.ts)
 [![UOMP](https://img.shields.io/badge/Context-UOMP-purple)](https://github.com/0xaicrypto/uomp-core)
-[![Network](https://img.shields.io/badge/Network-BSC%20Testnet-yellow)](https://testnet.bscscan.com)
+[![Network](https://img.shields.io/badge/Network-BSC%20Mainnet%20%2B%20Testnet-blue)](https://www.bnbchain.org)
 [![Python](https://img.shields.io/badge/Seller-Python%203.12-3776AB?logo=python)](stockanalyst/)
 [![TypeScript](https://img.shields.io/badge/Buyer-TypeScript-3178C6?logo=typescript)](buyer-client/)
 [![License](https://img.shields.io/badge/License-Apache%202.0-green)](LICENSE)
@@ -13,6 +13,11 @@ End-to-end demo of a **personalized AI stock analyst** bought and paid for on BN
 The agent aggregates 5 independent data sources (yfinance, FRED macro, SEC EDGAR insider trades, Alpha Vantage AI sentiment, GNews headlines), computes 10 technical indicators (RSI, MACD, Bollinger, MA50/200 golden/death cross, ADX trend strength, OBV, ATR, VaR 95%), and writes a structured report with explicit bull/bear thesis, portfolio P&L vs your actual cost basis, and a hard recommendation with target price.
 
 ## Paid x402 contract
+
+Mainnet integration references:
+
+- [External integration quickstart](docs/x402-mainnet-quickstart.md)
+- [Payment wire and security contract](docs/x402-api-usage.md)
 
 x402 payments use **BSC Mainnet (chain ID 56)**. Every accepted analysis costs exactly `100000000000000000` atomic units (0.1 of the selected 18-decimal token).
 
@@ -27,7 +32,7 @@ B402 capabilities may be partial; choose one live supported requirement. U and U
 
 `BSC_RPC_URL` is used only for USDC/USDT allowance reads, approval/revoke, and paid preflight. Use `npm run x402:allowance`, `npm run x402:approve`, and `npm run x402:revoke`; both approve and revoke require confirmation and `--yes` is an explicit noninteractive bypass. `npm run x402:async` never approves or revokes. Only a freshly created Permit2 reservation in the same request uses verify-and-settle. Every pre-existing stale Permit2 reservation is recovered settle-only with the identical persisted proof, regardless of `pendingSettlementReference` or deadline; recovery does not call `/verify`.
 
-After local cryptographic payment-proof verification identifies the wallet, admission allows 30 accepted new jobs per rolling hour. The 31st request returns HTTP 429 and `Retry-After` before B402 verification or settlement. An exact retry does not consume another slot or settle twice. Competition reporting occurs once after terminal settlement or queued state using `settledAt`.
+After local cryptographic payment-proof verification identifies the wallet, admission allows 30 accepted new jobs per rolling hour for each payer wallet. Explicit payment rejection releases a new reservation; the 31st request returns HTTP 429 and `Retry-After` before B402 verification or settlement. An exact retry does not consume another slot or settle twice. Payment is settled before analysis and does not guarantee a successful report; a later analysis failure does not automatically refund the settlement, while a retryable failure can resume without another payment. Competition delivery starts from durable settled/queued state, uses a stable hashed `eventId`, and is asynchronous best-effort delivery that the receiver must deduplicate.
 
 ERC-8183 is a separate on-chain escrow flow, not x402; its fixed price remains 0.21 U and its settlement and delivery behavior are unchanged.
 
@@ -162,8 +167,9 @@ The deployed agent exposes two ports:
 - `:9001` — x402 (public, `Payment-Signature` auth only) — enabled by `X402_PORT=9001` env var
 
 The public x402 V2 exchange is `402 PAYMENT-REQUIRED: base64(PaymentRequired)`,
-followed by a retry carrying `PAYMENT-SIGNATURE: base64(PaymentPayload)`, then
-`202 PAYMENT-RESPONSE: base64(SettlementResponse)`.
+followed by a retry carrying `PAYMENT-SIGNATURE: base64(PaymentPayload)` and a
+202 job response. `PAYMENT-RESPONSE` is conditional and is present only when a
+validated settlement response is available.
 
 ### 2. Configure the buyer
 
@@ -190,7 +196,7 @@ PROVIDER_ADDRESS=<seller wallet address>
 # x402 — defaults to localhost:9000; deployed value is the public mainnet gateway
 X402_ENDPOINT=https://stock-agent.bnbchain.org
 # Append /x402/price, /x402/analyze/async, or private job paths to this base.
-# It contains neither /mainnet nor a trailing /x402. The old execute-api endpoint remains enabled during certificate/DNS/custom-domain validation and is disabled only after successful final cutover verification.
+# It contains neither /mainnet nor a trailing /x402. Direct execute-api URLs are unsupported for external integration.
 
 UOMP_GUARD_URL=http://127.0.0.1:9374
 UOMP_GUARD_TOKEN=demo-guard-token
@@ -227,7 +233,7 @@ agent-demo/
 │   ├── app/agent/
 │   │   ├── main.py         A2A entrypoint + x402 dual-port mode
 │   │   ├── x402_handler.py x402 routes: /price  /analyze/async  /jobs
-│   │   ├── x402_verify.py  EIP-712 EIP-3009 verification (FIXED code, never LLM)
+│   │   ├── x402_verify.py  EIP-3009 + Permit2 Exact verification (FIXED code, never LLM)
 │   │   ├── seller_core.py  ERC-8183 negotiate / notify_funded / fulfill
 │   │   ├── signing.py      Deterministic signing (never LLM tools)
 │   │   ├── analysis.py     yfinance data engine + technical indicators

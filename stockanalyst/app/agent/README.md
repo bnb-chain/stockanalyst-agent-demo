@@ -5,6 +5,9 @@ This runtime serves paid asynchronous x402 jobs at
 `POST /x402/analyze/async`, `GET /x402/jobs/{jobId}`, and
 `POST /x402/jobs/{jobId}/resume`.
 
+- [Mainnet integration quickstart](../../../docs/x402-mainnet-quickstart.md)
+- [Payment wire and security contract](../../../docs/x402-api-usage.md)
+
 ## x402 payment contract
 
 Every accepted analysis costs exactly `100000000000000000` atomic units (0.1
@@ -36,10 +39,15 @@ settle-only with the identical persisted proof, regardless of
 ## Admission
 
 Verified wallet identity is admitted before B402 verification or settlement.
-Each wallet may receive 30 accepted new jobs per rolling hour. The 31st new
-job receives HTTP 429 with `Retry-After`. An exact retry does not consume
-another slot. Competition reporting occurs once after terminal settlement or
-queued state using `settledAt`.
+Admission allows 30 accepted new jobs per rolling hour for each payer wallet.
+Explicit payment rejection releases a new reservation; the 31st new job gets
+HTTP 429 with `Retry-After`. An exact retry does not consume another slot or
+settle twice. Payment is settled before analysis and does not guarantee a
+successful report; a later analysis failure does not automatically refund the
+settlement, while a retryable failure resumes without another payment.
+Competition delivery starts from durable settled/queued state, uses a stable
+hashed `eventId`, and is asynchronous best-effort delivery that the receiver
+must deduplicate.
 
 ERC-8183 is a separate escrow channel, not x402; its fixed price remains 0.21
 U and its behavior is unchanged.
