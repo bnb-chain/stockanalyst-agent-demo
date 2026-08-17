@@ -125,4 +125,4 @@ response can redeliver the same stable identifier, so the receiving API must
 deduplicate by `eventId`; this is not transport-level exactly-once delivery.
 Reporting failure does not fail the paid request or analysis job.
 
-ERC-8183 is separate on-chain escrow, not x402. Its fixed price remains 0.1 U and its behavior is unchanged.
+ERC-8183 is separate on-chain escrow, not x402. Its fixed price remains 0.21 U and its behavior is unchanged.

@@ -924,7 +924,6 @@ Witness(address to, uint256 validAfter)
             BUYER_README.read_text(encoding="utf-8"),
             STOCKANALYST_README.read_text(encoding="utf-8"),
             AGENT_README.read_text(encoding="utf-8"),
-            X402_API_USAGE.read_text(encoding="utf-8"),
         )
         for documentation in erc8183_guidance:
             normalized = " ".join(documentation.split())
