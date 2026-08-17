@@ -38,6 +38,7 @@ runtime_arn = "arn:aws:bedrock-agentcore:us-east-1:201243086760:runtime/stockana
 # Names-only contract for the protected runtime environment. Values remain in
 # the deployment secret and are never recorded in this tracked file.
 # BEGIN RUNTIME SECRET NAME CONTRACT
+# runtime-secret-name: API_BASE_URL
 # runtime-secret-name: ALPHA_VANTAGE_API_KEY
 # runtime-secret-name: B402_ACCESS_TOKEN
 # runtime-secret-name: B402_BASE_URL
@@ -205,6 +206,13 @@ public = true
 # COMPETITION_AI_CALLS_URL is the complete backend API URL, including its path.
 #   bag env set COMPETITION_AI_CALLS_URL https://<backend>/<api-path>
 #   bag env set COMPETITION_INTERNAL_TOKEN <internal-token>
+#
+# ── x402 usage metrics (optional, best effort) ─────────────────────────────
+# Uses the same internal write token as Competition. The Agent appends the
+# fixed /internal/x402/usage-events path. The query API key belongs only to the
+# backend/query client and must not be configured in this Runtime.
+#   bag env set API_BASE_URL https://bnbagent-api.bnbchain.world
+#   bag env set COMPETITION_INTERNAL_TOKEN <competition-write-token>
 
 # ── Asynchronous x402 reports (optional; all required together) ─────────────
 # At expiresAt, authenticated polling stops and the API issues or renews no

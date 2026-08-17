@@ -49,6 +49,15 @@ Competition delivery starts from durable settled/queued state, uses a stable
 hashed `eventId`, and is asynchronous best-effort delivery that the receiver
 must deduplicate.
 
+Usage metrics are a separate best-effort protocol. Configure
+`API_BASE_URL=https://bnbagent-api.bnbchain.world` together with the existing
+`COMPETITION_INTERNAL_TOKEN`; the Agent appends
+`/internal/x402/usage-events`. It uploads one `attempt` for every Runtime
+`POST /x402/analyze/async` and one stable hashed `succeeded` event after a
+report is durably completed. Reporting failure never changes payment or Job
+results. `COMPETITION_QUERY_API_KEY` belongs only to the backend query client
+and must not be configured in the Agent Runtime.
+
 ERC-8183 is a separate escrow channel, not x402; its fixed price remains 0.1
 U and its behavior is unchanged.
 

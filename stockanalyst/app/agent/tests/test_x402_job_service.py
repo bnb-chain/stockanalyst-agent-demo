@@ -454,6 +454,7 @@ def make_service(
     rate_limiter: Any = None,
     reservation_observer_sleep: Any = None,
     reservation_observer_attempts: int = 3,
+    usage_succeeded: Any = None,
 ) -> X402JobService:
     async def idle_stream(
         _prompt: str,
@@ -495,6 +496,7 @@ def make_service(
             reservation_observer_sleep or immediate_accounting_sleep
         ),
         reservation_observer_attempts=reservation_observer_attempts,
+        usage_succeeded=usage_succeeded,
     )
 
 
@@ -618,6 +620,71 @@ async def seed_execution_job(
 
 
 class X402JobIdentityTests(unittest.IsolatedAsyncioTestCase):
+    async def test_valid_payment_observes_wallet_before_rate_limit_rejection(
+        self,
+    ) -> None:
+        rate_limiter = AsyncMock()
+        rate_limiter.reserve.side_effect = WalletRateLimitExceeded(60)
+        service = make_service(rate_limiter=rate_limiter)
+        observed = Mock()
+
+        with (
+            patch(
+                "x402_job_service.validate_payment_proof",
+                return_value=(verified_payment(), ""),
+            ),
+            self.assertRaises(WalletRateLimitExceeded),
+        ):
+            await service.create_job(
+                PROOF,
+                REQUEST,
+                wallet_verified=observed,
+            )
+
+        observed.assert_called_once_with(ADDRESS.lower())
+        rate_limiter.reserve.assert_awaited_once()
+
+    async def test_invalid_payment_never_observes_a_wallet(self) -> None:
+        service = make_service()
+        observed = Mock()
+
+        with (
+            patch(
+                "x402_job_service.validate_payment_proof",
+                return_value=(None, "bad signature"),
+            ),
+            self.assertRaisesRegex(X402JobError, "payment_rejected"),
+        ):
+            await service.create_job(
+                PROOF,
+                REQUEST,
+                wallet_verified=observed,
+            )
+
+        observed.assert_not_called()
+
+    async def test_wallet_observer_failure_cannot_change_job_outcome(self) -> None:
+        service = make_service(accept_new_jobs=False)
+        observed = Mock(side_effect=RuntimeError("private observer detail"))
+
+        with (
+            patch(
+                "x402_job_service.validate_payment_proof",
+                return_value=(verified_payment(), ""),
+            ),
+            self.assertLogs("seller-agent.x402.jobs", level="WARNING") as logs,
+            self.assertRaises(X402JobError) as raised,
+        ):
+            await service.create_job(
+                PROOF,
+                REQUEST,
+                wallet_verified=observed,
+            )
+
+        self.assertEqual(raised.exception.code, "async_jobs_paused")
+        observed.assert_called_once_with(ADDRESS.lower())
+        self.assertNotIn("private observer detail", "\n".join(logs.output))
+
     async def test_same_payment_derives_same_handle(self) -> None:
         service = make_service()
         payment = verified_payment()
@@ -2806,6 +2873,7 @@ class X402JobExecutionTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_worker_writes_final_report_before_succeeded(self) -> None:
         store = MemoryJobStore()
+        usage_succeeded = Mock(return_value=True)
 
         async def successful_stream(
             _prompt: str,
@@ -2817,7 +2885,11 @@ class X402JobExecutionTests(unittest.IsolatedAsyncioTestCase):
             yield "report", {"content": "# complete", "format": "markdown"}
             yield "done", {}
 
-        service = make_service(store=store, stream_work=successful_stream)
+        service = make_service(
+            store=store,
+            stream_work=successful_stream,
+            usage_succeeded=usage_succeeded,
+        )
         with patch(
             "x402_job_service.validate_payment_proof",
             return_value=(verified_payment(), ""),
@@ -2837,7 +2909,71 @@ class X402JobExecutionTests(unittest.IsolatedAsyncioTestCase):
             store.events.index("put_report"),
             store.events.index("replace:succeeded"),
         )
+        durable = store.jobs[created.job_id].record
+        usage_succeeded.assert_called_once_with(
+            job_id=created.job_id,
+            wallet=ADDRESS,
+            timestamp=durable["updatedAt"],
+        )
         self.assertFalse(service.is_busy())
+
+    async def test_failed_analysis_never_reports_succeeded_usage(self) -> None:
+        store = MemoryJobStore()
+        usage_succeeded = Mock(return_value=True)
+
+        async def failing_stream(
+            _prompt: str,
+            _session_id: str,
+            _symbols: list[str],
+        ) -> Any:
+            raise RuntimeError("analysis failed")
+            if False:
+                yield "", {}
+
+        service = make_service(
+            store=store,
+            stream_work=failing_stream,
+            usage_succeeded=usage_succeeded,
+        )
+        created = await seed_execution_job(service, store, status="queued")
+
+        await service._run_job(created.job_id)
+
+        self.assertEqual(store.jobs[created.job_id].record["status"], "failed")
+        usage_succeeded.assert_not_called()
+
+    async def test_usage_scheduler_failure_keeps_durable_success(self) -> None:
+        store = MemoryJobStore()
+        usage_succeeded = Mock(
+            side_effect=RuntimeError("private usage scheduler detail")
+        )
+
+        async def successful_stream(
+            _prompt: str,
+            _session_id: str,
+            _symbols: list[str],
+        ) -> Any:
+            yield "report", {"content": "# complete", "format": "markdown"}
+
+        service = make_service(
+            store=store,
+            stream_work=successful_stream,
+            usage_succeeded=usage_succeeded,
+        )
+        created = await seed_execution_job(service, store, status="queued")
+
+        with self.assertLogs("seller-agent.x402.jobs", level="WARNING") as logs:
+            await service._run_job(created.job_id)
+
+        self.assertEqual(
+            store.jobs[created.job_id].record["status"],
+            "succeeded",
+        )
+        usage_succeeded.assert_called_once()
+        self.assertNotIn(
+            "private usage scheduler detail",
+            "\n".join(logs.output),
+        )
 
     async def test_query_authentication_hides_missing_and_wrong_token(
         self,
@@ -3616,6 +3752,7 @@ class X402JobExecutionTests(unittest.IsolatedAsyncioTestCase):
     async def test_stale_upload_cannot_overwrite_newer_success(self) -> None:
         store = OvertakingReportStore()
         now = [NOW]
+        usage_succeeded = Mock(return_value=True)
 
         async def stale_stream(
             _prompt: str,
@@ -3635,11 +3772,13 @@ class X402JobExecutionTests(unittest.IsolatedAsyncioTestCase):
             store=store,
             stream_work=stale_stream,
             clock=lambda: now[0],
+            usage_succeeded=usage_succeeded,
         )
         winning_service = make_service(
             store=store,
             stream_work=winning_stream,
             clock=lambda: now[0],
+            usage_succeeded=usage_succeeded,
         )
         created = await seed_execution_job(
             stale_service,
@@ -3665,6 +3804,11 @@ class X402JobExecutionTests(unittest.IsolatedAsyncioTestCase):
         durable = store.jobs[created.job_id].record
         self.assertEqual(durable, winner)
         self.assertEqual(store.report_for_record(durable), "# winner")
+        usage_succeeded.assert_called_once_with(
+            job_id=created.job_id,
+            wallet=ADDRESS,
+            timestamp=winner["updatedAt"],
+        )
 
     async def test_same_process_resume_hands_off_from_stale_worker(
         self,

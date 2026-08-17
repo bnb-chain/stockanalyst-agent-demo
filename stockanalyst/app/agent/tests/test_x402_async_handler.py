@@ -4,7 +4,7 @@ import base64
 import json
 import unittest
 from dataclasses import dataclass
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 from stockanalyst.app.agent import x402_handler as handler_module
 from stockanalyst.app.agent import x402_verify
@@ -203,7 +203,12 @@ async def call_disconnected_handler(
     return send
 
 
-def make_handler(service=None, *, b402_client=None) -> X402Handler:
+def make_handler(
+    service=None,
+    *,
+    b402_client=None,
+    usage_reporter=None,
+) -> X402Handler:
     if b402_client is None:
         b402_client = AsyncMock()
         b402_client.payment_extras.return_value = SUPPORTED_EXTRAS
@@ -211,10 +216,122 @@ def make_handler(service=None, *, b402_client=None) -> X402Handler:
         AsyncMock(),
         job_service=service,
         b402_client=b402_client,
+        usage_reporter=usage_reporter,
     )
 
 
 class X402AsyncHandlerTests(unittest.IsolatedAsyncioTestCase):
+    @staticmethod
+    def usage_reporter() -> tuple[Mock, Mock]:
+        attempt = Mock()
+        reporter = Mock()
+        reporter.start_attempt.return_value = attempt
+        return reporter, attempt
+
+    async def test_usage_attempt_brackets_an_accepted_request_and_observes_wallet(
+        self,
+    ) -> None:
+        service = AsyncMock()
+        service.create_job.return_value = CreateJobResult(
+            job_id=JOB_ID,
+            job_token="token",
+            status="queued",
+            expires_at=EXPIRES_AT,
+        )
+        reporter, attempt = self.usage_reporter()
+
+        response = await call_handler(
+            make_handler(service, usage_reporter=reporter),
+            method="POST",
+            path="/x402/analyze/async",
+            headers={"payment-signature": "proof"},
+            json_body={"symbols": ["AAPL"]},
+        )
+
+        self.assertEqual(response.status, 202)
+        reporter.start_attempt.assert_called_once_with()
+        reporter.submit_attempt.assert_called_once_with(attempt)
+        service.create_job.assert_awaited_once_with(
+            "proof",
+            {"symbols": ["AAPL"]},
+            wallet_verified=attempt.observe_verified_wallet,
+        )
+
+    async def test_usage_attempt_is_submitted_for_early_and_error_outcomes(
+        self,
+    ) -> None:
+        scenarios = (
+            (None, {"headers": {}, "json_body": {"symbols": ["AAPL"]}}, 404),
+            (
+                AsyncMock(),
+                {"headers": {"payment-signature": "proof"}, "body_chunks": [b"{"]},
+                400,
+            ),
+            (AsyncMock(), {"headers": {}, "json_body": {"symbols": ["AAPL"]}}, 402),
+        )
+        for service, call_kwargs, expected_status in scenarios:
+            reporter, attempt = self.usage_reporter()
+            with self.subTest(expected_status=expected_status):
+                response = await call_handler(
+                    make_handler(service, usage_reporter=reporter),
+                    method="POST",
+                    path="/x402/analyze/async",
+                    **call_kwargs,
+                )
+                self.assertEqual(response.status, expected_status)
+                reporter.start_attempt.assert_called_once_with()
+                reporter.submit_attempt.assert_called_once_with(attempt)
+
+    async def test_usage_attempt_is_submitted_when_wallet_limit_rejects(self) -> None:
+        service = AsyncMock()
+        service.create_job.side_effect = WalletRateLimitExceeded(60)
+        reporter, attempt = self.usage_reporter()
+
+        response = await call_handler(
+            make_handler(service, usage_reporter=reporter),
+            method="POST",
+            path="/x402/analyze/async",
+            headers={"payment-signature": "proof"},
+            json_body={"symbols": ["AAPL"]},
+        )
+
+        self.assertEqual(response.status, 429)
+        reporter.submit_attempt.assert_called_once_with(attempt)
+
+    async def test_usage_attempt_is_submitted_after_request_disconnect(self) -> None:
+        reporter, attempt = self.usage_reporter()
+        await call_disconnected_handler(
+            make_handler(AsyncMock(), usage_reporter=reporter),
+            messages=[{"type": "http.disconnect"}],
+        )
+
+        reporter.start_attempt.assert_called_once_with()
+        reporter.submit_attempt.assert_called_once_with(attempt)
+
+    async def test_usage_reporting_ignores_non_analyze_routes(self) -> None:
+        reporter, _attempt = self.usage_reporter()
+        handler = make_handler(AsyncMock(), usage_reporter=reporter)
+
+        for method, path in (
+            ("GET", "/x402/price"),
+            ("POST", "/x402/unknown"),
+        ):
+            with self.subTest(method=method, path=path):
+                await call_handler(handler, method=method, path=path)
+        await handler(
+            {
+                "type": "http",
+                "method": "GET",
+                "path": "/health",
+                "headers": [],
+            },
+            AsyncMock(),
+            AsyncMock(),
+        )
+
+        reporter.start_attempt.assert_not_called()
+        reporter.submit_attempt.assert_not_called()
+
     async def test_paid_wallet_limit_maps_to_fixed_429_before_other_work(
         self,
     ) -> None:

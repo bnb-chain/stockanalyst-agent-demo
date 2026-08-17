@@ -17,7 +17,7 @@ import json
 import logging
 import os
 import re
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from typing import Any
 
 import httpx
@@ -30,6 +30,7 @@ if __package__:
         B402IndeterminateError,
         B402RejectedError,
     )
+    from .usage_reporting import UsageAttempt, UsageEventReporter
     from .x402_job_service import (
         JobView,
         SettlementIndeterminate,
@@ -58,6 +59,7 @@ else:
         B402IndeterminateError,
         B402RejectedError,
     )
+    from usage_reporting import UsageAttempt, UsageEventReporter
     from x402_job_service import (
         JobView,
         SettlementIndeterminate,
@@ -269,10 +271,12 @@ class X402Handler:
         *,
         job_service: X402JobService | None = None,
         b402_client: B402Client | None = _B402_CLIENT,
+        usage_reporter: UsageEventReporter | None = None,
     ) -> None:
         self._inner = app
         self._job_service = job_service
         self._b402_client = b402_client
+        self._usage_reporter = usage_reporter
 
     async def __call__(self, scope, receive, send) -> None:
         if scope["type"] != "http" or not scope.get("path", "").startswith("/x402"):
@@ -287,15 +291,7 @@ class X402Handler:
         if path == "/x402/price":
             await self._handle_price(scope, send)
         elif raw_path == "/x402/analyze/async" and method == "POST":
-            if self._job_service is None:
-                await _send_json(
-                    send,
-                    404,
-                    {"error": "not found"},
-                    extra_headers=_async_response_headers(),
-                )
-            else:
-                await self._handle_async_analyze(scope, receive, send)
+            await self._handle_tracked_async_analyze(scope, receive, send)
         elif (
             job_match
             and method == "GET"
@@ -358,6 +354,38 @@ class X402Handler:
 
     # ── Route handlers ─────────────────────────────────────────────────────────
 
+    async def _handle_tracked_async_analyze(self, scope, receive, send) -> None:
+        usage_attempt: UsageAttempt | None = None
+        if self._usage_reporter is not None:
+            try:
+                usage_attempt = self._usage_reporter.start_attempt()
+            except Exception:
+                logger.warning("x402 usage attempt tracking unavailable")
+        try:
+            if self._job_service is None:
+                await _send_json(
+                    send,
+                    404,
+                    {"error": "not found"},
+                    extra_headers=_async_response_headers(),
+                )
+                return
+            wallet_verified: Callable[[str], None] | None = None
+            if usage_attempt is not None:
+                wallet_verified = usage_attempt.observe_verified_wallet
+            await self._handle_async_analyze(
+                scope,
+                receive,
+                send,
+                wallet_verified=wallet_verified,
+            )
+        finally:
+            if self._usage_reporter is not None and usage_attempt is not None:
+                try:
+                    self._usage_reporter.submit_attempt(usage_attempt)
+                except Exception:
+                    logger.warning("x402 usage attempt tracking unavailable")
+
     async def _handle_price(self, scope, send) -> None:
         """GET /x402/price — price info without payment."""
         try:
@@ -413,7 +441,14 @@ class X402Handler:
             )
         return requirements
 
-    async def _handle_async_analyze(self, scope, receive, send) -> None:
+    async def _handle_async_analyze(
+        self,
+        scope,
+        receive,
+        send,
+        *,
+        wallet_verified: Callable[[str], None] | None = None,
+    ) -> None:
         """POST /x402/analyze/async — settle and return a durable job handle."""
         try:
             req = await _read_json_body(receive)
@@ -484,9 +519,13 @@ class X402Handler:
             return
 
         try:
+            create_kwargs = {}
+            if wallet_verified is not None:
+                create_kwargs["wallet_verified"] = wallet_verified
             result = await self._job_service.create_job(
                 payment_header,
                 req,
+                **create_kwargs,
             )
         except WalletRateLimitExceeded as exc:
             await _send_json(

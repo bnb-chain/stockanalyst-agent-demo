@@ -2,11 +2,11 @@ import ast
 import hashlib
 import json
 import re
+import tomllib
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-import tomllib
 import yaml
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -59,6 +59,7 @@ CANONICAL_PERMIT2 = "0x000000000022D473030F116dDEE9F6B43aC78BA3"
 B402_PAY_TO = "0x15958aad30b758dAbfbB9788Da69dfcd56e89078"
 EXPECTED_RUNTIME_SECRET_NAMES = frozenset(
     {
+        "API_BASE_URL",
         "ALPHA_VANTAGE_API_KEY",
         "B402_ACCESS_TOKEN",
         "B402_BASE_URL",
@@ -746,13 +747,14 @@ Witness(address to, uint256 validAfter)
                     affirmative_payment_guidance_violations(guidance), []
                 )
 
-    def test_runtime_secret_name_contract_has_25_paid_only_names(self) -> None:
+    def test_runtime_secret_name_contract_has_26_paid_only_names(self) -> None:
         declared = declared_runtime_secret_names(STUDIO.read_text(encoding="utf-8"))
 
-        self.assertEqual(len(declared), 25)
+        self.assertEqual(len(declared), 26)
         self.assertEqual(len(declared), len(set(declared)))
         self.assertEqual(frozenset(declared), EXPECTED_RUNTIME_SECRET_NAMES)
         self.assertNotIn("BSC_RPC_URL", declared)
+        self.assertNotIn("COMPETITION_QUERY_API_KEY", declared)
         self.assertFalse(
             EXPECTED_RUNTIME_SECRET_NAMES.intersection(
                 {
@@ -992,7 +994,10 @@ Witness(address to, uint256 validAfter)
             studio,
         )
         self.assertNotIn("bsc-testnet", studio)
-        self.assertNotIn("bnbagent-api.bnbchain.world", studio)
+        self.assertIn(
+            "bag env set API_BASE_URL https://bnbagent-api.bnbchain.world",
+            studio,
+        )
         self.assertIn(
             'runtime_arn = "arn:aws:bedrock-agentcore:us-east-1:201243086760:'
             'runtime/stockanalystmainnet_stockanalystmainnet-GVFwe5Etrj"',
