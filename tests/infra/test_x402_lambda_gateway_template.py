@@ -1,10 +1,10 @@
 """Deterministic security and routing checks for the x402 SAM template."""
+
 from __future__ import annotations
 
 import re
 import unittest
 from pathlib import Path
-
 
 ROOT = Path(__file__).resolve().parents[2]
 TEMPLATE = ROOT / "infra" / "x402-lambda-gateway.yaml"
@@ -54,7 +54,6 @@ class X402LambdaGatewayTemplateTests(unittest.TestCase):
         ):
             self.assertRegex(text, rf"(?ms)^          {re.escape(path)}:\n            {method}:")
         self.assertNotIn("{proxy+}", text)
-        self.assertNotIn("/x402/free:", text)
 
     def test_regional_custom_domain_maps_root_to_mainnet(self) -> None:
         text = TEMPLATE.read_text()
@@ -132,7 +131,7 @@ class X402LambdaGatewayTemplateTests(unittest.TestCase):
         )
         self.assertIn("X402_CUSTOM_DOMAIN_NAME: !Ref CustomDomainName", adapter)
 
-    def test_dormant_free_waf_matcher_does_not_publish_free_openapi_route(self) -> None:
+    def test_create_waf_matcher_covers_the_paid_async_route(self) -> None:
         text = TEMPLATE.read_text()
         web_acl = resource_section(text, "X402WebAcl", "X402WebAclAssociation")
         create_rule = re.search(
@@ -150,18 +149,12 @@ class X402LambdaGatewayTemplateTests(unittest.TestCase):
             r"\s+SearchString: POST",
         )
         self.assertIn("OrStatement:", section)
-        for path in ("/x402/free", "/x402/analyze/async"):
-            self.assertRegex(
-                section,
-                rf"(?s)FieldToMatch: \{{UriPath: \{{\}}\}}\n"
-                rf"\s+PositionalConstraint: EXACTLY\n"
-                rf"\s+SearchString: {re.escape(path)}",
-            )
-        openapi = text.split("      DefinitionBody:", 1)[1].split(
-            "      AccessLogSetting:",
-            1,
-        )[0]
-        self.assertNotIn("/x402/free:", openapi)
+        self.assertRegex(
+            section,
+            r"(?s)FieldToMatch: \{UriPath: \{\}\}\n"
+            r"\s+PositionalConstraint: EXACTLY\n"
+            r"\s+SearchString: /x402/analyze/async",
+        )
 
     def test_template_adds_no_shared_promotional_state_resources(self) -> None:
         text = TEMPLATE.read_text()

@@ -337,8 +337,8 @@ Buyer                              Agent (localhost:9000)
 
 The current paid flow uses **x402 v2** on **BSC Mainnet (chain ID 56)**.
 U/USD1 use EIP-712 EIP-3009 `TransferWithAuthorization`; USDC/USDT use the
-exact Permit2 proof described above. The retained legacy free client is U-only.
-Paid requirements may select these exact tokens:
+exact Permit2 proof described above. Paid requirements may select these exact
+tokens:
 
 | Symbol | Method | Domain name/version | Decimals | Exact paid amount | Mainnet contract |
 |--------|--------|---------------------|----------|-------------------|------------------|

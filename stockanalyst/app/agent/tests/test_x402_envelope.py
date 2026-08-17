@@ -230,7 +230,7 @@ class X402EnvelopeTests(unittest.IsolatedAsyncioTestCase):
             ("GET", "/x402/analyze/async"),
             ("POST", f"/x402/jobs/{JOB_ID}"),
             ("GET", f"/x402/jobs/{JOB_ID}/resume"),
-            ("PUT", "/x402/free"),
+            ("PUT", "/x402/unknown"),
         ):
             with self.subTest(method=method, path=path), self.assertRaisesRegex(
                 EnvelopeError, "route_not_allowed"
@@ -241,14 +241,14 @@ class X402EnvelopeTests(unittest.IsolatedAsyncioTestCase):
                     expected_public_base_url=PUBLIC_BASE,
                 )
 
-    async def test_dispatch_rejects_free_routes(self) -> None:
+    async def test_dispatch_rejects_unknown_routes(self) -> None:
         for method in ("GET", "POST"):
             with self.subTest(method=method), self.assertRaisesRegex(
                 EnvelopeError, "route_not_allowed"
             ):
                 await dispatch_x402_envelope(
                     recording_app,
-                    request_envelope(method=method, path="/x402/free"),
+                    request_envelope(method=method, path="/x402/unknown"),
                     expected_public_base_url=PUBLIC_BASE,
                 )
 

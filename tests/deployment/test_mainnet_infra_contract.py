@@ -339,6 +339,32 @@ class MainnetInfrastructureContractTests(unittest.TestCase):
             (BUYER_X402_SOURCE_ROOT / "x402-free-client.test.ts").exists()
         )
 
+    def test_retired_endpoint_leaves_no_exact_route_or_helper_artifacts(self) -> None:
+        retired_route = "/x402/" + "fr" + "ee"
+        retired_helper = "signed_" + "fr" + "ee_proof"
+        stale_guidance = "retained legacy " + "fr" + "ee client"
+        markers = (retired_route, retired_helper, stale_guidance)
+        roots = (
+            ROOT / "gateway" / "x402_lambda" / "tests",
+            ROOT / "stockanalyst" / "app" / "agent" / "tests",
+            ROOT / "tests" / "infra",
+            Path(__file__),
+            BUYER_README,
+        )
+        offenders: list[str] = []
+
+        for root in roots:
+            paths = (root,) if root.is_file() else root.rglob("*")
+            for path in paths:
+                if not path.is_file() or path.suffix not in {".md", ".py", ".ts"}:
+                    continue
+                source = path.read_text(encoding="utf-8")
+                for marker in markers:
+                    if marker in source:
+                        offenders.append(f"{path.relative_to(ROOT)}: {marker}")
+
+        self.assertEqual(offenders, [])
+
     def test_paid_runtime_has_no_zero_settlement_demo_bypass(self) -> None:
         handler = RUNTIME_X402_HANDLER.read_text(encoding="utf-8")
         studio = STUDIO.read_text(encoding="utf-8")
@@ -483,7 +509,6 @@ class MainnetInfrastructureContractTests(unittest.TestCase):
                     self.assertIn(required, normalized)
                 for forbidden in (
                     "X402_PROMO_FREE_MODE",
-                    "/x402/free",
                     "Wallet-Signature",
                     "x402:free",
                     "promoFree",
