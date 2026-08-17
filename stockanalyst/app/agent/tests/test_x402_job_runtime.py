@@ -12,7 +12,7 @@ from collections.abc import AsyncGenerator, Mapping
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 from eth_utils import to_checksum_address
 from web3 import Web3
@@ -25,6 +25,11 @@ from tests.test_x402_job_service import (
 from tests.test_x402_job_service import (
     MemoryJobStore,
     seed_settling_job,
+)
+from usage_reporting import (
+    UsageEventReporter,
+    UsageReportingError,
+    load_usage_reporting_config,
 )
 from x402_job_service import (
     X402JobError,
@@ -52,7 +57,11 @@ def _load_runtime_functions(
 ) -> dict[str, Any]:
     """Load only the pure runtime helpers without importing the real ADK runner."""
     tree = ast.parse(MAIN_PATH.read_text(encoding="utf-8"))
-    wanted = {"build_x402_job_service", "_runtime_is_busy"}
+    wanted = {
+        "build_usage_event_reporter",
+        "build_x402_job_service",
+        "_runtime_is_busy",
+    }
     functions = [
         node
         for node in tree.body
@@ -63,6 +72,7 @@ def _load_runtime_functions(
         "Mapping": Mapping,
         "Any": Any,
         "asyncio": asyncio,
+        "logging": logging,
         "X402JobError": X402JobError,
         "X402JobService": X402JobService,
         "X402JobStore": X402JobStore,
@@ -71,6 +81,9 @@ def _load_runtime_functions(
         "token_by_asset": token_by_asset,
         "load_job_token_secret": load_job_token_secret,
         "WalletRateLimiter": WalletRateLimiter,
+        "UsageEventReporter": UsageEventReporter,
+        "UsageReportingError": UsageReportingError,
+        "load_usage_reporting_config": load_usage_reporting_config,
         "_settle_via_facilitator": settle or AsyncMock(),
         "report_competition_call": report or AsyncMock(return_value=True),
         "get_8183_client": get_client or (lambda: None),
@@ -292,6 +305,49 @@ class X402JobRuntimeTests(unittest.IsolatedAsyncioTestCase):
         build = _load_runtime_functions()["build_x402_job_service"]
 
         self.assertIsNone(build({}, stream_work=AsyncMock()))
+
+    def test_usage_reporter_factory_is_optional_and_fails_open(self) -> None:
+        build = _load_runtime_functions()["build_usage_event_reporter"]
+
+        self.assertIsNone(build({}))
+        with self.assertLogs("seller-agent.x402.usage", level="WARNING") as logs:
+            partial = build({"API_BASE_URL": "https://backend.example"})
+        self.assertIsNone(partial)
+        self.assertNotIn("backend.example", "\n".join(logs.output))
+
+        configured = build(
+            {
+                "API_BASE_URL": "https://bnbagent-api.bnbchain.world",
+                "COMPETITION_INTERNAL_TOKEN": "secret",
+            }
+        )
+        self.assertIsInstance(configured, UsageEventReporter)
+        assert configured is not None
+        self.assertEqual(
+            configured._config.endpoint_url,
+            "https://bnbagent-api.bnbchain.world/internal/x402/usage-events",
+        )
+
+    def test_configured_factory_injects_succeeded_usage_scheduler(self) -> None:
+        build = _load_runtime_functions()["build_x402_job_service"]
+        usage_reporter = Mock()
+
+        service = build(
+            {
+                "X402_JOB_S3_BUCKET": "private-jobs",
+                "X402_JOB_TOKEN_SECRET": "x" * 32,
+            },
+            stream_work=AsyncMock(),
+            s3_client=FakeS3(),
+            usage_reporter=usage_reporter,
+        )
+
+        self.assertIsNotNone(service)
+        assert service is not None
+        self.assertIs(
+            service._usage_succeeded,
+            usage_reporter.submit_succeeded,
+        )
 
     def test_configured_factory_builds_service_with_pause_switch(self) -> None:
         settle = AsyncMock()
@@ -540,6 +596,10 @@ class X402JobRuntimeTests(unittest.IsolatedAsyncioTestCase):
         main_text = MAIN_PATH.read_text(encoding="utf-8")
         self.assertLess(
             main_text.index("\n_load_runtime_secrets()\n"),
+            main_text.index("\nusage_reporter = build_usage_event_reporter(\n"),
+        )
+        self.assertLess(
+            main_text.index("\nusage_reporter = build_usage_event_reporter(\n"),
             main_text.index("\nx402_jobs = build_x402_job_service(\n"),
         )
 
@@ -566,6 +626,13 @@ class X402JobRuntimeTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(len(service_builds), 1)
         self.assertEqual(len(handlers), 1)
+        service_usage = next(
+            keyword.value
+            for keyword in service_builds[0].value.keywords
+            if keyword.arg == "usage_reporter"
+        )
+        self.assertIsInstance(service_usage, ast.Name)
+        self.assertEqual(service_usage.id, "usage_reporter")
         for handler in handlers:
             job_service = next(
                 keyword.value
@@ -574,6 +641,13 @@ class X402JobRuntimeTests(unittest.IsolatedAsyncioTestCase):
             )
             self.assertIsInstance(job_service, ast.Name)
             self.assertEqual(job_service.id, "x402_jobs")
+            handler_usage = next(
+                keyword.value
+                for keyword in handler.keywords
+                if keyword.arg == "usage_reporter"
+            )
+            self.assertIsInstance(handler_usage, ast.Name)
+            self.assertEqual(handler_usage.id, "usage_reporter")
 
     def test_factory_is_not_exposed_as_an_llm_tool(self) -> None:
         tree = ast.parse(MAIN_PATH.read_text(encoding="utf-8"))

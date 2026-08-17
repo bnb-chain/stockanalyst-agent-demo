@@ -137,6 +137,11 @@ install_s3_storage_from_env()
 from bnbagent_studio_core.erc8183.client import get_8183_client
 
 from competition_reporting import report_competition_call
+from usage_reporting import (
+    UsageEventReporter,
+    UsageReportingError,
+    load_usage_reporting_config,
+)
 from x402_handler import X402Handler, _settle_via_facilitator
 from x402_job_service import (
     X402JobError,
@@ -149,11 +154,28 @@ from x402_verify import VerifiedPayment
 from x402_wallet_rate_limit import WalletRateLimiter
 
 
+def build_usage_event_reporter(
+    env: Mapping[str, str],
+) -> UsageEventReporter | None:
+    """Build optional usage reporting after protected secrets are loaded."""
+    try:
+        config = load_usage_reporting_config(env)
+    except UsageReportingError:
+        logging.getLogger("seller-agent.x402.usage").warning(
+            "x402 usage reporting disabled due to invalid configuration"
+        )
+        return None
+    if config is None:
+        return None
+    return UsageEventReporter(config)
+
+
 def build_x402_job_service(
     env: Mapping[str, str],
     *,
     stream_work,
     s3_client: Any | None = None,
+    usage_reporter: UsageEventReporter | None = None,
 ) -> X402JobService | None:
     """Build the optional asynchronous x402 runtime from complete config."""
     bucket = env.get("X402_JOB_S3_BUCKET", "").strip()
@@ -217,6 +239,11 @@ def build_x402_job_service(
         authorization_used=authorization_used,
         report=report_competition_call,
         stream_work=stream_work,
+        usage_succeeded=(
+            usage_reporter.submit_succeeded
+            if usage_reporter is not None
+            else None
+        ),
         accept_new_jobs=accept_new_jobs,
     )
 
@@ -514,9 +541,14 @@ async def _stream_runner(
     yield "done", {}
 
 
+usage_reporter = build_usage_event_reporter(
+    os.environ,
+)
+
 x402_jobs = build_x402_job_service(
     os.environ,
     stream_work=_stream_runner,
+    usage_reporter=usage_reporter,
 )
 
 
@@ -536,6 +568,7 @@ async def _x402_not_found(scope, receive, send):
 x402_app = X402Handler(
     _x402_not_found,
     job_service=x402_jobs,
+    usage_reporter=usage_reporter,
 )
 
 

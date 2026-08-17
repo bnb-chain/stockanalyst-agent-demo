@@ -151,6 +151,7 @@ class X402JobService:
         authorization_used: Callable[[VerifiedPayment], Awaitable[bool]],
         report: Callable[..., Awaitable[bool]],
         stream_work: Callable[..., Any],
+        usage_succeeded: Callable[..., bool] | None = None,
         clock: Callable[[], int] | None = None,
         owner: str | None = None,
         accept_new_jobs: bool = True,
@@ -176,6 +177,7 @@ class X402JobService:
         self._authorization_used = authorization_used
         self._report = report
         self._stream_work = stream_work
+        self._usage_succeeded = usage_succeeded
         self._clock = clock or (lambda: int(time.time() * 1000))
         self._owner = owner or secrets.token_hex(16)
         self._accept_new_jobs = accept_new_jobs
@@ -499,6 +501,7 @@ class X402JobService:
         request: dict[str, Any],
         *,
         source_ip: str | None = None,
+        wallet_verified: Callable[[str], None] | None = None,
     ) -> CreateJobResult:
         now = int(self._clock())
         payment, _reason = validate_payment_proof(
@@ -518,6 +521,11 @@ class X402JobService:
                 expired_recovery = True
             else:
                 raise X402JobError("payment_rejected")
+        if wallet_verified is not None:
+            try:
+                wallet_verified(payment.from_address.lower())
+            except Exception:
+                logger.warning("x402 usage wallet observation failed")
         proof_digest = self._proof_digest(proof_header)
         identity = self.derive_identity(payment)
         stored = await self._store.read(identity.job_id)
@@ -1465,15 +1473,31 @@ class X402JobService:
                     "retryable": None,
                 }
                 try:
-                    await self._store.replace(holder[0], succeeded)
+                    durable_succeeded = await self._store.replace(
+                        holder[0],
+                        succeeded,
+                    )
                 except JobConflict:
                     return
+                self._submit_succeeded_usage(durable_succeeded.record)
             finally:
                 await self._stop_heartbeat(heartbeat)
         except asyncio.CancelledError:
             raise
         except Exception:
             logger.warning("x402 background job execution failed")
+
+    def _submit_succeeded_usage(self, record: dict[str, Any]) -> None:
+        if self._usage_succeeded is None:
+            return
+        try:
+            self._usage_succeeded(
+                job_id=str(record["jobId"]),
+                wallet=str(record["address"]),
+                timestamp=int(record["updatedAt"]),
+            )
+        except Exception:
+            logger.warning("x402 succeeded usage tracking unavailable")
 
     async def _drive_execution_claim(
         self,
