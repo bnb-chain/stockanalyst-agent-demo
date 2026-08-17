@@ -115,25 +115,25 @@ class QuoteSignatureCompatibilityTests(unittest.TestCase):
 
 
 class MainnetPriceConfigurationTests(unittest.TestCase):
-    def test_erc8183_list_price_and_floor_are_exactly_point_21_u(self) -> None:
+    def test_erc8183_list_price_and_floor_are_exactly_point_1_u(self) -> None:
         configured = {
             "payments": {
                 "erc8183": {
-                    "price": "210000000000000000",
-                    "min_price": "210000000000000000",
+                    "price": "100000000000000000",
+                    "min_price": "100000000000000000",
                     "max_price": "5000000000000000000",
                 }
             }
         }
         with patch.object(signing.config, "load_studio_toml", return_value=configured):
-            self.assertEqual(signing.list_price(), 210000000000000000)
+            self.assertEqual(signing.list_price(), 100000000000000000)
             self.assertEqual(
                 signing.price_bounds(),
-                (210000000000000000, 5000000000000000000),
+                (100000000000000000, 5000000000000000000),
             )
             self.assertEqual(
                 signing.clamp_price(signing.list_price()),
-                210000000000000000,
+                100000000000000000,
             )
 
 
