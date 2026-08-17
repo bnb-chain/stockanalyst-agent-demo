@@ -212,11 +212,6 @@ def signed_proof(
     return base64.b64encode(json.dumps(proof).encode()).decode()
 
 
-def signed_free_proof(_to_address: str) -> str:
-    """Legacy fixture retained only for skipped retired-route tests."""
-    return signed_proof(value=0)
-
-
 class VerifiedPaymentTests(unittest.TestCase):
     def test_payment_signature_decoder_is_strict_and_returns_only_objects(
         self,

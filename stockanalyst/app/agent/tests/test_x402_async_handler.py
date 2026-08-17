@@ -503,7 +503,7 @@ class X402AsyncHandlerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status, 402)
         service.create_job.assert_not_awaited()
 
-    async def test_free_routes_are_not_routed(self) -> None:
+    async def test_unknown_routes_are_not_routed(self) -> None:
         handler = make_handler(AsyncMock())
 
         for method in ("GET", "POST"):
@@ -511,7 +511,7 @@ class X402AsyncHandlerTests(unittest.IsolatedAsyncioTestCase):
                 response = await call_handler(
                     handler,
                     method=method,
-                    path="/x402/free",
+                    path="/x402/unknown",
                     json_body={"symbol": "AAPL"} if method == "POST" else None,
                 )
                 self.assertEqual(response.status, 404)

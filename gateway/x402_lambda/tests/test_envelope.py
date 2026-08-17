@@ -232,8 +232,8 @@ class EnvelopeTests(unittest.TestCase):
                 )
         for method, path in (
             ("POST", "/x402/price"),
-            ("GET", "/x402/free"),
-            ("POST", "/x402/free"),
+            ("GET", "/x402/unknown"),
+            ("POST", "/x402/unknown"),
             ("GET", "/x402/analyze/async"),
             ("POST", f"/x402/jobs/{JOB_ID}"),
             ("GET", f"/x402/jobs/{JOB_ID}/resume"),

@@ -233,10 +233,10 @@ class HandlerTests(unittest.TestCase):
         self.assertTrue(body["retryable"])
         self.assertNotIn("proof", result["body"].lower())
 
-    def test_retired_free_gateway_request_is_rejected(self):
+    def test_unknown_gateway_request_is_rejected(self):
         event = {
             **EVENT,
-            "path": "/testnet/x402/free",
+            "path": "/testnet/x402/unknown",
             "queryStringParameters": {"symbol": "AAPL"},
             "multiValueQueryStringParameters": {"symbol": ["AAPL"]},
         }
