@@ -233,6 +233,21 @@ class HandlerTests(unittest.TestCase):
         self.assertTrue(body["retryable"])
         self.assertNotIn("proof", result["body"].lower())
 
+    def test_free_gateway_request_is_forwarded(self):
+        event = {
+            **EVENT,
+            "path": "/testnet/x402/free",
+            "queryStringParameters": {"symbol": "AAPL"},
+            "multiValueQueryStringParameters": {"symbol": ["AAPL"]},
+        }
+        agentcore = FakeAgentCore(response_envelope())
+        app = handler.GatewayApplication(FakeOAuth(), agentcore)
+        with patch.object(handler, "_application", app):
+            result = handler.lambda_handler(event, CONTEXT)
+        self.assertEqual(result["statusCode"], 402)
+        self.assertEqual(agentcore.calls[0]["envelope"]["path"], "/x402/free")
+        self.assertEqual(agentcore.calls[0]["envelope"]["queryString"], "symbol=AAPL")
+
     def test_unknown_gateway_request_is_rejected(self):
         event = {
             **EVENT,

@@ -1,12 +1,13 @@
 """x402 HTTP payment channel with durable asynchronous delivery.
 
-Adds paid asynchronous job routes alongside the existing A2A server (pure ASGI
-middleware — no extra framework or heavy deps):
+Adds paid asynchronous job routes and the free quick-quote route alongside the
+existing A2A server (pure ASGI middleware — no extra framework or heavy deps):
 
   GET  /x402/price                → current price and asset information
   POST /x402/analyze/async        → settle payment and return a durable job
   GET  /x402/jobs/{jobId}         → authenticated job status and download URL
   POST /x402/jobs/{jobId}/resume  → authenticated recovery
+  GET|POST /x402/free             → zero-price quick quote as JSON
 
 Payment verification is FIXED CODE in x402_verify.py — never LLM-callable.
 """
@@ -17,8 +18,9 @@ import json
 import logging
 import os
 import re
-from collections.abc import Callable, Mapping
+from collections.abc import AsyncGenerator, Callable, Mapping
 from typing import Any
+from urllib.parse import parse_qs
 
 import httpx
 
@@ -42,10 +44,13 @@ if __package__:
     from .x402_tokens import TOKENS, supported_assets
     from .x402_verify import (
         CHAIN_ID,
+        FREE_TIER_LIMIT,
         PRICE_WEI,
+        build_free_payment_challenge,
         build_payment_challenge,
         build_payment_requirement,
         decode_payment_signature,
+        verify_free_payment_proof,
     )
     from .x402_wallet_rate_limit import (
         WalletRateLimitExceeded,
@@ -71,10 +76,13 @@ else:
     from x402_tokens import TOKENS, supported_assets
     from x402_verify import (
         CHAIN_ID,
+        FREE_TIER_LIMIT,
         PRICE_WEI,
+        build_free_payment_challenge,
         build_payment_challenge,
         build_payment_requirement,
         decode_payment_signature,
+        verify_free_payment_proof,
     )
     from x402_wallet_rate_limit import (
         WalletRateLimitExceeded,
@@ -262,6 +270,8 @@ class X402Handler:
 
     Args:
         app: Inner ASGI application (A2A + existing routes).
+        free_work: Async generator used only by the free quick-quote
+            endpoint.
         job_service: Durable paid-analysis service.
     """
 
@@ -269,11 +279,13 @@ class X402Handler:
         self,
         app,
         *,
+        free_work: Callable[..., AsyncGenerator[tuple[str, dict], None]] | None = None,
         job_service: X402JobService | None = None,
         b402_client: B402Client | None = _B402_CLIENT,
         usage_reporter: UsageEventReporter | None = None,
     ) -> None:
         self._inner = app
+        self._free_work = free_work
         self._job_service = job_service
         self._b402_client = b402_client
         self._usage_reporter = usage_reporter
@@ -290,6 +302,10 @@ class X402Handler:
 
         if path == "/x402/price":
             await self._handle_price(scope, send)
+        elif path == "/x402/free" and method == "GET":
+            await self._handle_free_challenge(scope, send)
+        elif path == "/x402/free" and method == "POST":
+            await self._handle_free(scope, receive, send)
         elif raw_path == "/x402/analyze/async" and method == "POST":
             await self._handle_tracked_async_analyze(scope, receive, send)
         elif (
@@ -348,6 +364,8 @@ class X402Handler:
                     "POST /x402/analyze/async  (+ Payment-Signature header)  → paid, asynchronous report",
                     "GET  /x402/jobs/{jobId}  (+ X-Job-Token header)",
                     "POST /x402/jobs/{jobId}/resume  (+ X-Job-Token header)",
+                    "GET  /x402/free?symbol=AAPL",
+                    "POST /x402/free     (+ Payment-Signature header)  → free, 0 U, quick quote",
                 ]},
                 extra_headers=async_headers,
             )
@@ -668,6 +686,146 @@ class X402Handler:
             ),
         )
 
+    async def _handle_free_challenge(self, scope, send) -> None:
+        """GET /x402/free?symbol=AAPL — return 402 free tier challenge (0 U)."""
+        qs = parse_qs((scope.get("query_string") or b"").decode())
+        symbol = ((qs.get("symbol") or qs.get("symbols") or [""])[0]).strip().upper()
+        challenge = build_free_payment_challenge(
+            symbol,
+            _public_resource(scope, "/x402/free"),
+        )
+        await send({
+            "type": "http.response.start",
+            "status": 402,
+            "headers": [
+                (b"payment-required", _encode_payment_header(challenge)),
+                (b"content-type", b"application/json"),
+            ],
+        })
+        body = json.dumps({
+            "error": "Payment Required",
+            "description": (
+                "Sign a 0-U EIP-712 authorization to prove your wallet identity, "
+                f"then POST to /x402/free. Rate limit: {FREE_TIER_LIMIT}/24h per wallet."
+            ),
+            "paymentRequired": challenge,
+        }).encode()
+        await send({"type": "http.response.body", "body": body, "more_body": False})
+
+    async def _handle_free(self, scope, receive, send) -> None:
+        """POST /x402/free — verify a 0-U proof and return a JSON quick quote."""
+        if not self._free_work:
+            await _send_json(send, 501, {"error": "free tier not configured"})
+            return
+
+        chunks: list[bytes] = []
+        while True:
+            msg = await receive()
+            if msg["type"] == "http.request":
+                chunks.append(msg.get("body") or b"")
+                if not msg.get("more_body"):
+                    break
+
+        try:
+            req: dict[str, Any] = json.loads(b"".join(chunks)) if chunks else {}
+        except json.JSONDecodeError:
+            await _send_json(send, 400, {"error": "invalid JSON body"})
+            return
+
+        # Accept "symbol" (singular) or "symbols" (list/string, first element)
+        symbol_raw = req.get("symbol") or ""
+        if not symbol_raw:
+            syms = _parse_symbols(req.get("symbols") or "")
+            symbol_raw = syms[0] if syms else ""
+        symbol = str(symbol_raw).strip().upper()
+        if not symbol:
+            await _send_json(send, 400, {
+                "error": "symbol is required",
+                "example": '{"symbol": "AAPL"}',
+            })
+            return
+
+        try:
+            payment_header = _header(scope, b"payment-signature")
+        except InvalidHeaderValue:
+            await _send_json(send, 402, {
+                "error": "Free tier access denied",
+                "detail": "Payment-Signature is not valid base64 JSON",
+            })
+            return
+
+        if not payment_header:
+            challenge = build_free_payment_challenge(
+                symbol,
+                _public_resource(scope, "/x402/free"),
+            )
+            await send({
+                "type": "http.response.start",
+                "status": 402,
+                "headers": [
+                    (b"payment-required", _encode_payment_header(challenge)),
+                    (b"content-type", b"application/json"),
+                ],
+            })
+            body = json.dumps({
+                "error": "Payment Required",
+                "description": "Retry with a valid Payment-Signature header (0 U EIP-712 signature).",
+                "paymentRequired": challenge,
+            }).encode()
+            await send({"type": "http.response.body", "body": body, "more_body": False})
+            return
+
+        ok, msg, from_addr = verify_free_payment_proof(payment_header)
+        if not ok:
+            logger.warning("x402 free tier outcome=rejected")
+            await _send_json(send, 402, {
+                "error": "Free tier access denied",
+                "detail": msg,
+            })
+            return
+
+        self._report_free_usage(from_addr)
+
+        logger.info("x402 free tier outcome=accepted")
+        report: dict[str, str] | None = None
+        try:
+            async for event_name, data in self._free_work(symbol):
+                if event_name == "error":
+                    logger.warning("x402 free quote outcome=failed")
+                    await _send_free_unavailable(send)
+                    return
+                if event_name == "report" and isinstance(data, dict):
+                    content = data.get("content")
+                    report_format = data.get("format")
+                    if (
+                        isinstance(content, str)
+                        and content
+                        and report_format in {"markdown", "text"}
+                    ):
+                        report = {"content": content, "format": report_format}
+        except Exception:
+            logger.warning("x402 free quote outcome=failed")
+            await _send_free_unavailable(send)
+            return
+
+        if report is None:
+            logger.warning("x402 free quote outcome=empty")
+            await _send_free_unavailable(send)
+            return
+        await _send_json(send, 200, report)
+
+    def _report_free_usage(self, wallet: str) -> None:
+        """Record one accepted free call. Never raises into the request path."""
+        if self._usage_reporter is None:
+            return
+        try:
+            attempt = self._usage_reporter.start_attempt()
+            attempt.observe_verified_wallet(wallet)
+            self._usage_reporter.submit_attempt(attempt)
+        except Exception:
+            logger.warning("x402 free tier accounting outcome=failed")
+
+
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
 async def _read_json_body(
@@ -829,6 +987,14 @@ async def _send_payment_backend_unavailable(send) -> None:
             "retryable": True,
         },
         extra_headers=_async_response_headers(),
+    )
+
+
+async def _send_free_unavailable(send) -> None:
+    await _send_json(
+        send,
+        503,
+        {"errorCode": "free_quote_unavailable", "retryable": True},
     )
 
 
