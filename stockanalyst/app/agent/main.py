@@ -39,6 +39,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import os
 import sys
 from collections.abc import AsyncGenerator, Mapping
@@ -543,60 +544,54 @@ async def _stream_runner(
 
 # --- Free-tier quick-quote (no LLM, no ADK) -----------------------------------
 
-def _format_free_report(symbol: str, quote: dict) -> str:
-    """Format a simple markdown table from a fetch_quote result dict."""
+def _finite_quote_number(value: object) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    if not math.isfinite(value):
+        return None
+    return float(value)
+
+
+def _build_free_quote(symbol: str, quote: dict) -> dict:
+    """Project a fetch_quote result into the free-tier JSON body."""
     from datetime import UTC, datetime
 
-    today = datetime.now(tz=UTC).date().isoformat()
-    name = quote.get("name", symbol)
-    cur = quote.get("currency", "USD")
-
-    def fp(v):   return f"{cur} {v:,.2f}" if v is not None else "N/A"
-    def fpct(v): return f"{v:+.2f}%" if v is not None else "N/A"
-    def fx(v):   return f"{v:.1f}x" if v is not None else "N/A"
-    def fcap(v):
-        if v is None: return "N/A"
-        if v >= 1e12: return f"{v / 1e12:.2f}T {cur}"
-        if v >= 1e9:  return f"{v / 1e9:.2f}B {cur}"
-        return f"{v / 1e6:.2f}M {cur}"
-
-    target  = quote.get("analyst_target")
-    price   = quote.get("price")
-    upside  = (
-        f" ({(target - price) / price * 100:+.1f}% upside)"
-        if target and price else ""
+    price = _finite_quote_number(quote.get("price"))
+    target = _finite_quote_number(quote.get("analyst_target"))
+    upside = (
+        round((target - price) / price * 100, 1)
+        if price and target is not None
+        else None
     )
-
-    rows = [
-        ("Price",           fp(price)),
-        ("Change",          fpct(quote.get("change_pct"))),
-        ("Market Cap",      fcap(quote.get("market_cap"))),
-        ("PE (TTM)",        fx(quote.get("pe_ratio"))),
-        ("Forward PE",      fx(quote.get("forward_pe"))),
-        ("Analyst Target",  fp(target) + upside),
-        ("Consensus",       (quote.get("recommendation") or "N/A").title()),
-        ("Beta",            f"{quote['beta']:.2f}" if quote.get("beta") is not None else "N/A"),
-        ("52W Range",       f"{fp(quote.get('52w_low'))} – {fp(quote.get('52w_high'))}"),
-    ]
-
-    lines = [
-        f"## {symbol} — {name}  |  Quick Quote  {today}",
-        "",
-        "| Metric | Value |",
-        "|--------|-------|",
-        *[f"| {k} | {v} |" for k, v in rows],
-        "",
-        (
-            "> **Full analysis** (RSI / MACD / Bollinger Bands, options sentiment, "
-            "insider activity, portfolio rebalancing) "
-            "→ **Paid tier (0.1 U)** via `POST /x402/analyze/async`"
-        ),
-    ]
-    return "\n".join(lines)
+    recommendation = quote.get("recommendation")
+    body: dict[str, object] = {
+        "symbol": symbol.upper(),
+        "name": quote.get("name") or symbol,
+        "date": datetime.now(tz=UTC).date().isoformat(),
+        "currency": quote.get("currency") or "USD",
+        "price": price,
+        "price_now": price,
+        "change_pct": _finite_quote_number(quote.get("change_pct")),
+        "market_cap": _finite_quote_number(quote.get("market_cap")),
+        "pe_ratio": _finite_quote_number(quote.get("pe_ratio")),
+        "forward_pe": _finite_quote_number(quote.get("forward_pe")),
+        "analyst_target": target,
+        "twelve_month_target": target,
+        "analyst_upside_pct": upside,
+        "room_to_target": upside,
+        "recommendation": recommendation if isinstance(recommendation, str) else None,
+        "beta": _finite_quote_number(quote.get("beta")),
+        "week_52_low": _finite_quote_number(quote.get("52w_low")),
+        "week_52_high": _finite_quote_number(quote.get("52w_high")),
+    }
+    error = quote.get("error")
+    if isinstance(error, str) and error:
+        body["error"] = error
+    return body
 
 
 async def _free_quote_work(symbol: str) -> AsyncGenerator[tuple[str, dict], None]:
-    """Free-tier generator: fetch_quote only, format as simple markdown table.
+    """Free-tier generator: fetch_quote only, return a JSON quote object.
 
     No LLM, no ADK — completes in ~1 s (one yfinance call).
     """
@@ -614,7 +609,7 @@ async def _free_quote_work(symbol: str) -> AsyncGenerator[tuple[str, dict], None
         yield "error", {"message": f"Failed to fetch {symbol}: {exc}"}
         return
 
-    yield "report", {"content": _format_free_report(symbol, quote), "format": "markdown"}
+    yield "report", _build_free_quote(symbol, quote)
     yield "done", {}
 
 

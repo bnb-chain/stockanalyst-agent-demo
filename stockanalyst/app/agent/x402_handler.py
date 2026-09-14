@@ -787,7 +787,7 @@ class X402Handler:
         self._report_free_usage(from_addr)
 
         logger.info("x402 free tier outcome=accepted")
-        report: dict[str, str] | None = None
+        report: dict[str, Any] | None = None
         try:
             async for event_name, data in self._free_work(symbol):
                 if event_name == "error":
@@ -795,14 +795,9 @@ class X402Handler:
                     await _send_free_unavailable(send)
                     return
                 if event_name == "report" and isinstance(data, dict):
-                    content = data.get("content")
-                    report_format = data.get("format")
-                    if (
-                        isinstance(content, str)
-                        and content
-                        and report_format in {"markdown", "text"}
-                    ):
-                        report = {"content": content, "format": report_format}
+                    report_symbol = data.get("symbol")
+                    if isinstance(report_symbol, str) and report_symbol:
+                        report = data
         except Exception:
             logger.warning("x402 free quote outcome=failed")
             await _send_free_unavailable(send)

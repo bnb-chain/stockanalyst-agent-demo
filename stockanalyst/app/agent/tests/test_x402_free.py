@@ -25,7 +25,14 @@ SIGNER_ADDRESS = Account.from_key("0x" + "11" * 32).address.lower()
 
 async def free_report_work(symbol: str):
     yield "progress", {"stage": "collecting"}
-    yield "report", {"content": f"# {symbol} quick quote", "format": "markdown"}
+    yield "report", {
+        "symbol": symbol,
+        "name": f"{symbol} Inc.",
+        "price": 100.0,
+        "price_now": 100.0,
+        "twelve_month_target": 110.0,
+        "room_to_target": 10.0,
+    }
     yield "done", {}
 
 
@@ -173,8 +180,14 @@ class FreeRouteTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(response.status, 200)
-        self.assertEqual(response.json["format"], "markdown")
-        self.assertIn("AAPL", response.json["content"])
+        self.assertEqual(response.json["symbol"], "AAPL")
+        self.assertEqual(response.json["name"], "AAPL Inc.")
+        self.assertEqual(response.json["price"], 100.0)
+        self.assertEqual(response.json["price_now"], 100.0)
+        self.assertEqual(response.json["twelve_month_target"], 110.0)
+        self.assertEqual(response.json["room_to_target"], 10.0)
+        self.assertNotIn("content", response.json)
+        self.assertNotIn("format", response.json)
 
     async def test_post_accepts_the_first_entry_of_a_symbols_list(self) -> None:
         response = await call_handler(
@@ -186,7 +199,7 @@ class FreeRouteTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(response.status, 200)
-        self.assertIn("NVDA", response.json["content"])
+        self.assertEqual(response.json["symbol"], "NVDA")
 
     async def test_post_with_a_rejected_proof_does_not_run_the_work(self) -> None:
         work = Mock(side_effect=AssertionError("free work must not run"))
@@ -225,6 +238,24 @@ class FreeRouteTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status, 503)
         self.assertEqual(response.json["errorCode"], "free_quote_unavailable")
         self.assertTrue(response.json["retryable"])
+
+    async def test_markdown_payload_is_rejected(self) -> None:
+        async def markdown_work(symbol: str):
+            yield "report", {
+                "content": f"# {symbol} quick quote",
+                "format": "markdown",
+            }
+
+        response = await call_handler(
+            build_handler(markdown_work),
+            method="POST",
+            path="/x402/free",
+            headers={"payment-signature": signed_free_proof(B402_PAY_TO)},
+            json_body={"symbol": "AAPL"},
+        )
+
+        self.assertEqual(response.status, 503)
+        self.assertEqual(response.json["errorCode"], "free_quote_unavailable")
 
     async def test_work_without_a_report_reports_a_retryable_outage(self) -> None:
         response = await call_handler(
@@ -315,7 +346,7 @@ class FreeUsageReportingTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(response.status, 200)
-        self.assertIn("AAPL", response.json["content"])
+        self.assertEqual(response.json["symbol"], "AAPL")
 
 
 class FreeProofStabilityTests(unittest.TestCase):

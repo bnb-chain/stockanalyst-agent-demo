@@ -18,7 +18,7 @@ import { resolve, dirname } from "path";
 import { fileURLToPath } from "url";
 import { Wallet } from "ethers";
 import { randomBytes } from "crypto";
-import { readFreeQuoteResponse } from "./x402-free-client.js";
+import { readFreeQuoteResponse, type FreeQuoteResponse } from "./x402-free-client.js";
 import {
   BSC_MAINNET_CHAIN_ID,
   U_TOKEN_ADDRESS,
@@ -100,7 +100,7 @@ async function buildFreeProof(
   return Buffer.from(JSON.stringify(proof)).toString("base64");
 }
 
-async function fetchFreeQuote(endpoint: string, symbol: string, proof: string): Promise<string> {
+async function fetchFreeQuote(endpoint: string, symbol: string, proof: string): Promise<FreeQuoteResponse> {
   const url  = `${endpoint}/x402/free`;
   const body = JSON.stringify({ symbol });
 
@@ -164,7 +164,7 @@ async function main(): Promise<void> {
   if (!report) throw new Error("No report received");
 
   console.log("\n┌─ REPORT " + "─".repeat(50) + "┐");
-  for (const line of report.split("\n")) {
+  for (const line of JSON.stringify(report, null, 2).split("\n")) {
     console.log("│ " + line);
   }
   console.log("└" + "─".repeat(52) + "┘");
