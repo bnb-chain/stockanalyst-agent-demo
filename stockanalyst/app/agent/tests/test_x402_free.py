@@ -3,11 +3,13 @@ from __future__ import annotations
 import base64
 import json
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 from eth_account import Account
+from stockanalyst.app.agent import x402_handler as handler_module
 from stockanalyst.app.agent import x402_verify as verify
 from stockanalyst.app.agent.tests.test_x402_async_handler import (
+    call_disconnected_handler,
     call_handler,
     decode_header,
 )
@@ -158,6 +160,104 @@ class FreeRouteTests(unittest.IsolatedAsyncioTestCase):
             response.json["paymentRequired"]["accepts"][0]["maxAmountRequired"],
             "0",
         )
+
+    async def test_post_rejects_a_non_object_json_body(self) -> None:
+        work = Mock(side_effect=AssertionError("free work must not run"))
+        response = await call_handler(
+            build_handler(work),
+            method="POST",
+            path="/x402/free",
+            body_chunks=[b'["AAPL"]'],
+        )
+
+        self.assertEqual(response.status, 400)
+        self.assertEqual(response.json["error"], "invalid JSON body")
+        work.assert_not_called()
+
+    async def test_post_stops_when_body_exceeds_256_kib(self) -> None:
+        work = Mock(side_effect=AssertionError("free work must not run"))
+        extra_receive = AsyncMock(return_value={"type": "http.disconnect"})
+        chunks = [
+            b"x" * handler_module._ASYNC_BODY_MAX_BYTES,
+            b"x",
+            b"must-not-be-read",
+        ]
+        sent: list[dict] = []
+        receive_count = 0
+
+        async def receive() -> dict:
+            nonlocal receive_count
+            receive_count += 1
+            if chunks:
+                chunk = chunks.pop(0)
+                return {
+                    "type": "http.request",
+                    "body": chunk,
+                    "more_body": True,
+                }
+            return await extra_receive()
+
+        async def send(message: dict) -> None:
+            sent.append(message)
+
+        await build_handler(work)(
+            {
+                "type": "http",
+                "method": "POST",
+                "path": "/x402/free",
+                "query_string": b"",
+                "headers": [],
+            },
+            receive,
+            send,
+        )
+
+        start = next(item for item in sent if item["type"] == "http.response.start")
+        self.assertEqual(start["status"], 413)
+        self.assertEqual(
+            json.loads(
+                b"".join(
+                    item.get("body", b"")
+                    for item in sent
+                    if item["type"] == "http.response.body"
+                )
+            ),
+            {"errorCode": "request_too_large"},
+        )
+        self.assertEqual(receive_count, 2)
+        self.assertEqual(len(chunks), 1)
+        work.assert_not_called()
+
+    async def test_post_rejects_disconnect_after_partial_body(self) -> None:
+        work = Mock(side_effect=AssertionError("free work must not run"))
+
+        send = await call_disconnected_handler(
+            build_handler(work),
+            path="/x402/free",
+            messages=[
+                {
+                    "type": "http.request",
+                    "body": b'{"symbol":"AAPL"}',
+                    "more_body": True,
+                },
+                {"type": "http.disconnect"},
+            ],
+        )
+
+        send.assert_not_awaited()
+        work.assert_not_called()
+
+    async def test_post_rejects_disconnect_before_body(self) -> None:
+        work = Mock(side_effect=AssertionError("free work must not run"))
+
+        send = await call_disconnected_handler(
+            build_handler(work),
+            path="/x402/free",
+            messages=[{"type": "http.disconnect"}],
+        )
+
+        send.assert_not_awaited()
+        work.assert_not_called()
 
     async def test_post_without_a_symbol_is_rejected(self) -> None:
         response = await call_handler(

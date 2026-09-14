@@ -714,22 +714,21 @@ class X402Handler:
 
     async def _handle_free(self, scope, receive, send) -> None:
         """POST /x402/free — verify a 0-U proof and return a JSON quick quote."""
+        try:
+            req = await _read_json_body(receive)
+        except BodyTooLarge:
+            await _send_json(send, 413, {"errorCode": "request_too_large"})
+            return
+        except RequestDisconnected:
+            return
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            await _send_json(send, 400, {"error": "invalid JSON body"})
+            return
+        if not isinstance(req, dict):
+            await _send_json(send, 400, {"error": "invalid JSON body"})
+            return
         if not self._free_work:
             await _send_json(send, 501, {"error": "free tier not configured"})
-            return
-
-        chunks: list[bytes] = []
-        while True:
-            msg = await receive()
-            if msg["type"] == "http.request":
-                chunks.append(msg.get("body") or b"")
-                if not msg.get("more_body"):
-                    break
-
-        try:
-            req: dict[str, Any] = json.loads(b"".join(chunks)) if chunks else {}
-        except json.JSONDecodeError:
-            await _send_json(send, 400, {"error": "invalid JSON body"})
             return
 
         # Accept "symbol" (singular) or "symbols" (list/string, first element)
