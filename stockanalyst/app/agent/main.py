@@ -39,6 +39,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import os
 import sys
 from collections.abc import AsyncGenerator, Mapping
@@ -541,6 +542,77 @@ async def _stream_runner(
     yield "done", {}
 
 
+# --- Free-tier quick-quote (no LLM, no ADK) -----------------------------------
+
+def _finite_quote_number(value: object) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    if not math.isfinite(value):
+        return None
+    return float(value)
+
+
+def _build_free_quote(symbol: str, quote: dict) -> dict:
+    """Project a fetch_quote result into the free-tier JSON body."""
+    from datetime import UTC, datetime
+
+    price = _finite_quote_number(quote.get("price"))
+    target = _finite_quote_number(quote.get("analyst_target"))
+    upside = (
+        round((target - price) / price * 100, 1)
+        if price and target is not None
+        else None
+    )
+    recommendation = quote.get("recommendation")
+    body: dict[str, object] = {
+        "symbol": symbol.upper(),
+        "name": quote.get("name") or symbol,
+        "date": datetime.now(tz=UTC).date().isoformat(),
+        "currency": quote.get("currency") or "USD",
+        "price": price,
+        "price_now": price,
+        "change_pct": _finite_quote_number(quote.get("change_pct")),
+        "market_cap": _finite_quote_number(quote.get("market_cap")),
+        "pe_ratio": _finite_quote_number(quote.get("pe_ratio")),
+        "forward_pe": _finite_quote_number(quote.get("forward_pe")),
+        "analyst_target": target,
+        "twelve_month_target": target,
+        "analyst_upside_pct": upside,
+        "room_to_target": upside,
+        "recommendation": recommendation if isinstance(recommendation, str) else None,
+        "beta": _finite_quote_number(quote.get("beta")),
+        "week_52_low": _finite_quote_number(quote.get("52w_low")),
+        "week_52_high": _finite_quote_number(quote.get("52w_high")),
+    }
+    error = quote.get("error")
+    if isinstance(error, str) and error:
+        body["error"] = error
+    return body
+
+
+async def _free_quote_work(symbol: str) -> AsyncGenerator[tuple[str, dict], None]:
+    """Free-tier generator: fetch_quote only, return a JSON quote object.
+
+    No LLM, no ADK — completes in ~1 s (one yfinance call).
+    """
+    from analysis import fetch_quote
+
+    yield "progress", {
+        "stage": "collecting",
+        "tool": "get_stock_quote",
+        "message": f"Fetching market data for {symbol}...",
+    }
+    try:
+        loop = asyncio.get_running_loop()
+        quote = await loop.run_in_executor(None, fetch_quote, symbol)
+    except Exception as exc:
+        yield "error", {"message": f"Failed to fetch {symbol}: {exc}"}
+        return
+
+    yield "report", _build_free_quote(symbol, quote)
+    yield "done", {}
+
+
 usage_reporter = build_usage_event_reporter(
     os.environ,
 )
@@ -567,6 +639,7 @@ async def _x402_not_found(scope, receive, send):
 
 x402_app = X402Handler(
     _x402_not_found,
+    free_work=_free_quote_work,
     job_service=x402_jobs,
     usage_reporter=usage_reporter,
 )

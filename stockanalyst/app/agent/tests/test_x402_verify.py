@@ -212,6 +212,48 @@ def signed_proof(
     return base64.b64encode(json.dumps(proof).encode()).decode()
 
 
+def signed_free_proof(
+    to_address: str,
+    *,
+    value: object = "0",
+    nonce_seed: str = "66",
+    valid_before: int = NOW + 600,
+) -> str:
+    account = Account.from_key("0x" + "11" * 32)
+    nonce = bytes.fromhex(nonce_seed * 32)
+    authorization = {
+        "from": account.address.lower(),
+        "to": to_address.lower(),
+        "value": value,
+        "validAfter": "0",
+        "validBefore": str(valid_before),
+        "nonce": "0x" + nonce.hex(),
+    }
+    digest = verify._eip712_digest(
+        authorization["from"],
+        authorization["to"],
+        0,
+        0,
+        valid_before,
+        nonce,
+        token=U_TOKEN,
+    )
+    signature = Account._sign_hash(
+        digest, private_key="0x" + "11" * 32
+    ).signature.hex()
+    if not signature.startswith("0x"):
+        signature = "0x" + signature
+    return base64.b64encode(json.dumps({
+        "x402Version": 2,
+        "scheme": "exact",
+        "network": f"eip155:{verify.CHAIN_ID}",
+        "payload": {
+            "signature": signature,
+            "authorization": authorization,
+        },
+    }).encode()).decode()
+
+
 class VerifiedPaymentTests(unittest.TestCase):
     def test_payment_signature_decoder_is_strict_and_returns_only_objects(
         self,

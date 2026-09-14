@@ -336,37 +336,37 @@ class MainnetInfrastructureContractTests(unittest.TestCase):
         self.assertEqual(set(seller), {"U", "USD1", "USDC", "USDT"})
         self.assertEqual(buyer, seller)
 
-    def test_retired_free_buyer_artifacts_are_absent(self) -> None:
-        self.assertFalse((BUYER_X402_SOURCE_ROOT / "x402-free-client.ts").exists())
-        self.assertFalse(
+    def test_free_buyer_artifacts_are_present(self) -> None:
+        self.assertTrue((BUYER_X402_SOURCE_ROOT / "x402free.ts").exists())
+        self.assertTrue((BUYER_X402_SOURCE_ROOT / "x402-free-client.ts").exists())
+        self.assertTrue(
             (BUYER_X402_SOURCE_ROOT / "x402-free-client.test.ts").exists()
         )
 
-    def test_retired_endpoint_leaves_no_exact_route_or_helper_artifacts(self) -> None:
-        retired_route = "/x402/" + "fr" + "ee"
-        retired_helper = "signed_" + "fr" + "ee_proof"
-        stale_guidance = "retained legacy " + "fr" + "ee client"
-        markers = (retired_route, retired_helper, stale_guidance)
-        roots = (
-            ROOT / "gateway" / "x402_lambda" / "tests",
-            ROOT / "stockanalyst" / "app" / "agent" / "tests",
-            ROOT / "tests" / "infra",
-            Path(__file__),
-            BUYER_README,
+    def test_free_route_is_wired_and_stays_zero_priced(self) -> None:
+        handler = RUNTIME_X402_HANDLER.read_text(encoding="utf-8")
+        verify = (RUNTIME_X402_SOURCE_ROOT / "x402_verify.py").read_text(
+            encoding="utf-8"
         )
-        offenders: list[str] = []
+        main = AGENT_MAIN.read_text(encoding="utf-8")
 
-        for root in roots:
-            paths = (root,) if root.is_file() else root.rglob("*")
-            for path in paths:
-                if not path.is_file() or path.suffix not in {".md", ".py", ".ts"}:
-                    continue
-                source = path.read_text(encoding="utf-8")
-                for marker in markers:
-                    if marker in source:
-                        offenders.append(f"{path.relative_to(ROOT)}: {marker}")
+        for method in ('path == "/x402/free" and method == "GET"',
+                       'path == "/x402/free" and method == "POST"'):
+            self.assertIn(method, handler)
+        self.assertIn("free_work=_free_quote_work", main)
+        # The identity proof must never authorize a transfer.
+        self.assertIn('"maxAmountRequired": "0"', verify)
+        self.assertIn("_FREE_VALUE_REJECTION", verify)
 
-        self.assertEqual(offenders, [])
+    def test_free_route_never_reaches_the_paid_settlement_path(self) -> None:
+        handler = RUNTIME_X402_HANDLER.read_text(encoding="utf-8")
+        free_body = handler.split("async def _handle_free(", 1)[1].split(
+            "\n    def _report_free_usage(",
+            1,
+        )[0]
+
+        for forbidden in ("_b402_client", "_job_service", "settle"):
+            self.assertNotIn(forbidden, free_body)
 
     def test_paid_runtime_has_no_zero_settlement_demo_bypass(self) -> None:
         handler = RUNTIME_X402_HANDLER.read_text(encoding="utf-8")

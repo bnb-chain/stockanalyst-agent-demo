@@ -177,6 +177,8 @@ async def call_disconnected_handler(
     handler: X402Handler,
     *,
     messages: list[dict],
+    path: str = "/x402/analyze/async",
+    headers: dict[str, str] | None = None,
 ) -> AsyncMock:
     pending = list(messages)
 
@@ -193,9 +195,12 @@ async def call_disconnected_handler(
         {
             "type": "http",
             "method": "POST",
-            "path": "/x402/analyze/async",
+            "path": path,
             "query_string": b"",
-            "headers": [(b"payment-signature", b"proof")],
+            "headers": [
+                (name.encode(), value.encode())
+                for name, value in (headers or {"payment-signature": "proof"}).items()
+            ],
         },
         receive,
         send,

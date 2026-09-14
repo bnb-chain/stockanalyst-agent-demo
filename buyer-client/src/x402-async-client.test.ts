@@ -1446,13 +1446,28 @@ test("x402 production modules expose only explicit mainnet chain naming", () => 
   assert.doesNotMatch(paymentModule, /BSC_TESTNET_CHAIN_ID/);
 });
 
-test("x402 buyer has no free CLI command or executable source", () => {
+test("x402 buyer ships the free CLI command and its executable source", () => {
   const packageJson = JSON.parse(readFileSync(
     new URL("../package.json", import.meta.url),
     "utf8",
   )) as { scripts?: Record<string, string> };
-  assert.equal(packageJson.scripts?.["x402:free"], undefined);
-  assert.equal(existsSync(new URL("../src/x402free.ts", import.meta.url)), false);
+  assert.equal(
+    packageJson.scripts?.["x402:free"],
+    "npx tsx --env-file=.env src/x402free.ts",
+  );
+  assert.equal(existsSync(new URL("../src/x402free.ts", import.meta.url)), true);
+});
+
+test("the free CLI signs a zero-value authorization and never settles", () => {
+  const source = readFileSync(
+    new URL("../src/x402free.ts", import.meta.url),
+    "utf8",
+  );
+
+  assert.match(source, /value:\s+BigInt\(0\)/);
+  assert.match(source, /\/x402\/free/);
+  assert.doesNotMatch(source, /PAID_AMOUNT/);
+  assert.doesNotMatch(source, /buildPaymentProof/);
 });
 
 test("buyer documentation separates mainnet x402 from testnet ERC-8183", () => {

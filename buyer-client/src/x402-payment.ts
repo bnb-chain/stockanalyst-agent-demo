@@ -35,6 +35,11 @@ export const BSC_MAINNET_CHAIN_ID = 56;
 export const PAID_AMOUNT = "100000000000000000";
 export const PAYMENT_TIMEOUT_SECONDS = 600;
 
+// Compatibility aliases for the free-tier client, which remains U-only.
+export const U_TOKEN_ADDRESS = PAYMENT_TOKENS.U.asset;
+export const U_TOKEN_DOMAIN_NAME = PAYMENT_TOKENS.U.name;
+export const U_TOKEN_DOMAIN_VERSION = PAYMENT_TOKENS.U.version;
+
 export interface B402PaymentExtra {
   name: string;
   version: string;
